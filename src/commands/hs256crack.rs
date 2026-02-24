@@ -22,6 +22,10 @@ pub struct Hs256CrackArgs {
     pub jwt: String,
     #[arg(long, default_value = DEFAULT_WORDLIST_PATH)]
     pub wordlist: PathBuf,
+    #[arg(long)]
+    pub threads_per_group: Option<usize>,
+    #[arg(long)]
+    pub autotune: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,11 +154,27 @@ struct GpuHs256BruteForcer {
     device: metal::Device,
     queue: metal::CommandQueue,
     pipeline: metal::ComputePipelineState,
+    threadgroup_width: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct BatchDispatchTimings {
+    setup: Duration,
+    gpu_wait: Duration,
+    total: Duration,
+}
+
+#[derive(Debug, Default)]
+struct RunTimings {
+    gpu_setup: Duration,
+    gpu_wait: Duration,
+    dispatch_total: Duration,
 }
 
 impl GpuHs256BruteForcer {
     fn new() -> anyhow::Result<Self> {
-        let device = Device::system_default().ok_or_else(|| anyhow!("no Metal device available"))?;
+        let device =
+            Device::system_default().ok_or_else(|| anyhow!("no Metal device available"))?;
         let source = std::fs::read_to_string(METAL_SOURCE_PATH)
             .with_context(|| format!("failed to read Metal source {METAL_SOURCE_PATH}"))?;
         let compile_options = CompileOptions::new();
@@ -168,12 +188,47 @@ impl GpuHs256BruteForcer {
             .new_compute_pipeline_state_with_function(&function)
             .map_err(|e| anyhow!("failed to create compute pipeline: {e}"))?;
         let queue = device.new_command_queue();
+        let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
+        let threadgroup_width = 256usize.min(max_threads.max(1));
 
         Ok(Self {
             device,
             queue,
             pipeline,
+            threadgroup_width,
         })
+    }
+
+    fn set_threadgroup_width(&mut self, requested: usize) -> anyhow::Result<()> {
+        let max_threads = self.pipeline.max_total_threads_per_threadgroup() as usize;
+        if requested == 0 {
+            bail!("--threads-per-group must be > 0");
+        }
+        if requested > max_threads {
+            bail!(
+                "--threads-per-group {} exceeds pipeline max {}",
+                requested,
+                max_threads
+            );
+        }
+        self.threadgroup_width = requested;
+        Ok(())
+    }
+
+    fn current_threadgroup_width(&self) -> usize {
+        self.threadgroup_width
+    }
+
+    fn thread_execution_width(&self) -> usize {
+        self.pipeline.thread_execution_width() as usize
+    }
+
+    fn max_total_threads_per_threadgroup(&self) -> usize {
+        self.pipeline.max_total_threads_per_threadgroup() as usize
+    }
+
+    fn device_name(&self) -> &str {
+        self.device.name()
     }
 
     fn try_batch(
@@ -181,10 +236,28 @@ impl GpuHs256BruteForcer {
         signing_input: &[u8],
         target_signature: [u8; 32],
         batch: &WordBatch,
-    ) -> anyhow::Result<Option<u32>> {
+    ) -> anyhow::Result<(Option<u32>, BatchDispatchTimings)> {
+        self.dispatch_batch(
+            signing_input,
+            target_signature,
+            batch,
+            self.threadgroup_width,
+        )
+    }
+
+    fn dispatch_batch(
+        &self,
+        signing_input: &[u8],
+        target_signature: [u8; 32],
+        batch: &WordBatch,
+        threadgroup_width: usize,
+    ) -> anyhow::Result<(Option<u32>, BatchDispatchTimings)> {
+        let started = Instant::now();
+        let mut timings = BatchDispatchTimings::default();
         let candidate_count = batch.word_offsets.len() as u32;
         if candidate_count == 0 {
-            return Ok(None);
+            timings.total = started.elapsed();
+            return Ok((None, timings));
         }
         let message_length =
             u32::try_from(signing_input.len()).context("JWT signing input too long")?;
@@ -234,6 +307,7 @@ impl GpuHs256BruteForcer {
             options,
         );
 
+        let setup_started = Instant::now();
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.pipeline);
@@ -244,30 +318,121 @@ impl GpuHs256BruteForcer {
         encoder.set_buffer(4, Some(&lengths_buf), 0);
         encoder.set_buffer(5, Some(&result_buf), 0);
 
-        let max_threads = self.pipeline.max_total_threads_per_threadgroup() as usize;
-        let threadgroup_width = 256usize.min(max_threads.max(1));
         let threads_per_group = MTLSize::new(threadgroup_width as u64, 1, 1);
         let threads_per_grid = MTLSize::new(candidate_count as u64, 1, 1);
         encoder.dispatch_threads(threads_per_grid, threads_per_group);
         encoder.end_encoding();
+        timings.setup = setup_started.elapsed();
 
+        let gpu_wait_started = Instant::now();
         command_buffer.commit();
         command_buffer.wait_until_completed();
+        timings.gpu_wait = gpu_wait_started.elapsed();
 
         let result_ptr = result_buf.contents().cast::<u32>();
         // SAFETY: `result_buf` is a 4-byte shared buffer initialized above and still alive.
         let result = unsafe { *result_ptr };
+        timings.total = started.elapsed();
         if result == RESULT_NOT_FOUND_SENTINEL {
-            Ok(None)
+            Ok((None, timings))
         } else {
-            Ok(Some(result))
+            Ok((Some(result), timings))
         }
+    }
+
+    fn autotune_threadgroup_width(
+        &mut self,
+        signing_input: &[u8],
+        target_signature: [u8; 32],
+        batch: &WordBatch,
+    ) -> anyhow::Result<()> {
+        let sample_count = batch.word_offsets.len().min(16_384);
+        if sample_count == 0 {
+            return Ok(());
+        }
+
+        let sample_batch = if sample_count == batch.word_offsets.len() {
+            batch.clone()
+        } else {
+            let keep_bytes = {
+                let last_offset = batch.word_offsets[sample_count - 1] as usize;
+                let last_len = batch.word_lengths[sample_count - 1] as usize;
+                last_offset + last_len
+            };
+            WordBatch {
+                candidate_index_base: batch.candidate_index_base,
+                words: batch.words[..sample_count].to_vec(),
+                word_bytes: batch.word_bytes[..keep_bytes].to_vec(),
+                word_offsets: batch.word_offsets[..sample_count].to_vec(),
+                word_lengths: batch.word_lengths[..sample_count].to_vec(),
+            }
+        };
+
+        let tew = self.pipeline.thread_execution_width() as usize;
+        let max_threads = self.pipeline.max_total_threads_per_threadgroup() as usize;
+        let mut candidates = vec![
+            tew,
+            tew.saturating_mul(2),
+            tew.saturating_mul(4),
+            tew.saturating_mul(8),
+            64,
+            128,
+            256,
+            512,
+            1024,
+        ];
+        candidates.retain(|&v| v > 0 && v <= max_threads);
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!(
+            "AUTOTUNE: benchmarking {} candidates across {} threadgroup widths",
+            sample_batch.word_offsets.len(),
+            candidates.len()
+        );
+
+        let mut best: Option<(usize, f64)> = None;
+        for width in candidates {
+            let (_result, timings) =
+                self.dispatch_batch(signing_input, target_signature, &sample_batch, width)?;
+            if timings.gpu_wait.is_zero() {
+                continue;
+            }
+            let rate = sample_batch.word_offsets.len() as f64 / timings.gpu_wait.as_secs_f64();
+            match best {
+                Some((_, best_rate)) if rate <= best_rate => {}
+                _ => best = Some((width, rate)),
+            }
+        }
+
+        if let Some((best_width, best_rate)) = best {
+            self.threadgroup_width = best_width;
+            eprintln!(
+                "AUTOTUNE: selected --threads-per-group {} ({}/s sample)",
+                best_width,
+                format_human_count(best_rate)
+            );
+        }
+        Ok(())
     }
 }
 
 pub fn run(args: Hs256CrackArgs) -> anyhow::Result<bool> {
     let (signing_input, target_signature) = parse_hs256_jwt(&args.jwt)?;
-    let gpu = GpuHs256BruteForcer::new()?;
+    let mut gpu = GpuHs256BruteForcer::new()?;
+    if let Some(tpg) = args.threads_per_group {
+        gpu.set_threadgroup_width(tpg)?;
+    }
+    eprintln!(
+        "GPU device={} tew={} max_tpg={} selected_tpg={}",
+        gpu.device_name(),
+        gpu.thread_execution_width(),
+        gpu.max_total_threads_per_threadgroup(),
+        gpu.current_threadgroup_width()
+    );
 
     let file = File::open(&args.wordlist)
         .with_context(|| format!("failed to open wordlist {}", args.wordlist.display()))?;
@@ -275,14 +440,32 @@ pub fn run(args: Hs256CrackArgs) -> anyhow::Result<bool> {
     let started_at = Instant::now();
     let mut last_rate_report_at = started_at;
     let mut candidates_tested: u64 = 0;
+    let mut autotune_done = !args.autotune;
+    let mut timings = RunTimings::default();
 
     while let Some(batch) = reader.next_batch()? {
+        if !autotune_done {
+            gpu.autotune_threadgroup_width(&signing_input, target_signature, &batch)?;
+            autotune_done = true;
+        }
         let batch_candidate_count = batch.word_offsets.len() as u64;
-        if let Some(global_index) = gpu.try_batch(&signing_input, target_signature, &batch)? {
+        let (maybe_match, batch_timings) =
+            gpu.try_batch(&signing_input, target_signature, &batch)?;
+        timings.gpu_setup += batch_timings.setup;
+        timings.gpu_wait += batch_timings.gpu_wait;
+        timings.dispatch_total += batch_timings.total;
+        if let Some(global_index) = maybe_match {
             candidates_tested = candidates_tested.saturating_add(batch_candidate_count);
             let elapsed = started_at.elapsed();
-            let rate = rate_per_second(candidates_tested, elapsed);
-            print_final_stats(candidates_tested, elapsed, rate);
+            let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
+            let rate_gpu_only = rate_per_second(candidates_tested, timings.gpu_wait);
+            print_final_stats(
+                candidates_tested,
+                elapsed,
+                rate_end_to_end,
+                rate_gpu_only,
+                &timings,
+            );
 
             let local_index = usize::try_from(global_index - batch.candidate_index_base)
                 .context("GPU returned out-of-range result index")?;
@@ -298,20 +481,30 @@ pub fn run(args: Hs256CrackArgs) -> anyhow::Result<bool> {
         let now = Instant::now();
         if now.duration_since(last_rate_report_at) >= Duration::from_secs(1) {
             let elapsed = now.duration_since(started_at);
-            let rate = rate_per_second(candidates_tested, elapsed);
+            let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
+            let rate_gpu_only = rate_per_second(candidates_tested, timings.gpu_wait);
             eprintln!(
-                "RATE {}/s ({} tested in {:.2}s)",
-                format_human_count(rate),
+                "RATE end_to_end={}/s gpu_only={}/s ({} tested in {:.2}s, tpg={})",
+                format_human_count(rate_end_to_end),
+                format_human_count(rate_gpu_only),
                 format_human_count(candidates_tested as f64),
-                elapsed.as_secs_f64()
+                elapsed.as_secs_f64(),
+                gpu.current_threadgroup_width()
             );
             last_rate_report_at = now;
         }
     }
 
     let elapsed = started_at.elapsed();
-    let rate = rate_per_second(candidates_tested, elapsed);
-    print_final_stats(candidates_tested, elapsed, rate);
+    let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
+    let rate_gpu_only = rate_per_second(candidates_tested, timings.gpu_wait);
+    print_final_stats(
+        candidates_tested,
+        elapsed,
+        rate_end_to_end,
+        rate_gpu_only,
+        &timings,
+    );
     println!("NOT FOUND");
     Ok(false)
 }
@@ -381,16 +574,37 @@ fn format_human_count(value: f64) -> String {
     format!("{value:.0}")
 }
 
-fn print_final_stats(candidates_tested: u64, elapsed: Duration, rate: f64) {
+fn print_final_stats(
+    candidates_tested: u64,
+    elapsed: Duration,
+    rate_end_to_end: f64,
+    rate_gpu_only: f64,
+    timings: &RunTimings,
+) {
     eprintln!("STATS");
     eprintln!("  tested: {}", format_human_count(candidates_tested as f64));
     eprintln!("  elapsed: {:.2}s", elapsed.as_secs_f64());
-    eprintln!("  rate: {}/s", format_human_count(rate));
+    eprintln!(
+        "  rate_end_to_end: {}/s",
+        format_human_count(rate_end_to_end)
+    );
+    eprintln!("  rate_gpu_only: {}/s", format_human_count(rate_gpu_only));
+    eprintln!(
+        "  timing.gpu_setup: {:.3}s",
+        timings.gpu_setup.as_secs_f64()
+    );
+    eprintln!("  timing.gpu_wait: {:.3}s", timings.gpu_wait.as_secs_f64());
+    eprintln!(
+        "  timing.dispatch_total: {:.3}s",
+        timings.dispatch_total.as_secs_f64()
+    );
 }
 
 fn bytes_of<T>(value: &T) -> &[u8] {
     // SAFETY: `value` is a valid pointer for `size_of::<T>()` bytes for the duration of the borrow.
-    unsafe { std::slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>()) }
+    unsafe {
+        std::slice::from_raw_parts((value as *const T).cast::<u8>(), std::mem::size_of::<T>())
+    }
 }
 
 #[cfg(test)]

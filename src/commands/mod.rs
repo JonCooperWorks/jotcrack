@@ -44,7 +44,12 @@ mod tests {
 
         let Commands::Hs256crack(args) = cli.command;
         assert_eq!(args.jwt, "abc.def.ghi");
-        assert_eq!(args.wordlist, PathBuf::from(hs256crack::DEFAULT_WORDLIST_PATH));
+        assert_eq!(
+            args.wordlist,
+            PathBuf::from(hs256crack::DEFAULT_WORDLIST_PATH)
+        );
+        assert_eq!(args.threads_per_group, None);
+        assert!(!args.autotune);
     }
 
     #[test]
@@ -85,5 +90,22 @@ mod tests {
 
         let Commands::Hs256crack(args) = cli.command;
         assert_eq!(args.wordlist, PathBuf::from("custom.txt"));
+    }
+
+    #[test]
+    fn clap_cli_accepts_autotune_and_threadgroup_flags() {
+        let cli = Cli::try_parse_from([
+            "jotcrack",
+            "hs256crack",
+            "abc.def.ghi",
+            "--threads-per-group",
+            "512",
+            "--autotune",
+        ])
+        .unwrap();
+
+        let Commands::Hs256crack(args) = cli.command;
+        assert_eq!(args.threads_per_group, Some(512));
+        assert!(args.autotune);
     }
 }
