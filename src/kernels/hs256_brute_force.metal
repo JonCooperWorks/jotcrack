@@ -82,6 +82,20 @@ static inline uint32_t load_be_u32(thread const uint8_t* p) {
            uint32_t(p[3]);          // Least-significant byte.
 }
 
+static inline uint32_t load_be_u32(device const uint8_t* p) {
+    return (uint32_t(p[0]) << 24) | // Most-significant byte.
+           (uint32_t(p[1]) << 16) | // Next byte.
+           (uint32_t(p[2]) << 8)  | // Next byte.
+           uint32_t(p[3]);          // Least-significant byte.
+}
+
+static inline uint32_t load_be_u32(constant const uint8_t* p) {
+    return (uint32_t(p[0]) << 24) | // Most-significant byte.
+           (uint32_t(p[1]) << 16) | // Next byte.
+           (uint32_t(p[2]) << 8)  | // Next byte.
+           uint32_t(p[3]);          // Least-significant byte.
+}
+
 // Write one 32-bit word into 4 bytes in big-endian order.
 static inline void store_be_u32(thread uint8_t* p, uint32_t v) {
     p[0] = uint8_t((v >> 24) & 0xffu); // Highest byte.
@@ -105,15 +119,48 @@ static inline void sha256_init(thread Sha256Ctx& ctx) {
 }
 
 // Compress exactly one 64-byte SHA-256 block into the running state.
-static inline void sha256_compress(thread Sha256Ctx& ctx, thread const uint8_t* block) {
-    uint32_t w[64]; // Message schedule array for this block.
+#define SHA256_EXPAND(i) \
+    w[(i)] = ssig1(w[(i) - 2]) + w[(i) - 7] + ssig0(w[(i) - 15]) + w[(i) - 16]
 
-    for (uint i = 0; i < 16; ++i) { // First 16 words come directly from the 64-byte input block.
-        w[i] = load_be_u32(block + (i * 4u)); // Convert each 4-byte chunk to a 32-bit word.
-    }
-    for (uint i = 16; i < 64; ++i) { // Remaining words are expanded from previous schedule words.
-        w[i] = ssig1(w[i - 2]) + w[i - 7] + ssig0(w[i - 15]) + w[i - 16]; // Standard SHA-256 schedule formula.
-    }
+#define SHA256_EXPAND_16(base) \
+    SHA256_EXPAND((base) + 0);  \
+    SHA256_EXPAND((base) + 1);  \
+    SHA256_EXPAND((base) + 2);  \
+    SHA256_EXPAND((base) + 3);  \
+    SHA256_EXPAND((base) + 4);  \
+    SHA256_EXPAND((base) + 5);  \
+    SHA256_EXPAND((base) + 6);  \
+    SHA256_EXPAND((base) + 7);  \
+    SHA256_EXPAND((base) + 8);  \
+    SHA256_EXPAND((base) + 9);  \
+    SHA256_EXPAND((base) + 10); \
+    SHA256_EXPAND((base) + 11); \
+    SHA256_EXPAND((base) + 12); \
+    SHA256_EXPAND((base) + 13); \
+    SHA256_EXPAND((base) + 14); \
+    SHA256_EXPAND((base) + 15)
+
+#define SHA256_ROUND(i, a, b, c, d, e, f, g, h) do { \
+    uint32_t t1_ = (h) + bsig1((e)) + ch32((e), (f), (g)) + SHA256_K[(i)] + w[(i)]; \
+    uint32_t t2_ = bsig0((a)) + maj32((a), (b), (c)); \
+    (d) += t1_; \
+    (h) = t1_ + t2_; \
+} while (0)
+
+#define SHA256_ROUND_8(base, a, b, c, d, e, f, g, h) \
+    SHA256_ROUND((base) + 0, a, b, c, d, e, f, g, h); \
+    SHA256_ROUND((base) + 1, h, a, b, c, d, e, f, g); \
+    SHA256_ROUND((base) + 2, g, h, a, b, c, d, e, f); \
+    SHA256_ROUND((base) + 3, f, g, h, a, b, c, d, e); \
+    SHA256_ROUND((base) + 4, e, f, g, h, a, b, c, d); \
+    SHA256_ROUND((base) + 5, d, e, f, g, h, a, b, c); \
+    SHA256_ROUND((base) + 6, c, d, e, f, g, h, a, b); \
+    SHA256_ROUND((base) + 7, b, c, d, e, f, g, h, a)
+
+static inline void sha256_compress_words(thread Sha256Ctx& ctx, thread uint32_t w[64]) {
+    SHA256_EXPAND_16(16);
+    SHA256_EXPAND_16(32);
+    SHA256_EXPAND_16(48);
 
     uint32_t a = ctx.state[0]; // Working variable a starts from current hash state.
     uint32_t b = ctx.state[1]; // Working variable b.
@@ -124,18 +171,14 @@ static inline void sha256_compress(thread Sha256Ctx& ctx, thread const uint8_t* 
     uint32_t g = ctx.state[6]; // Working variable g.
     uint32_t h = ctx.state[7]; // Working variable h.
 
-    for (uint i = 0; i < 64; ++i) { // 64 SHA-256 rounds.
-        uint32_t t1 = h + bsig1(e) + ch32(e, f, g) + SHA256_K[i] + w[i]; // Main round sum #1.
-        uint32_t t2 = bsig0(a) + maj32(a, b, c);                          // Main round sum #2.
-        h = g;               // Shift working registers down.
-        g = f;               // Shift working registers down.
-        f = e;               // Shift working registers down.
-        e = d + t1;          // New e includes previous d + t1.
-        d = c;               // Shift working registers down.
-        c = b;               // Shift working registers down.
-        b = a;               // Shift working registers down.
-        a = t1 + t2;         // New a combines both round sums.
-    }
+    SHA256_ROUND_8(0,  a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8(8,  a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8(16, a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8(24, a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8(32, a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8(40, a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8(48, a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8(56, a, b, c, d, e, f, g, h);
 
     ctx.state[0] += a; // Feed-forward: add working variables back into the hash state.
     ctx.state[1] += b; // Feed-forward for state word 1.
@@ -147,29 +190,126 @@ static inline void sha256_compress(thread Sha256Ctx& ctx, thread const uint8_t* 
     ctx.state[7] += h; // Feed-forward for state word 7.
 }
 
+static inline void sha256_compress(thread Sha256Ctx& ctx, thread const uint8_t* block) {
+    uint32_t w[64]; // Message schedule array for this block.
+    for (uint i = 0; i < 16; ++i) { // First 16 words come directly from the 64-byte input block.
+        w[i] = load_be_u32(block + (i * 4u)); // Convert each 4-byte chunk to a 32-bit word.
+    }
+    sha256_compress_words(ctx, w);
+}
+
+static inline void sha256_compress_device(thread Sha256Ctx& ctx, device const uint8_t* block) {
+    uint32_t w[64];
+    for (uint i = 0; i < 16; ++i) {
+        w[i] = load_be_u32(block + (i * 4u));
+    }
+    sha256_compress_words(ctx, w);
+}
+
+static inline void sha256_compress_constant(thread Sha256Ctx& ctx, constant const uint8_t* block) {
+    uint32_t w[64];
+    for (uint i = 0; i < 16; ++i) {
+        w[i] = load_be_u32(block + (i * 4u));
+    }
+    sha256_compress_words(ctx, w);
+}
+
 // Update SHA-256 state from thread-local memory (`thread` address space).
 // We use this for small local arrays like ipad/opad and inner digest.
 static inline void sha256_update_thread(thread Sha256Ctx& ctx, thread const uint8_t* data, uint32_t len) {
-    for (uint32_t i = 0; i < len; ++i) {        // Consume one byte at a time (simple, correct implementation).
-        ctx.block[ctx.block_len++] = data[i];   // Append byte into current 64-byte block buffer.
-        ctx.total_len += 1;                     // Count total bytes for final bit-length encoding.
-        if (ctx.block_len == 64u) {             // If block buffer is full,
-            sha256_compress(ctx, ctx.block);    // compress it now,
-            ctx.block_len = 0;                  // then reset buffer length for the next block.
+    if (len == 0u) {
+        return;
+    }
+    ctx.total_len += uint64_t(len);             // Count total bytes for final bit-length encoding.
+
+    uint32_t offset = 0u;
+    if (ctx.block_len != 0u) {                  // Fill pending partial block first.
+        const uint32_t need = 64u - ctx.block_len;
+        const uint32_t take = (len < need) ? len : need;
+        for (uint32_t i = 0; i < take; ++i) {
+            ctx.block[ctx.block_len + i] = data[i];
         }
+        ctx.block_len += take;
+        offset += take;
+        if (ctx.block_len == 64u) {
+            sha256_compress(ctx, ctx.block);
+            ctx.block_len = 0u;
+        }
+    }
+
+    while ((len - offset) >= 64u) {             // Compress whole source blocks directly.
+        sha256_compress(ctx, data + offset);
+        offset += 64u;
+    }
+
+    for (; offset < len; ++offset) {            // Buffer only trailing bytes.
+        ctx.block[ctx.block_len++] = data[offset];
     }
 }
 
 // Update SHA-256 state from device memory (`device` address space).
-// We use this for GPU buffers uploaded by the host (candidate secrets, JWT message bytes).
+// We use this for thread-specific GPU buffers uploaded by the host (candidate secrets).
 static inline void sha256_update_device(thread Sha256Ctx& ctx, device const uint8_t* data, uint32_t len) {
-    for (uint32_t i = 0; i < len; ++i) {        // Consume one byte at a time from device memory.
-        ctx.block[ctx.block_len++] = data[i];   // Append to the local 64-byte block buffer.
-        ctx.total_len += 1;                     // Track total length in bytes.
-        if (ctx.block_len == 64u) {             // Compress whenever one full block is available.
-            sha256_compress(ctx, ctx.block);    // Run the SHA-256 compression function.
-            ctx.block_len = 0;                  // Start filling a fresh block.
+    if (len == 0u) {
+        return;
+    }
+    ctx.total_len += uint64_t(len);             // Track total length in bytes once per call.
+
+    uint32_t offset = 0u;
+    if (ctx.block_len != 0u) {                  // Fill pending partial block first.
+        const uint32_t need = 64u - ctx.block_len;
+        const uint32_t take = (len < need) ? len : need;
+        for (uint32_t i = 0; i < take; ++i) {
+            ctx.block[ctx.block_len + i] = data[i];
         }
+        ctx.block_len += take;
+        offset += take;
+        if (ctx.block_len == 64u) {
+            sha256_compress(ctx, ctx.block);
+            ctx.block_len = 0u;
+        }
+    }
+
+    while ((len - offset) >= 64u) {             // Compress whole device blocks directly.
+        sha256_compress_device(ctx, data + offset);
+        offset += 64u;
+    }
+
+    for (; offset < len; ++offset) {            // Buffer only the tail bytes.
+        ctx.block[ctx.block_len++] = data[offset];
+    }
+}
+
+// Update SHA-256 state from constant memory (`constant` address space).
+// Shared JWT message bytes are read by all threads, so `constant` helps on Apple GPUs.
+static inline void sha256_update_constant(thread Sha256Ctx& ctx, constant const uint8_t* data, uint32_t len) {
+    if (len == 0u) {
+        return;
+    }
+    ctx.total_len += uint64_t(len);
+
+    uint32_t offset = 0u;
+    if (ctx.block_len != 0u) {
+        const uint32_t need = 64u - ctx.block_len;
+        const uint32_t take = (len < need) ? len : need;
+        for (uint32_t i = 0; i < take; ++i) {
+            ctx.block[ctx.block_len + i] = data[i];
+        }
+        ctx.block_len += take;
+        offset += take;
+        if (ctx.block_len == 64u) {
+            sha256_compress(ctx, ctx.block);
+            ctx.block_len = 0u;
+        }
+    }
+
+    while ((len - offset) >= 64u) {
+        sha256_compress_constant(ctx, data + offset);
+        offset += 64u;
+    }
+
+    for (; offset < len; ++offset) {
+        ctx.block[ctx.block_len++] = data[offset];
     }
 }
 
@@ -201,16 +341,45 @@ static inline void sha256_final(thread Sha256Ctx& ctx, thread uint8_t out[32]) {
     }
 }
 
+// Specialized finalization for appending a known 32-byte tail when `ctx.block_len == 0`.
+// This virtualizes the final SHA-256 block as message words instead of materializing a 64-byte buffer.
+static inline void sha256_final_append_tail32(thread Sha256Ctx& ctx, thread const uint8_t tail[32], thread uint8_t out[32]) {
+    uint32_t w[64];
+    for (uint i = 0; i < 8; ++i) {                 // Tail contributes exactly 8 words.
+        w[i] = load_be_u32(tail + (i * 4u));
+    }
+    w[8] = 0x80000000u;                            // Append 0x80 then zeros in big-endian word form.
+    w[9] = 0u;
+    w[10] = 0u;
+    w[11] = 0u;
+    w[12] = 0u;
+    w[13] = 0u;
+
+    const uint64_t final_total_len = ctx.total_len + 32ull;
+    const uint64_t bit_len = final_total_len * 8ull;
+    w[14] = uint32_t((bit_len >> 32u) & 0xffffffffull);
+    w[15] = uint32_t(bit_len & 0xffffffffull);
+
+    ctx.total_len = final_total_len;
+    sha256_compress_words(ctx, w);
+    ctx.block_len = 0u;
+
+    for (uint i = 0; i < 8; ++i) {
+        store_be_u32(out + (i * 4u), ctx.state[i]);
+    }
+}
+
 // Compute HMAC-SHA256(key, message) into `out`.
-// `key` and `message` both live in device memory because they come from host-uploaded buffers.
+// `key` lives in device memory (candidate-specific), `message` lives in constant memory (shared JWT input).
 static inline void hmac_sha256(
     device const uint8_t* key,                  // Candidate secret bytes (wordlist entry) for this thread.
     uint32_t key_len,                           // Candidate secret length in bytes.
-    device const uint8_t* message,              // Shared JWT signing input bytes (`header.payload`).
+    constant const uint8_t* message,            // Shared JWT signing input bytes (`header.payload`).
     uint32_t message_len,                       // Length of the JWT signing input.
     thread uint8_t out[32]                      // Output digest buffer in thread-local memory.
 ) {
     uint8_t key_block[64];                      // HMAC uses a 64-byte block for SHA-256 keys.
+    #pragma unroll
     for (uint i = 0; i < 64; ++i) {             // Start with all zeros (key padding if key is short).
         key_block[i] = 0u;
     }
@@ -221,6 +390,7 @@ static inline void hmac_sha256(
         sha256_init(key_ctx);                   // Initialize SHA-256 context.
         sha256_update_device(key_ctx, key, key_len); // Feed original key bytes.
         sha256_final(key_ctx, hashed_key);      // Finalize into `hashed_key`.
+        #pragma unroll
         for (uint i = 0; i < 32; ++i) {         // Copy hashed key into the 64-byte HMAC key block.
             key_block[i] = hashed_key[i];       // Remaining bytes stay zero-padded.
         }
@@ -232,6 +402,7 @@ static inline void hmac_sha256(
 
     uint8_t ipad[64];                            // Inner padding block (key xor 0x36).
     uint8_t opad[64];                            // Outer padding block (key xor 0x5c).
+    #pragma unroll
     for (uint i = 0; i < 64; ++i) {              // Build both pads byte-by-byte.
         ipad[i] = key_block[i] ^ 0x36u;          // HMAC inner pad constant.
         opad[i] = key_block[i] ^ 0x5cu;          // HMAC outer pad constant.
@@ -241,20 +412,22 @@ static inline void hmac_sha256(
     uint8_t inner_digest[32];                    // Output of SHA256(ipad || message).
     sha256_init(inner);                          // Initialize inner SHA-256.
     sha256_update_thread(inner, ipad, 64u);      // Feed 64-byte ipad from thread memory.
-    sha256_update_device(inner, message, message_len); // Feed shared JWT signing input from device memory.
+    sha256_update_constant(inner, message, message_len); // Feed shared JWT signing input from constant memory.
     sha256_final(inner, inner_digest);           // Finalize inner hash.
 
     Sha256Ctx outer;                             // SHA-256 context for the outer hash.
     sha256_init(outer);                          // Initialize outer SHA-256.
-    sha256_update_thread(outer, opad, 64u);      // Feed 64-byte opad.
-    sha256_update_thread(outer, inner_digest, 32u); // Feed inner digest bytes.
-    sha256_final(outer, out);                    // Final HMAC digest = SHA256(opad || inner_digest).
+    sha256_compress(outer, opad);                // Directly compress opad block (known full block).
+    outer.total_len = 64ull;                     // Account for the compressed opad bytes.
+    outer.block_len = 0u;
+    sha256_final_append_tail32(outer, inner_digest, out); // Final block is fixed-shape: inner_digest || pad || len.
 }
 
 // Compare two 32-byte digests byte-by-byte.
 static inline bool digest_matches(thread const uint8_t digest[32], constant const uint8_t target[32]) {
-    for (uint i = 0; i < 32; ++i) {              // Check every digest byte.
-        if (digest[i] != target[i]) {            // Mismatch means this candidate secret is wrong.
+    #pragma unroll
+    for (uint i = 0; i < 8; ++i) {               // Compare as 8 big-endian words to reduce branch checks.
+        if (load_be_u32(digest + (i * 4u)) != load_be_u32(target + (i * 4u))) {
             return false;                        // Exit early on first mismatch.
         }
     }
@@ -264,7 +437,7 @@ static inline bool digest_matches(thread const uint8_t digest[32], constant cons
 // Main compute kernel: one GPU thread tests exactly one candidate secret from the wordlist batch.
 kernel void hs256_brute_force(
     constant Hs256BruteForceParams& params [[buffer(0)]], // Small shared params uploaded by Rust.
-    device const uint8_t* message_bytes [[buffer(1)]],    // JWT signing input bytes (`header.payload`).
+    constant const uint8_t* message_bytes [[buffer(1)]],  // JWT signing input bytes (`header.payload`).
     device const uint8_t* word_bytes [[buffer(2)]],       // Packed wordlist bytes for this batch.
     device const uint32_t* word_offsets [[buffer(3)]],    // Start offset of each candidate into `word_bytes`.
     device const uint16_t* word_lengths [[buffer(4)]],    // Length of each candidate secret.

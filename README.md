@@ -82,3 +82,33 @@ Exit codes:
 - This project currently targets the `hs256_brute_force` Metal kernel only.
 - `--wordlist` is the only supported flag.
 - The default `breach.txt` is ignored by git (not included in the repo).
+
+## Performance benchmarking (before/after kernel changes)
+
+Use the same JWT and wordlist ordering for every run so `RATE .../s` numbers are comparable.
+
+Recommended scenarios:
+
+- Short signing input (`header.payload` < 128 bytes), mostly short candidate secrets
+- Medium signing input (~512 bytes), mostly short candidate secrets
+- Large signing input (> 1 KB), mostly short candidate secrets
+
+Example workflow:
+
+```bash
+# Build once in release mode
+cargo build --release
+
+# Run and capture throughput logs (stderr includes RATE/STATS lines)
+JWT="$(cat jwt_example.txt)"
+./target/release/jotcrack "$JWT" --wordlist ./my_wordlist.txt 2>bench.log
+
+# Extract throughput snapshots
+rg '^RATE |^STATS|^  rate:' bench.log
+```
+
+Benchmarking guidance:
+
+- Run each scenario at least 3 times and compare median throughput.
+- Keep the machine in a similar thermal/power state.
+- Record candidate count and elapsed time along with the reported rate.
