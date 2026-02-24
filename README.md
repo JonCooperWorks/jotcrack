@@ -1,0 +1,84 @@
+# jotcrack
+
+GPU-assisted HS256 JWT secret brute forcing on macOS using Metal.
+
+## What it does
+
+`jotcrack` takes:
+
+- a JWT (must use `alg=HS256`)
+- a wordlist file (one candidate secret per line)
+
+It computes HMAC-SHA256 candidates on the GPU and prints the first matching secret if found.
+
+## Requirements
+
+- macOS (Apple Metal is required)
+- Rust toolchain (`cargo`)
+- A wordlist file (default: `breach.txt`)
+
+## Build
+
+```bash
+cargo build --release
+```
+
+## Usage
+
+```bash
+cargo run --release -- '<jwt>' [--wordlist <path>]
+```
+
+Or run the built binary:
+
+```bash
+./target/release/jotcrack '<jwt>' [--wordlist <path>]
+```
+
+## Examples
+
+Use the sample JWT in `jwt_example.txt`:
+
+```bash
+JWT="$(cat jwt_example.txt)"
+cargo run --release -- "$JWT" --wordlist ./my_wordlist.txt
+```
+
+If you omit `--wordlist`, it uses `breach.txt` in the project root:
+
+```bash
+cargo run --release -- "$JWT"
+```
+
+## Wordlist format
+
+- Plain text file
+- One candidate secret per line
+- Empty lines are ignored
+- Very long lines are rejected (over 65535 bytes)
+
+## Output and exit codes
+
+Output:
+
+- `FOUND <secret>` when a match is found
+- `NOT FOUND` when no candidate matches
+- `ERROR: ...` for invalid input / runtime failures
+
+Exit codes:
+
+- `0` = found
+- `1` = not found
+- `2` = error
+
+## JWT constraints
+
+- JWT must have exactly 3 dot-separated segments
+- Header must decode as JSON with `"alg": "HS256"`
+- Signature must be valid base64url and decode to 32 bytes
+
+## Notes
+
+- This project currently targets the `hs256_brute_force` Metal kernel only.
+- `--wordlist` is the only supported flag.
+- The default `breach.txt` is ignored by git (not included in the repo).
