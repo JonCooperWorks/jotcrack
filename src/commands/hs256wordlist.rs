@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,8 +11,10 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Args;
 use memmap2::{Mmap, MmapOptions};
-use metal::{Buffer, CompileOptions, Device, MTLResourceOptions, MTLSize};
+use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
 use serde::Deserialize;
+#[cfg(test)]
+use std::io::BufRead;
 
 // ---- Runtime configuration / tuning knobs ---------------------------------
 // These constants define how much work we package into one GPU dispatch and how
@@ -76,25 +77,51 @@ struct Hs256BruteForceParams {
 // Instead of storing `Vec<String>` per candidate (which is allocation-heavy for
 // huge wordlists), we store one contiguous byte blob plus offset/length tables.
 // This minimizes host memory churn and matches the GPU kernel input format.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct WordBatch {
     candidate_index_base: u32,
-    word_bytes: Vec<u8>,
-    word_offsets: Vec<u32>,
-    word_lengths: Vec<u16>,
+    // Buffers that are directly bound to the kernel at dispatch time.
+    // The producer fills them; the consumer reuses the same allocations.
+    word_bytes_buf: metal::Buffer,
+    word_offsets_buf: metal::Buffer,
+    word_lengths_buf: metal::Buffer,
+    // Cached CPU-visible base pointers for the shared buffers.
+    // This avoids repeated `contents()` Objective-C calls in the hot parser loop.
+    word_bytes_ptr: usize,
+    word_offsets_ptr: usize,
+    word_lengths_ptr: usize,
+    // Logical initialized prefix lengths within the fixed-size Metal buffers.
+    candidate_count: usize,
+    word_bytes_len: usize,
     max_word_len: u16,
 }
 
 impl WordBatch {
-    // Preallocate based on batch caps to reduce allocator traffic in the hot
-    // parsing path. We intentionally do not preallocate the full 32 MiB blob to
-    // avoid wasting memory on smaller batches.
-    fn new(candidate_index_base: u32) -> Self {
+    // Allocate fixed-capacity shared buffers sized to the batch caps so parser
+    // writes can go straight into memory later bound to the kernel.
+    fn new(device: &Device, candidate_index_base: u32) -> Self {
+        let options = MTLResourceOptions::StorageModeShared;
+        let word_bytes_buf = device.new_buffer(MAX_WORD_BYTES_PER_BATCH as u64, options);
+        let word_offsets_buf = device.new_buffer(
+            (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u32>()) as u64,
+            options,
+        );
+        let word_lengths_buf = device.new_buffer(
+            (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u16>()) as u64,
+            options,
+        );
+        // `contents()` is stable for the lifetime of each buffer allocation, so
+        // we cache the pointers once and use raw pointer math in `push_candidate`.
         Self {
             candidate_index_base,
-            word_bytes: Vec::with_capacity(MAX_WORD_BYTES_PER_BATCH.min(256 * 1024)),
-            word_offsets: Vec::with_capacity(MAX_CANDIDATES_PER_BATCH),
-            word_lengths: Vec::with_capacity(MAX_CANDIDATES_PER_BATCH),
+            word_bytes_ptr: word_bytes_buf.contents() as usize,
+            word_offsets_ptr: word_offsets_buf.contents() as usize,
+            word_lengths_ptr: word_lengths_buf.contents() as usize,
+            word_bytes_buf,
+            word_offsets_buf,
+            word_lengths_buf,
+            candidate_count: 0,
+            word_bytes_len: 0,
             max_word_len: 0,
         }
     }
@@ -102,40 +129,133 @@ impl WordBatch {
     // Reuse batch allocations across producer iterations to reduce allocator
     // churn in the parsing hot path while preserving the same batch semantics.
     fn reset_for_reuse(&mut self, candidate_index_base: u32) {
-        // `clear()` keeps the capacity but drops the logical length to zero.
-        // That is exactly what we want here: recycle the backing allocations
-        // (often large) while making the batch look freshly constructed.
         self.candidate_index_base = candidate_index_base;
-        self.word_bytes.clear();
-        self.word_offsets.clear();
-        self.word_lengths.clear();
+        self.candidate_count = 0;
+        self.word_bytes_len = 0;
         self.max_word_len = 0;
     }
 
     // A batch is considered empty when it has no candidate metadata entries.
-    // `word_bytes` alone is not a sufficient signal because parsing may not
-    // have appended anything yet.
     fn is_empty(&self) -> bool {
-        self.word_offsets.is_empty()
+        self.candidate_count == 0
     }
 
     // Number of candidates packaged for this dispatch.
     fn candidate_count(&self) -> usize {
-        self.word_offsets.len()
+        self.candidate_count
     }
 
-    // Number of packed candidate bytes uploaded for this dispatch.
+    // Number of packed candidate bytes for this dispatch.
     fn word_bytes_len(&self) -> usize {
-        self.word_bytes.len()
+        self.word_bytes_len
+    }
+
+    fn max_word_len(&self) -> u16 {
+        self.max_word_len
+    }
+
+    fn offsets_buffer(&self) -> &metal::Buffer {
+        &self.word_offsets_buf
+    }
+
+    fn lengths_buffer(&self) -> &metal::Buffer {
+        &self.word_lengths_buf
+    }
+
+    fn word_bytes_buffer(&self) -> &metal::Buffer {
+        &self.word_bytes_buf
+    }
+
+    fn offsets_slice(&self) -> &[u32] {
+        // SAFETY: `word_offsets_buf` stores `u32` entries; the first
+        // `candidate_count` entries are initialized by `push_candidate`.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.word_offsets_ptr as *const u32,
+                self.candidate_count,
+            )
+        }
+    }
+
+    fn lengths_slice(&self) -> &[u16] {
+        // SAFETY: `word_lengths_buf` stores `u16` entries; the first
+        // `candidate_count` entries are initialized by `push_candidate`.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.word_lengths_ptr as *const u16,
+                self.candidate_count,
+            )
+        }
+    }
+
+    fn word_bytes_slice(&self) -> &[u8] {
+        // SAFETY: the first `word_bytes_len` bytes are initialized by
+        // `push_candidate`.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.word_bytes_ptr as *const u8,
+                self.word_bytes_len,
+            )
+        }
+    }
+
+    fn can_fit(&self, line_len: usize) -> bool {
+        // Preserve the original batching rule:
+        // - always enforce candidate-count cap
+        // - only enforce byte-cap after the first candidate is present
+        let would_exceed_count = self.candidate_count >= MAX_CANDIDATES_PER_BATCH;
+        let would_exceed_bytes =
+            self.candidate_count != 0 && (self.word_bytes_len + line_len > MAX_WORD_BYTES_PER_BATCH);
+        !(would_exceed_count || would_exceed_bytes)
+    }
+
+    fn push_candidate(&mut self, line: &[u8]) -> anyhow::Result<()> {
+        if line.len() > u16::MAX as usize {
+            bail!("wordlist entry exceeds {} bytes", u16::MAX);
+        }
+        if !self.can_fit(line.len()) {
+            bail!("batch capacity exceeded while packing candidate");
+        }
+
+        // Offsets are byte offsets into the packed `word_bytes` blob, not global
+        // wordlist indices. The kernel uses (offset, length) to reconstruct each
+        // candidate inside the contiguous payload.
+        let offset = u32::try_from(self.word_bytes_len).context("packed word bytes exceed u32")?;
+        let index = self.candidate_count;
+        let line_len = line.len();
+        debug_assert!(index < MAX_CANDIDATES_PER_BATCH);
+        debug_assert!(self.word_bytes_len + line_len <= MAX_WORD_BYTES_PER_BATCH);
+
+        // SAFETY: capacities are fixed to the batch caps, `index` and
+        // `word_bytes_len..word_bytes_len+line_len` are in-bounds, and writes are
+        // serialized by exclusive `&mut self`.
+        //
+        // Layout invariant written here (must match Metal kernel expectations):
+        // `offsets[i]` = start in `word_bytes`, `lengths[i]` = candidate length,
+        // and `word_bytes` contains candidates concatenated with no separators.
+        unsafe {
+            *(self.word_offsets_ptr as *mut u32).add(index) = offset;
+            *(self.word_lengths_ptr as *mut u16).add(index) = line_len as u16;
+            std::ptr::copy_nonoverlapping(
+                line.as_ptr(),
+                (self.word_bytes_ptr as *mut u8).add(self.word_bytes_len),
+                line_len,
+            );
+        }
+
+        self.candidate_count += 1;
+        self.word_bytes_len += line_len;
+        self.max_word_len = self.max_word_len.max(line_len as u16);
+        Ok(())
     }
 
     // Reconstruct a candidate slice from the packed storage.
     // Offsets and lengths are guaranteed to have matching indices by the batch
     // builders, so any `None` here indicates a bug or invalid GPU result.
     fn word(&self, local_index: usize) -> Option<&[u8]> {
-        let start = *self.word_offsets.get(local_index)? as usize;
-        let len = *self.word_lengths.get(local_index)? as usize;
-        self.word_bytes.get(start..start + len)
+        let start = *self.offsets_slice().get(local_index)? as usize;
+        let len = *self.lengths_slice().get(local_index)? as usize;
+        self.word_bytes_slice().get(start..start + len)
     }
 
     // Human-readable reconstruction for final reporting. We keep this lossy to
@@ -143,10 +263,54 @@ impl WordBatch {
     fn word_string_lossy(&self, local_index: usize) -> Option<String> {
         Some(String::from_utf8_lossy(self.word(local_index)?).into_owned())
     }
+
+    fn as_dispatch_view(&self) -> DispatchBatchView<'_> {
+        // Views let us dispatch or autotune against the same buffers without
+        // cloning `WordBatch` or copying any payload bytes.
+        DispatchBatchView {
+            candidate_index_base: self.candidate_index_base,
+            candidate_count: self.candidate_count,
+            max_word_len: self.max_word_len(),
+            word_bytes_buf: self.word_bytes_buffer(),
+            word_offsets_buf: self.offsets_buffer(),
+            word_lengths_buf: self.lengths_buffer(),
+        }
+    }
+
+    fn prefix_dispatch_view(&self, sample_count: usize) -> Option<DispatchBatchView<'_>> {
+        if sample_count == 0 || sample_count > self.candidate_count {
+            return None;
+        }
+        // Recompute the maximum length for the sampled prefix so autotune picks
+        // the same kernel variant (short-key vs mixed) it would use for that
+        // subset during a real dispatch.
+        let lengths = self.lengths_slice();
+        let max_word_len = lengths[..sample_count].iter().copied().max().unwrap_or(0);
+        Some(DispatchBatchView {
+            candidate_index_base: self.candidate_index_base,
+            candidate_count: sample_count,
+            max_word_len,
+            word_bytes_buf: &self.word_bytes_buf,
+            word_offsets_buf: &self.word_offsets_buf,
+            word_lengths_buf: &self.word_lengths_buf,
+        })
+    }
 }
 
-// Shared helper for both readers so CRLF and LF wordlists behave identically.
-// Returning a subslice avoids an allocation on the trim step itself.
+#[derive(Clone, Copy)]
+struct DispatchBatchView<'a> {
+    // Minimal metadata + buffer references required to dispatch a full batch or
+    // sampled prefix batch without owning the storage.
+    candidate_index_base: u32,
+    candidate_count: usize,
+    max_word_len: u16,
+    word_bytes_buf: &'a metal::Buffer,
+    word_offsets_buf: &'a metal::Buffer,
+    word_lengths_buf: &'a metal::Buffer,
+}
+
+// Shared helper used by parser tests to verify CRLF/LF parity.
+#[cfg(test)]
 fn trim_line_endings(bytes: &[u8]) -> &[u8] {
     let mut end = bytes.len();
     while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
@@ -155,11 +319,13 @@ fn trim_line_endings(bytes: &[u8]) -> &[u8] {
     &bytes[..end]
 }
 
-// Streaming reader fallback (and test-friendly implementation).
+// Test-only streaming reader used for parser unit tests. Runtime uses mmap-only.
 //
-// This path is slower than mmap for large local files, but it preserves the
-// same batching rules and correctness guarantees when mmap is unavailable.
+// Keeping this path test-only lets us use `Cursor` for parser behavior tests
+// without carrying a slower runtime fallback that would skew performance tuning.
+#[cfg(test)]
 struct BufferedWordlistBatchReader<R: BufRead> {
+    device: Device,
     reader: R,
     line_buf: Vec<u8>,
     pending_line: Option<Vec<u8>>,
@@ -167,10 +333,12 @@ struct BufferedWordlistBatchReader<R: BufRead> {
     done: bool,
 }
 
+#[cfg(test)]
 impl<R: BufRead> BufferedWordlistBatchReader<R> {
     // Construct a buffered batch reader over any `BufRead` source.
-    fn new(reader: R) -> Self {
+    fn new(device: Device, reader: R) -> Self {
         Self {
+            device,
             reader,
             line_buf: Vec::new(),
             pending_line: None,
@@ -198,16 +366,17 @@ impl<R: BufRead> BufferedWordlistBatchReader<R> {
         let candidate_index_base = self.next_index;
         let mut batch = if let Some(mut batch) = recycled {
             // Reuse the producer-owned allocation when available. This avoids
-            // re-allocating `word_bytes` / metadata vectors every batch.
+            // re-allocating large Metal buffers on every batch and preserves the
+            // cached base pointers stored in `WordBatch`.
             //
             // Important invariant: recycled batches are only returned after the
             // consumer has finished GPU dispatch for that batch, so no aliasing
-            // exists while we mutate the vectors again.
+            // exists while we mutate the buffers again.
             batch.reset_for_reuse(candidate_index_base);
             batch
         } else {
-            // Fallback on startup or when the recycle queue is empty/full.
-            WordBatch::new(candidate_index_base)
+            // Fresh allocation on startup or when the recycle queue is empty/full.
+            WordBatch::new(&self.device, candidate_index_base)
         };
 
         loop {
@@ -242,10 +411,7 @@ impl<R: BufRead> BufferedWordlistBatchReader<R> {
                 );
             }
 
-            let would_exceed_count = batch.word_offsets.len() >= MAX_CANDIDATES_PER_BATCH;
-            let would_exceed_bytes = !batch.word_offsets.is_empty()
-                && (batch.word_bytes.len() + line.len() > MAX_WORD_BYTES_PER_BATCH);
-            if would_exceed_count || would_exceed_bytes {
+            if !batch.can_fit(line.len()) {
                 // Preserve the line for the next call so batch boundaries do
                 // not drop or duplicate candidates.
                 //
@@ -255,12 +421,7 @@ impl<R: BufRead> BufferedWordlistBatchReader<R> {
                 break;
             }
 
-            let offset =
-                u32::try_from(batch.word_bytes.len()).context("packed word bytes exceed u32")?;
-            batch.word_offsets.push(offset);
-            batch.word_lengths.push(line.len() as u16);
-            batch.max_word_len = batch.max_word_len.max(line.len() as u16);
-            batch.word_bytes.extend_from_slice(&line);
+            batch.push_candidate(&line)?;
             self.next_index = self
                 .next_index
                 .checked_add(1)
@@ -277,10 +438,10 @@ impl<R: BufRead> BufferedWordlistBatchReader<R> {
 
 // mmap-backed reader for high-throughput local files.
 //
-// We still copy candidate bytes into `WordBatch` because the GPU upload path
-// wants a compact batch-sized byte buffer, but parsing itself avoids per-line
-// I/O calls and syscalls.
+// mmap removes per-line read syscalls. We still copy candidate bytes once into
+// the packed batch buffer because the kernel expects a contiguous payload.
 struct MmapWordlistBatchReader {
+    device: Device,
     mmap: Mmap,
     cursor: usize,
     next_index: u32,
@@ -288,8 +449,9 @@ struct MmapWordlistBatchReader {
 
 impl MmapWordlistBatchReader {
     // Wrap a mapped wordlist file for sequential batch extraction.
-    fn new(mmap: Mmap) -> Self {
+    fn new(device: Device, mmap: Mmap) -> Self {
         Self {
+            device,
             mmap,
             cursor: 0,
             next_index: 0,
@@ -313,7 +475,7 @@ impl MmapWordlistBatchReader {
             batch.reset_for_reuse(self.next_index);
             batch
         } else {
-            WordBatch::new(self.next_index)
+            WordBatch::new(&self.device, self.next_index)
         };
         while self.cursor < bytes.len() {
             // Find the next line without allocating intermediate strings.
@@ -347,10 +509,7 @@ impl MmapWordlistBatchReader {
                 );
             }
 
-            let would_exceed_count = batch.word_offsets.len() >= MAX_CANDIDATES_PER_BATCH;
-            let would_exceed_bytes = !batch.word_offsets.is_empty()
-                && (batch.word_bytes.len() + line_len > MAX_WORD_BYTES_PER_BATCH);
-            if would_exceed_count || would_exceed_bytes {
+            if !batch.can_fit(line_len) {
                 // Unlike the buffered reader there is no `pending_line`: we can
                 // simply leave `cursor` at the current line start and retry on
                 // the next call.
@@ -359,14 +518,7 @@ impl MmapWordlistBatchReader {
                 break;
             }
 
-            let offset =
-                u32::try_from(batch.word_bytes.len()).context("packed word bytes exceed u32")?;
-            batch.word_offsets.push(offset);
-            batch.word_lengths.push(line_len as u16);
-            batch.max_word_len = batch.max_word_len.max(line_len as u16);
-            batch
-                .word_bytes
-                .extend_from_slice(&bytes[line_start..trimmed_end]);
+            batch.push_candidate(&bytes[line_start..trimmed_end])?;
             self.cursor = next_cursor;
             self.next_index = self
                 .next_index
@@ -382,32 +534,21 @@ impl MmapWordlistBatchReader {
     }
 }
 
-// Small abstraction so the producer thread can treat mmap and buffered parsing
-// uniformly once startup chooses the best available strategy.
+// Small abstraction so the producer thread can remain agnostic to reader
+// details. Runtime currently has a single concrete path (mmap).
 enum AnyWordlistBatchReader {
-    Buffered(BufferedWordlistBatchReader<BufReader<File>>),
     Mmap(MmapWordlistBatchReader),
 }
 
 impl AnyWordlistBatchReader {
-    // Prefer mmap for large local wordlists; fall back to buffered I/O when
-    // mapping is unavailable (permissions, filesystem constraints, etc.).
-    fn new(path: &PathBuf) -> anyhow::Result<Self> {
+    // Runtime path is mmap-only. If mapping fails, return an error instead of
+    // silently switching to a slower path (which would hide perf regressions).
+    fn new(device: Device, path: &PathBuf) -> anyhow::Result<Self> {
         let file = File::open(path)
             .with_context(|| format!("failed to open wordlist {}", path.display()))?;
-        match unsafe { MmapOptions::new().map(&file) } {
-            Ok(mmap) => Ok(Self::Mmap(MmapWordlistBatchReader::new(mmap))),
-            Err(err) => {
-                eprintln!(
-                    "WORDLIST: mmap failed for {} ({}), falling back to buffered I/O",
-                    path.display(),
-                    err
-                );
-                Ok(Self::Buffered(BufferedWordlistBatchReader::new(
-                    BufReader::new(file),
-                )))
-            }
-        }
+        let mmap = unsafe { MmapOptions::new().map(&file) }
+            .with_context(|| format!("failed to mmap wordlist {}", path.display()))?;
+        Ok(Self::Mmap(MmapWordlistBatchReader::new(device, mmap)))
     }
 
     // Forward batch production to the selected reader strategy.
@@ -418,7 +559,6 @@ impl AnyWordlistBatchReader {
         // `recycled` is moved into exactly one concrete reader branch, so the
         // batch allocation has a single owner throughout the rebuild step.
         match self {
-            Self::Buffered(reader) => reader.next_batch_reusing(recycled),
             Self::Mmap(reader) => reader.next_batch_reusing(recycled),
         }
     }
@@ -450,7 +590,7 @@ struct WordlistProducer {
 impl WordlistProducer {
     // Start the producer thread immediately so parsing can begin while the
     // consumer is initializing autotune / first dispatch state.
-    fn spawn(wordlist_path: PathBuf) -> Self {
+    fn spawn(wordlist_path: PathBuf, device: Device) -> Self {
         let (tx, rx) = sync_channel(DEFAULT_PIPELINE_DEPTH);
         // Match the forward pipeline depth so we can recycle a small pool of
         // batch allocations without letting memory usage grow unbounded.
@@ -459,7 +599,8 @@ impl WordlistProducer {
         let stop_for_thread = Arc::clone(&stop);
         let tx_err = tx.clone();
         let handle = thread::spawn(move || {
-            if let Err(err) = run_wordlist_producer(wordlist_path, stop_for_thread, tx, recycle_rx)
+            if let Err(err) =
+                run_wordlist_producer(wordlist_path, device, stop_for_thread, tx, recycle_rx)
             {
                 // Best effort: the receiver may already be dropped on early exit.
                 let _ = tx_err.send(ProducerMessage::Error(format!("{err:#}")));
@@ -520,13 +661,14 @@ impl WordlistProducer {
 // EOF, stop requested, or the receiver is dropped.
 fn run_wordlist_producer(
     wordlist_path: PathBuf,
+    device: Device,
     stop: Arc<AtomicBool>,
     tx: SyncSender<ProducerMessage>,
     // Optional returned batches from the consumer. The producer owns the next
     // parse/build step, so this is where allocation reuse naturally fits.
     recycle_rx: Receiver<WordBatch>,
 ) -> anyhow::Result<()> {
-    let mut reader = AnyWordlistBatchReader::new(&wordlist_path)?;
+    let mut reader = AnyWordlistBatchReader::new(device, &wordlist_path)?;
     while !stop.load(Ordering::Relaxed) {
         // The producer reports build time per batch so the consumer can measure
         // how much parsing work is hidden behind GPU compute.
@@ -553,28 +695,27 @@ fn run_wordlist_producer(
     Ok(())
 }
 
-// Owns Metal objects and persistent shared buffers for repeated dispatches.
-// The struct is intentionally stateful so we can avoid per-batch allocations.
+// Owns Metal objects and the small persistent buffers reused across dispatches.
+//
+// Large per-batch payload buffers now live in `WordBatch` and are recycled
+// producer<->consumer, which removes the old extra host copy before dispatch.
 struct GpuHs256BruteForcer {
     device: metal::Device,
     queue: metal::CommandQueue,
     pipeline_mixed: metal::ComputePipelineState,
     pipeline_short_keys: metal::ComputePipelineState,
-    params_buf: Buffer,
-    msg_buf: Buffer,
-    word_bytes_buf: Buffer,
-    offsets_buf: Buffer,
-    lengths_buf: Buffer,
-    result_buf: Buffer,
+    params_buf: metal::Buffer,
+    msg_buf: metal::Buffer,
+    result_buf: metal::Buffer,
     message_length: u32,
     threadgroup_width: usize,
 }
 
-// Per-dispatch timing buckets used to separate host upload/encode overhead from
+// Per-dispatch timing buckets used to separate host prep/encode overhead from
 // time spent waiting for GPU completion.
 #[derive(Debug, Clone, Copy, Default)]
 struct BatchDispatchTimings {
-    buffer_alloc_upload: Duration,
+    host_prep: Duration,
     command_encode: Duration,
     gpu_wait: Duration,
     result_readback: Duration,
@@ -585,7 +726,7 @@ struct BatchDispatchTimings {
 #[derive(Debug, Default)]
 struct RunTimings {
     wordlist_batch_build: Duration,
-    buffer_alloc_upload: Duration,
+    host_prep: Duration,
     command_encode: Duration,
     gpu_wait: Duration,
     result_readback: Duration,
@@ -597,10 +738,9 @@ struct RunTimings {
 }
 
 // ---- Host -> Metal shared-buffer copy helpers ------------------------------
-// These helpers centralize the `unsafe` pointer copies used to write shared
-// Metal buffers. Keeping them in one place makes the safety assumptions easy to
-// audit and avoids duplicating pointer arithmetic around dispatch code.
-fn copy_bytes_to_buffer(buffer: &Buffer, data: &[u8]) {
+// After the no-copy refactor these are only for small state writes (params,
+// result sentinel, one-time JWT message upload), not batch payload bytes.
+fn copy_bytes_to_buffer(buffer: &metal::Buffer, data: &[u8]) {
     debug_assert!(buffer.length() as usize >= data.len());
     if data.is_empty() {
         return;
@@ -612,33 +752,13 @@ fn copy_bytes_to_buffer(buffer: &Buffer, data: &[u8]) {
 }
 
 // Convenience wrapper for POD values (params struct, sentinel result value).
-fn copy_value_to_buffer<T>(buffer: &Buffer, value: &T) {
+fn copy_value_to_buffer<T>(buffer: &metal::Buffer, value: &T) {
     copy_bytes_to_buffer(buffer, bytes_of(value));
 }
 
-// Convenience wrapper for typed slices (`u32` offsets, `u16` lengths).
-fn copy_slice_to_buffer<T>(buffer: &Buffer, slice: &[T]) {
-    let len = std::mem::size_of_val(slice);
-    debug_assert!(buffer.length() as usize >= len);
-    if len == 0 {
-        return;
-    }
-    // SAFETY: `slice` is valid for `len` bytes and the destination buffer is large enough.
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            slice.as_ptr().cast::<u8>(),
-            buffer.contents().cast::<u8>(),
-            len,
-        );
-    }
-}
-
 impl GpuHs256BruteForcer {
-    // Compile the Metal kernels, create the command queue, and allocate
-    // persistent shared buffers sized to the configured batch caps.
-    //
-    // This front-loads setup work so the hot dispatch path only performs copies
-    // and encoding instead of allocating new buffers every batch.
+    // Compile the Metal kernels, create the command queue, and allocate the
+    // small persistent buffers shared by every dispatch (params/JWT/result).
     fn new(signing_input: &[u8]) -> anyhow::Result<Self> {
         let device =
             Device::system_default().ok_or_else(|| anyhow!("no Metal device available"))?;
@@ -685,17 +805,6 @@ impl GpuHs256BruteForcer {
         // once and reuse the same shared buffer for every dispatch.
         copy_bytes_to_buffer(&msg_buf, signing_input);
 
-        // These capacities mirror the batch caps so any valid `WordBatch` fits
-        // without reallocation or buffer resizing.
-        let word_bytes_buf = device.new_buffer(MAX_WORD_BYTES_PER_BATCH as u64, options);
-        let offsets_buf = device.new_buffer(
-            (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u32>()) as u64,
-            options,
-        );
-        let lengths_buf = device.new_buffer(
-            (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u16>()) as u64,
-            options,
-        );
         let result_buf = device.new_buffer(std::mem::size_of::<u32>() as u64, options);
         copy_value_to_buffer(&result_buf, &RESULT_NOT_FOUND_SENTINEL);
 
@@ -706,18 +815,16 @@ impl GpuHs256BruteForcer {
             pipeline_short_keys,
             params_buf,
             msg_buf,
-            word_bytes_buf,
-            offsets_buf,
-            lengths_buf,
             result_buf,
             message_length,
             threadgroup_width,
         })
     }
 
-    // Select the specialized short-key kernel when every candidate in the batch
-    // is <= 64 bytes; otherwise fall back to the mixed kernel for correctness.
-    fn active_pipeline_for_batch(&self, batch: &WordBatch) -> &metal::ComputePipelineState {
+    // Select the specialized short-key kernel when every candidate in the
+    // dispatch view is <= 64 bytes; otherwise fall back to the mixed kernel.
+    // `DispatchBatchView` lets autotune reuse this logic on a sampled prefix.
+    fn active_pipeline_for_view(&self, batch: DispatchBatchView<'_>) -> &metal::ComputePipelineState {
         if batch.max_word_len <= 64 {
             &self.pipeline_short_keys
         } else {
@@ -770,20 +877,21 @@ impl GpuHs256BruteForcer {
         target_signature: [u8; 32],
         batch: &WordBatch,
     ) -> anyhow::Result<(Option<u32>, BatchDispatchTimings)> {
-        self.dispatch_batch(target_signature, batch, self.threadgroup_width)
+        self.dispatch_batch_view(target_signature, batch.as_dispatch_view(), self.threadgroup_width)
     }
 
     // Encode and execute a single GPU dispatch, then read back the match index.
     // Timing is split so we can distinguish host overhead from actual GPU wait.
-    fn dispatch_batch(
+    fn dispatch_batch_view(
         &self,
         target_signature: [u8; 32],
-        batch: &WordBatch,
+        batch: DispatchBatchView<'_>,
         threadgroup_width: usize,
     ) -> anyhow::Result<(Option<u32>, BatchDispatchTimings)> {
         let started = Instant::now();
         let mut timings = BatchDispatchTimings::default();
-        let candidate_count = batch.word_offsets.len() as u32;
+        let candidate_count =
+            u32::try_from(batch.candidate_count).context("candidate count exceeds u32")?;
         if candidate_count == 0 {
             timings.total = started.elapsed();
             return Ok((None, timings));
@@ -800,28 +908,27 @@ impl GpuHs256BruteForcer {
             candidate_index_base: batch.candidate_index_base,
         };
 
-        // Host upload phase: copy the current batch metadata/data into shared
-        // buffers and reset the result slot to the sentinel.
-        let upload_started = Instant::now();
+        // Host prep phase: update params and reset the result slot.
+        //
+        // The large offsets/lengths/payload buffers are already populated in
+        // shared memory by the producer thread and are bound directly below.
+        let prep_started = Instant::now();
         copy_value_to_buffer(&self.params_buf, &params);
-        copy_slice_to_buffer(&self.offsets_buf, &batch.word_offsets);
-        copy_slice_to_buffer(&self.lengths_buf, &batch.word_lengths);
-        copy_bytes_to_buffer(&self.word_bytes_buf, &batch.word_bytes);
         copy_value_to_buffer(&self.result_buf, &RESULT_NOT_FOUND_SENTINEL);
-        timings.buffer_alloc_upload = upload_started.elapsed();
+        timings.host_prep = prep_started.elapsed();
 
-        // Encode phase: bind the selected kernel and shared buffers, then
-        // schedule exactly one thread per candidate.
+        // Encode phase: bind the selected kernel and batch-owned shared buffers,
+        // then schedule exactly one thread per candidate.
         let encode_started = Instant::now();
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
-        let pipeline = self.active_pipeline_for_batch(batch);
+        let pipeline = self.active_pipeline_for_view(batch);
         encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(&self.params_buf), 0);
         encoder.set_buffer(1, Some(&self.msg_buf), 0);
-        encoder.set_buffer(2, Some(&self.word_bytes_buf), 0);
-        encoder.set_buffer(3, Some(&self.offsets_buf), 0);
-        encoder.set_buffer(4, Some(&self.lengths_buf), 0);
+        encoder.set_buffer(2, Some(batch.word_bytes_buf), 0);
+        encoder.set_buffer(3, Some(batch.word_offsets_buf), 0);
+        encoder.set_buffer(4, Some(batch.word_lengths_buf), 0);
         encoder.set_buffer(5, Some(&self.result_buf), 0);
 
         let threads_per_group = MTLSize::new(threadgroup_width as u64, 1, 1);
@@ -862,33 +969,13 @@ impl GpuHs256BruteForcer {
         target_signature: [u8; 32],
         batch: &WordBatch,
     ) -> anyhow::Result<()> {
-        let sample_count = batch.word_offsets.len().min(16_384);
+        let sample_count = batch.candidate_count().min(16_384);
         if sample_count == 0 {
             return Ok(());
         }
-
-        let sample_batch = if sample_count == batch.word_offsets.len() {
-            batch.clone()
-        } else {
-            // Build a compact prefix batch so autotune cost stays bounded even
-            // when the first real batch is very large.
-            let keep_bytes = {
-                let last_offset = batch.word_offsets[sample_count - 1] as usize;
-                let last_len = batch.word_lengths[sample_count - 1] as usize;
-                last_offset + last_len
-            };
-            WordBatch {
-                candidate_index_base: batch.candidate_index_base,
-                word_bytes: batch.word_bytes[..keep_bytes].to_vec(),
-                word_offsets: batch.word_offsets[..sample_count].to_vec(),
-                word_lengths: batch.word_lengths[..sample_count].to_vec(),
-                max_word_len: batch.word_lengths[..sample_count]
-                    .iter()
-                    .copied()
-                    .max()
-                    .unwrap_or(0),
-            }
-        };
+        let sample_view = batch
+            .prefix_dispatch_view(sample_count)
+            .ok_or_else(|| anyhow!("failed to build autotune sample view"))?;
 
         let tew = self.thread_execution_width();
         let max_threads = self.max_total_threads_per_threadgroup();
@@ -912,19 +999,19 @@ impl GpuHs256BruteForcer {
 
         eprintln!(
             "AUTOTUNE: benchmarking {} candidates across {} threadgroup widths",
-            sample_batch.word_offsets.len(),
+            sample_view.candidate_count,
             candidates.len()
         );
 
-        // Compare widths using the same sample batch for an apples-to-apples
-        // GPU-only throughput measurement.
+        // Compare widths using the same sampled prefix view for an apples-to-
+        // apples GPU-only throughput measurement (same data, only width changes).
         let mut best: Option<(usize, f64)> = None;
         for width in candidates {
-            let (_result, timings) = self.dispatch_batch(target_signature, &sample_batch, width)?;
+            let (_result, timings) = self.dispatch_batch_view(target_signature, sample_view, width)?;
             if timings.gpu_wait.is_zero() {
                 continue;
             }
-            let rate = sample_batch.word_offsets.len() as f64 / timings.gpu_wait.as_secs_f64();
+            let rate = sample_view.candidate_count as f64 / timings.gpu_wait.as_secs_f64();
             match best {
                 Some((_, best_rate)) if rate <= best_rate => {}
                 _ => best = Some((width, rate)),
@@ -964,7 +1051,7 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
 
     // Start the parser thread before entering the main loop so batch
     // construction can overlap with GPU setup and dispatch wait time.
-    let mut producer = WordlistProducer::spawn(args.wordlist.clone());
+    let mut producer = WordlistProducer::spawn(args.wordlist.clone(), gpu.device.clone());
     let run_result = (|| -> anyhow::Result<bool> {
         let started_at = Instant::now();
         let mut last_rate_report_at = started_at;
@@ -1004,7 +1091,7 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
 
             // Dispatch the batch and accumulate fine-grained timing buckets.
             let (maybe_match, batch_timings) = gpu.try_batch(target_signature, &batch)?;
-            timings.buffer_alloc_upload += batch_timings.buffer_alloc_upload;
+            timings.host_prep += batch_timings.host_prep;
             timings.command_encode += batch_timings.command_encode;
             timings.gpu_wait += batch_timings.gpu_wait;
             timings.result_readback += batch_timings.result_readback;
@@ -1165,7 +1252,7 @@ fn format_human_count(value: f64) -> String {
 
 // Print the final timing breakdown and batch statistics. This intentionally
 // separates end-to-end throughput from GPU-only throughput to highlight host
-// bottlenecks (parsing, uploads, synchronization).
+// bottlenecks (parsing, prep, synchronization).
 fn print_final_stats(
     candidates_tested: u64,
     elapsed: Duration,
@@ -1210,8 +1297,8 @@ fn print_final_stats(
         timings.consumer_idle_wait.as_secs_f64()
     );
     eprintln!(
-        "  timing.buffer_alloc_upload: {:.3}s",
-        timings.buffer_alloc_upload.as_secs_f64()
+        "  timing.host_prep: {:.3}s",
+        timings.host_prep.as_secs_f64()
     );
     eprintln!(
         "  timing.command_encode: {:.3}s",
@@ -1242,6 +1329,10 @@ fn bytes_of<T>(value: &T) -> &[u8] {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn test_device() -> Device {
+        Device::system_default().expect("Metal device is required for hs256wordlist tests")
+    }
 
     // ---- Layout / host-kernel contract tests --------------------------------
     #[test]
@@ -1305,14 +1396,14 @@ mod tests {
     #[test]
     fn wordlist_batch_reader_packs_offsets_and_lengths() {
         let data = b"alpha\r\n\nbe\ncharlie\n";
-        let mut reader = BufferedWordlistBatchReader::new(Cursor::new(data.as_slice()));
+        let mut reader = BufferedWordlistBatchReader::new(test_device(), Cursor::new(data.as_slice()));
         let batch = reader.next_batch().unwrap().unwrap();
 
         assert_eq!(batch.candidate_index_base, 0);
-        assert_eq!(batch.word_offsets, vec![0, 5, 7]);
-        assert_eq!(batch.word_lengths, vec![5, 2, 7]);
-        assert_eq!(batch.word_bytes, b"alphabecharlie");
-        assert_eq!(batch.max_word_len, 7);
+        assert_eq!(batch.offsets_slice(), &[0, 5, 7]);
+        assert_eq!(batch.lengths_slice(), &[5, 2, 7]);
+        assert_eq!(batch.word_bytes_slice(), b"alphabecharlie");
+        assert_eq!(batch.max_word_len(), 7);
         assert_eq!(batch.word(0).unwrap(), b"alpha");
         assert_eq!(batch.word(1).unwrap(), b"be");
         assert_eq!(batch.word(2).unwrap(), b"charlie");
@@ -1323,7 +1414,7 @@ mod tests {
     fn wordlist_batch_reader_rejects_too_long_line() {
         let oversized = "a".repeat((u16::MAX as usize) + 1);
         let data = format!("{oversized}\n");
-        let mut reader = BufferedWordlistBatchReader::new(Cursor::new(data.into_bytes()));
+        let mut reader = BufferedWordlistBatchReader::new(test_device(), Cursor::new(data.into_bytes()));
         let err = reader.next_batch().unwrap_err();
         assert!(format!("{err:#}").contains("exceeds"));
     }
@@ -1337,7 +1428,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let data = format!("{lines}\n");
-        let mut reader = BufferedWordlistBatchReader::new(Cursor::new(data.into_bytes()));
+        let mut reader = BufferedWordlistBatchReader::new(test_device(), Cursor::new(data.into_bytes()));
 
         let first = reader.next_batch().unwrap().unwrap();
         let second = reader.next_batch().unwrap().unwrap();
@@ -1351,7 +1442,7 @@ mod tests {
     // ---- Edge cases: empty input, missing newline, CRLF/LF normalization -----
     #[test]
     fn wordlist_batch_reader_returns_none_for_all_empty_lines() {
-        let mut reader = BufferedWordlistBatchReader::new(Cursor::new(b"\n\r\n".as_slice()));
+        let mut reader = BufferedWordlistBatchReader::new(test_device(), Cursor::new(b"\n\r\n".as_slice()));
         assert!(reader.next_batch().unwrap().is_none());
     }
 
@@ -1359,7 +1450,8 @@ mod tests {
     // Final line handling is a common parser edge case when files do not end in
     // `\n`; behavior should match the normal newline-terminated case.
     fn wordlist_batch_reader_handles_final_line_without_newline() {
-        let mut reader = BufferedWordlistBatchReader::new(Cursor::new(b"alpha\nbeta".as_slice()));
+        let mut reader =
+            BufferedWordlistBatchReader::new(test_device(), Cursor::new(b"alpha\nbeta".as_slice()));
         let batch = reader.next_batch().unwrap().unwrap();
         assert_eq!(batch.candidate_count(), 2);
         assert_eq!(batch.word(0).unwrap(), b"alpha");
