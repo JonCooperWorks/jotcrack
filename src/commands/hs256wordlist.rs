@@ -3,7 +3,7 @@ use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -99,6 +99,19 @@ impl WordBatch {
         }
     }
 
+    // Reuse batch allocations across producer iterations to reduce allocator
+    // churn in the parsing hot path while preserving the same batch semantics.
+    fn reset_for_reuse(&mut self, candidate_index_base: u32) {
+        // `clear()` keeps the capacity but drops the logical length to zero.
+        // That is exactly what we want here: recycle the backing allocations
+        // (often large) while making the batch look freshly constructed.
+        self.candidate_index_base = candidate_index_base;
+        self.word_bytes.clear();
+        self.word_offsets.clear();
+        self.word_lengths.clear();
+        self.max_word_len = 0;
+    }
+
     // A batch is considered empty when it has no candidate metadata entries.
     // `word_bytes` alone is not a sufficient signal because parsing may not
     // have appended anything yet.
@@ -169,13 +182,33 @@ impl<R: BufRead> BufferedWordlistBatchReader<R> {
     // Build the next GPU batch by packing candidates into a contiguous byte
     // buffer plus offset/length tables. This is where most host-side parsing
     // time is spent, so allocation and copies are kept minimal.
+    #[cfg(test)]
     fn next_batch(&mut self) -> anyhow::Result<Option<WordBatch>> {
+        self.next_batch_reusing(None)
+    }
+
+    fn next_batch_reusing(
+        &mut self,
+        recycled: Option<WordBatch>,
+    ) -> anyhow::Result<Option<WordBatch>> {
         if self.done {
             return Ok(None);
         }
 
         let candidate_index_base = self.next_index;
-        let mut batch = WordBatch::new(candidate_index_base);
+        let mut batch = if let Some(mut batch) = recycled {
+            // Reuse the producer-owned allocation when available. This avoids
+            // re-allocating `word_bytes` / metadata vectors every batch.
+            //
+            // Important invariant: recycled batches are only returned after the
+            // consumer has finished GPU dispatch for that batch, so no aliasing
+            // exists while we mutate the vectors again.
+            batch.reset_for_reuse(candidate_index_base);
+            batch
+        } else {
+            // Fallback on startup or when the recycle queue is empty/full.
+            WordBatch::new(candidate_index_base)
+        };
 
         loop {
             let line = if let Some(line) = self.pending_line.take() {
@@ -215,6 +248,9 @@ impl<R: BufRead> BufferedWordlistBatchReader<R> {
             if would_exceed_count || would_exceed_bytes {
                 // Preserve the line for the next call so batch boundaries do
                 // not drop or duplicate candidates.
+                //
+                // Reuse does not change this rule: we still split on the same
+                // boundaries as before, only the backing allocation differs.
                 self.pending_line = Some(line);
                 break;
             }
@@ -262,13 +298,23 @@ impl MmapWordlistBatchReader {
 
     // Scan the mmap for newline-delimited candidates while preserving the same
     // batching semantics as the buffered reader.
-    fn next_batch(&mut self) -> anyhow::Result<Option<WordBatch>> {
+    fn next_batch_reusing(
+        &mut self,
+        recycled: Option<WordBatch>,
+    ) -> anyhow::Result<Option<WordBatch>> {
         let bytes = self.mmap.as_ref();
         if self.cursor >= bytes.len() {
             return Ok(None);
         }
 
-        let mut batch = WordBatch::new(self.next_index);
+        let mut batch = if let Some(mut batch) = recycled {
+            // Same reuse strategy as the buffered reader: preserve capacity,
+            // reset logical contents, and repopulate using identical rules.
+            batch.reset_for_reuse(self.next_index);
+            batch
+        } else {
+            WordBatch::new(self.next_index)
+        };
         while self.cursor < bytes.len() {
             // Find the next line without allocating intermediate strings.
             let line_start = self.cursor;
@@ -308,6 +354,8 @@ impl MmapWordlistBatchReader {
                 // Unlike the buffered reader there is no `pending_line`: we can
                 // simply leave `cursor` at the current line start and retry on
                 // the next call.
+                //
+                // This preserves byte-for-byte behavior with the non-reuse path.
                 break;
             }
 
@@ -363,10 +411,15 @@ impl AnyWordlistBatchReader {
     }
 
     // Forward batch production to the selected reader strategy.
-    fn next_batch(&mut self) -> anyhow::Result<Option<WordBatch>> {
+    fn next_batch_reusing(
+        &mut self,
+        recycled: Option<WordBatch>,
+    ) -> anyhow::Result<Option<WordBatch>> {
+        // `recycled` is moved into exactly one concrete reader branch, so the
+        // batch allocation has a single owner throughout the rebuild step.
         match self {
-            Self::Buffered(reader) => reader.next_batch(),
-            Self::Mmap(reader) => reader.next_batch(),
+            Self::Buffered(reader) => reader.next_batch_reusing(recycled),
+            Self::Mmap(reader) => reader.next_batch_reusing(recycled),
         }
     }
 }
@@ -387,6 +440,9 @@ enum ProducerMessage {
 // parsing with GPU dispatch.
 struct WordlistProducer {
     rx: Option<Receiver<ProducerMessage>>,
+    // Reverse direction channel used only for allocation reuse:
+    // consumer -> producer returns fully-owned `WordBatch` values after dispatch.
+    recycle_tx: SyncSender<WordBatch>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -396,17 +452,22 @@ impl WordlistProducer {
     // consumer is initializing autotune / first dispatch state.
     fn spawn(wordlist_path: PathBuf) -> Self {
         let (tx, rx) = sync_channel(DEFAULT_PIPELINE_DEPTH);
+        // Match the forward pipeline depth so we can recycle a small pool of
+        // batch allocations without letting memory usage grow unbounded.
+        let (recycle_tx, recycle_rx) = sync_channel(DEFAULT_PIPELINE_DEPTH);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let tx_err = tx.clone();
         let handle = thread::spawn(move || {
-            if let Err(err) = run_wordlist_producer(wordlist_path, stop_for_thread, tx) {
+            if let Err(err) = run_wordlist_producer(wordlist_path, stop_for_thread, tx, recycle_rx)
+            {
                 // Best effort: the receiver may already be dropped on early exit.
                 let _ = tx_err.send(ProducerMessage::Error(format!("{err:#}")));
             }
         });
         Self {
             rx: Some(rx),
+            recycle_tx,
             stop,
             handle: Some(handle),
         }
@@ -434,6 +495,15 @@ impl WordlistProducer {
         let _ = self.rx.take();
     }
 
+    // Best-effort recycle path: do not block the consumer/GPU path if the
+    // producer is busy or already shutting down.
+    fn recycle(&self, batch: WordBatch) {
+        // `try_send` is intentional: the consumer is on the critical path for
+        // throughput, so we prefer dropping a recyclable allocation over
+        // stalling GPU dispatch progress.
+        let _ = self.recycle_tx.try_send(batch);
+    }
+
     // Join the background thread so shutdown is deterministic and panics are
     // surfaced as regular errors.
     fn join(&mut self) -> anyhow::Result<()> {
@@ -452,13 +522,22 @@ fn run_wordlist_producer(
     wordlist_path: PathBuf,
     stop: Arc<AtomicBool>,
     tx: SyncSender<ProducerMessage>,
+    // Optional returned batches from the consumer. The producer owns the next
+    // parse/build step, so this is where allocation reuse naturally fits.
+    recycle_rx: Receiver<WordBatch>,
 ) -> anyhow::Result<()> {
     let mut reader = AnyWordlistBatchReader::new(&wordlist_path)?;
     while !stop.load(Ordering::Relaxed) {
         // The producer reports build time per batch so the consumer can measure
         // how much parsing work is hidden behind GPU compute.
         let batch_started = Instant::now();
-        let maybe_batch = reader.next_batch()?;
+        let recycled = match recycle_rx.try_recv() {
+            Ok(batch) => Some(batch),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
+        };
+        // `next_batch_reusing` preserves batching semantics; only allocation
+        // source changes (fresh vs recycled).
+        let maybe_batch = reader.next_batch_reusing(recycled)?;
         let build_time = batch_started.elapsed();
         let message = match maybe_batch {
             Some(batch) => ProducerMessage::Batch { batch, build_time },
@@ -973,6 +1052,14 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
                 );
                 last_rate_report_at = now;
             }
+
+            // After dispatch/readback completes with no match, the consumer no
+            // longer needs the batch contents. Return ownership to the producer
+            // so it can refill the same allocation on the next iteration.
+            //
+            // We intentionally do not recycle on the match path above because we
+            // still need `batch` to reconstruct and print the winning secret.
+            producer.recycle(batch);
         }
 
         let elapsed = started_at.elapsed();
