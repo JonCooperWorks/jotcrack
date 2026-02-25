@@ -26,8 +26,14 @@ const METAL_SOURCE_EMBEDDED: &str = include_str!("../kernels/hs256_wordlist.meta
 // We keep both kernels loaded and choose per batch based on candidate lengths.
 const METAL_FUNCTION_NAME_MIXED: &str = "hs256_wordlist";
 const METAL_FUNCTION_NAME_SHORT_KEYS: &str = "hs256_wordlist_short_keys";
-// The GPU writes the first matching absolute wordlist index here; `u32::MAX`
-// means "no match in this batch".
+// The GPU writes the first matching *batch-local* candidate index here (the
+// thread's `gid`, i.e. `0..candidate_count-1`), not an absolute wordlist index.
+//
+// Keeping the GPU result slot as a single `u32` preserves the same tiny shared
+// buffer/atomic path while letting the host scale absolute wordlist indexing to
+// `u64` for very large files (multi-billion non-empty lines).
+//
+// `u32::MAX` remains the sentinel for "no match in this batch".
 const RESULT_NOT_FOUND_SENTINEL: u32 = u32::MAX;
 // Larger batches improve amortization of dispatch overhead and host work.
 const MAX_CANDIDATES_PER_BATCH: usize = 1_048_576;
@@ -67,9 +73,17 @@ struct Hs256BruteForceParams {
     // to infer it from buffers or rely on implicit buffer metadata.
     message_length: u32,
     candidate_count: u32,
-    // Absolute wordlist index of candidate #0 in this batch. The GPU reports a
-    // batch-local match as an absolute index so output stays deterministic.
-    candidate_index_base: u32,
+    // Reserved/padding field kept so the Rust and Metal structs stay the same
+    // size/alignment as before (4 x 32-bit fields after the 32-byte digest).
+    //
+    // We previously used this slot for `candidate_index_base` (absolute wordlist
+    // index of candidate #0 in the batch). That overflowed at `u32::MAX` on very
+    // large wordlists, so the GPU now reports a batch-local index and the host
+    // reconstructs the absolute index from `WordBatch::candidate_index_base`.
+    //
+    // Keeping the field avoids unnecessary ABI churn and makes future kernel-side
+    // metadata additions straightforward without changing buffer sizes today.
+    reserved0: u32,
 }
 
 // Packed representation of a wordlist batch sent to the GPU.
@@ -79,7 +93,12 @@ struct Hs256BruteForceParams {
 // This minimizes host memory churn and matches the GPU kernel input format.
 #[derive(Debug)]
 struct WordBatch {
-    candidate_index_base: u32,
+    // Host-only absolute wordlist index of candidate #0 in this batch.
+    //
+    // This is intentionally `u64` so parsing/progress/result reconstruction can
+    // exceed 4,294,967,295 non-empty candidates. It is not sent to the GPU
+    // anymore; the kernel returns a batch-local match index (`u32`) instead.
+    candidate_index_base: u64,
     // Buffers that are directly bound to the kernel at dispatch time.
     // The producer fills them; the consumer reuses the same allocations.
     word_bytes_buf: metal::Buffer,
@@ -99,7 +118,7 @@ struct WordBatch {
 impl WordBatch {
     // Allocate fixed-capacity shared buffers sized to the batch caps so parser
     // writes can go straight into memory later bound to the kernel.
-    fn new(device: &Device, candidate_index_base: u32) -> Self {
+    fn new(device: &Device, candidate_index_base: u64) -> Self {
         let options = MTLResourceOptions::StorageModeShared;
         let word_bytes_buf = device.new_buffer(MAX_WORD_BYTES_PER_BATCH as u64, options);
         let word_offsets_buf = device.new_buffer(
@@ -128,7 +147,9 @@ impl WordBatch {
 
     // Reuse batch allocations across producer iterations to reduce allocator
     // churn in the parsing hot path while preserving the same batch semantics.
-    fn reset_for_reuse(&mut self, candidate_index_base: u32) {
+    fn reset_for_reuse(&mut self, candidate_index_base: u64) {
+        // Rebinding the base is what preserves globally correct indexing across
+        // batches even when the backing Metal buffers are recycled.
         self.candidate_index_base = candidate_index_base;
         self.candidate_count = 0;
         self.word_bytes_len = 0;
@@ -268,7 +289,6 @@ impl WordBatch {
         // Views let us dispatch or autotune against the same buffers without
         // cloning `WordBatch` or copying any payload bytes.
         DispatchBatchView {
-            candidate_index_base: self.candidate_index_base,
             candidate_count: self.candidate_count,
             max_word_len: self.max_word_len(),
             word_bytes_buf: self.word_bytes_buffer(),
@@ -287,7 +307,6 @@ impl WordBatch {
         let lengths = self.lengths_slice();
         let max_word_len = lengths[..sample_count].iter().copied().max().unwrap_or(0);
         Some(DispatchBatchView {
-            candidate_index_base: self.candidate_index_base,
             candidate_count: sample_count,
             max_word_len,
             word_bytes_buf: &self.word_bytes_buf,
@@ -301,7 +320,6 @@ impl WordBatch {
 struct DispatchBatchView<'a> {
     // Minimal metadata + buffer references required to dispatch a full batch or
     // sampled prefix batch without owning the storage.
-    candidate_index_base: u32,
     candidate_count: usize,
     max_word_len: u16,
     word_bytes_buf: &'a metal::Buffer,
@@ -329,7 +347,9 @@ struct BufferedWordlistBatchReader<R: BufRead> {
     reader: R,
     line_buf: Vec<u8>,
     pending_line: Option<Vec<u8>>,
-    next_index: u32,
+    // Absolute index of the next non-empty candidate line the reader will emit.
+    // `u64` avoids the old >4.29B-line overflow on giant wordlists.
+    next_index: u64,
     done: bool,
 }
 
@@ -444,7 +464,9 @@ struct MmapWordlistBatchReader {
     device: Device,
     mmap: Mmap,
     cursor: usize,
-    next_index: u32,
+    // Same semantic as the test-only buffered reader: absolute index of the next
+    // non-empty candidate line, tracked in `u64` for huge wordlists.
+    next_index: u64,
 }
 
 impl MmapWordlistBatchReader {
@@ -896,16 +918,15 @@ impl GpuHs256BruteForcer {
             timings.total = started.elapsed();
             return Ok((None, timings));
         }
-        let _max_index = batch
-            .candidate_index_base
-            .checked_add(candidate_count - 1)
-            .ok_or_else(|| anyhow!("candidate index overflow in batch"))?;
 
         let params = Hs256BruteForceParams {
             target_signature,
             message_length: self.message_length,
             candidate_count,
-            candidate_index_base: batch.candidate_index_base,
+            // The kernel no longer needs the absolute wordlist base. It only
+            // needs `candidate_count` and writes back the earliest matching
+            // batch-local index (`gid`) to the shared result slot.
+            reserved0: 0,
         };
 
         // Host prep phase: update params and reset the result slot.
@@ -943,8 +964,14 @@ impl GpuHs256BruteForcer {
         command_buffer.wait_until_completed();
         timings.gpu_wait = gpu_wait_started.elapsed();
 
-        // Read back the result from shared memory after completion. The kernel
-        // leaves the sentinel unchanged when no candidate matched.
+        // Read back the result from shared memory after completion.
+        //
+        // Result contract:
+        // - `RESULT_NOT_FOUND_SENTINEL` => no match in this batch
+        // - any other value => earliest matching batch-local candidate index
+        //
+        // Host code combines that local index with `batch.candidate_index_base`
+        // (tracked as `u64`) when it needs a globally meaningful position.
         let readback_started = Instant::now();
         let result_ptr = self.result_buf.contents().cast::<u32>();
         // SAFETY: `result_buf` is a 4-byte shared buffer that stays alive for the dispatch lifetime.
@@ -1097,9 +1124,10 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
             timings.result_readback += batch_timings.result_readback;
             timings.dispatch_total += batch_timings.total;
 
-            if let Some(global_index) = maybe_match {
-                // The GPU returns an absolute wordlist index. Convert it back to
-                // a batch-local index so we can reconstruct the candidate bytes.
+            if let Some(local_match_index) = maybe_match {
+                // The GPU returns a batch-local index. Reconstruct the absolute
+                // wordlist index on the host so large (>u32) wordlists remain
+                // supported without changing the GPU result slot width.
                 candidates_tested = candidates_tested.saturating_add(batch_candidate_count);
                 let elapsed = started_at.elapsed();
                 let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
@@ -1112,8 +1140,19 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
                     &timings,
                 );
 
-                let local_index = usize::try_from(global_index - batch.candidate_index_base)
-                    .context("GPU returned out-of-range result index")?;
+                // Reconstruct the absolute wordlist index using the host-side
+                // `u64` batch base. `_global_index` is currently only validated
+                // (for overflow) and not printed, but keeping the computation
+                // here documents the invariant and catches impossible states.
+                let _global_index = batch
+                    .candidate_index_base
+                    .checked_add(local_match_index as u64)
+                    .ok_or_else(|| anyhow!("candidate index overflow while reconstructing result"))?;
+                let local_index =
+                    // The GPU result must fit `usize` because every dispatch is
+                    // bounded by `MAX_CANDIDATES_PER_BATCH` (far below `usize`
+                    // on supported targets). Convert explicitly for safety.
+                    usize::try_from(local_match_index).context("GPU returned invalid result index")?;
                 let secret = batch
                     .word_string_lossy(local_index)
                     .ok_or_else(|| anyhow!("GPU returned invalid local candidate index"))?;
@@ -1435,7 +1474,7 @@ mod tests {
 
         assert_eq!(first.candidate_index_base, 0);
         assert_eq!(first.candidate_count(), MAX_CANDIDATES_PER_BATCH);
-        assert_eq!(second.candidate_index_base, MAX_CANDIDATES_PER_BATCH as u32);
+        assert_eq!(second.candidate_index_base, MAX_CANDIDATES_PER_BATCH as u64);
         assert_eq!(second.candidate_count(), 2);
     }
 

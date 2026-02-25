@@ -8,7 +8,10 @@ struct Hs256BruteForceParams {
     uint8_t target_signature[32];      // Expected HS256 HMAC digest (32 bytes) we compare against.
     uint32_t message_length;           // Actual byte length of `message_bytes` (the JWT `header.payload` string).
     uint32_t candidate_count;          // Number of candidate secrets in this GPU batch.
-    uint32_t candidate_index_base;     // Absolute wordlist index of candidate #0 in this batch (for deterministic reporting).
+    uint32_t reserved0;                // Reserved/padding slot kept for ABI stability with the Rust-side params struct.
+                                      // Older versions used this as `candidate_index_base` (absolute wordlist index
+                                      // of candidate #0). The kernel now reports batch-local match indices (`gid`)
+                                      // so host-side absolute indexing can scale past `uint32_t`.
 };
 
 // Minimal SHA-256 streaming context used per GPU thread.
@@ -495,7 +498,7 @@ kernel void hs256_wordlist(
     device const uint8_t* word_bytes [[buffer(2)]],       // Packed wordlist bytes for this batch.
     device const uint32_t* word_offsets [[buffer(3)]],    // Start offset of each candidate into `word_bytes`.
     device const uint16_t* word_lengths [[buffer(4)]],    // Length of each candidate secret.
-    device atomic_uint* result_index [[buffer(5)]],       // Shared output slot (absolute wordlist index, or sentinel).
+    device atomic_uint* result_index [[buffer(5)]],       // Shared output slot (earliest matching *batch-local* index, or sentinel).
     uint gid [[thread_position_in_grid]]                  // Global thread id = candidate index within this batch.
 ) {
     if (gid >= params.candidate_count) {                  // Guard against over-dispatch from rounded grid sizes.
@@ -514,10 +517,14 @@ kernel void hs256_wordlist(
                 digest);                                  // Receive computed HMAC-SHA256 digest here.
 
     if (digest_matches(digest, params.target_signature)) { // If this candidate produced the target signature,
-        const uint32_t absolute_index = params.candidate_index_base + gid; // convert batch-local index to absolute line index.
-        // Multiple GPU threads can match in theory; we keep the earliest absolute wordlist index
-        // for deterministic reporting on the host.
-        atomic_fetch_min_explicit(result_index, absolute_index, memory_order_relaxed); // Publish earliest match deterministically.
+        // Multiple GPU threads can match in theory (e.g. duplicate secrets in the
+        // same batch). We publish the minimum `gid` so the host preserves the same
+        // deterministic "earliest candidate wins" behavior as before.
+        //
+        // Important design choice: we intentionally store `gid` (batch-local) and
+        // not an absolute wordlist index. That keeps the kernel result path in a
+        // single `uint32_t` while the host tracks absolute batch bases in `u64`.
+        atomic_fetch_min_explicit(result_index, gid, memory_order_relaxed);
     }
 }
 
@@ -547,8 +554,8 @@ kernel void hs256_wordlist_short_keys(
                           digest);               // Output HMAC-SHA256(K, M)
 
     if (digest_matches(digest, params.target_signature)) {
-        const uint32_t absolute_index = params.candidate_index_base + gid;
-        // Same deterministic "earliest match wins" policy as the mixed kernel.
-        atomic_fetch_min_explicit(result_index, absolute_index, memory_order_relaxed);
+        // Same deterministic "earliest match wins" policy as the mixed kernel:
+        // write the minimum batch-local `gid`, not an absolute wordlist index.
+        atomic_fetch_min_explicit(result_index, gid, memory_order_relaxed);
     }
 }
