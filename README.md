@@ -26,13 +26,13 @@ cargo build --release
 ## Usage
 
 ```bash
-cargo run --release -- hs256crack '<jwt>' [--wordlist <path>]
+cargo run --release -- hs256wordlist '<jwt>' [--wordlist <path>]
 ```
 
 Or run the built binary:
 
 ```bash
-./target/release/jotcrack hs256crack '<jwt>' [--wordlist <path>]
+./target/release/jotcrack hs256wordlist '<jwt>' [--wordlist <path>]
 ```
 
 ## Examples
@@ -41,13 +41,13 @@ Use the sample JWT in `jwt_example.txt`:
 
 ```bash
 JWT="$(cat jwt_example.txt)"
-cargo run --release -- hs256crack "$JWT" --wordlist ./my_wordlist.txt
+cargo run --release -- hs256wordlist "$JWT" --wordlist ./my_wordlist.txt
 ```
 
 If you omit `--wordlist`, it uses `breach.txt` in the project root:
 
 ```bash
-cargo run --release -- hs256crack "$JWT"
+cargo run --release -- hs256wordlist "$JWT"
 ```
 
 ## Wordlist format
@@ -79,8 +79,8 @@ Exit codes:
 
 ## Notes
 
-- Currently available subcommand: `hs256crack` (uses the `hs256_brute_force` Metal kernel).
-- `--wordlist` is currently supported on `hs256crack`.
+- Currently available subcommand: `hs256wordlist` (uses the `hs256_wordlist` Metal kernel).
+- `--wordlist` is currently supported on `hs256wordlist`.
 - The default `breach.txt` is ignored by git (not included in the repo).
 
 ## Performance benchmarking (before/after kernel changes)
