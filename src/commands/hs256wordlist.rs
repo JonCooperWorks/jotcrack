@@ -15,7 +15,7 @@
 //! The file is intentionally organized in the same order as the runtime data
 //! flow (batch packing -> producer pipeline -> GPU dispatch -> command `run()`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,7 +55,7 @@ const METAL_FUNCTION_NAME_SHORT_KEYS: &str = "hs256_wordlist_short_keys";
 // `u32::MAX` remains the sentinel for "no match in this batch".
 const RESULT_NOT_FOUND_SENTINEL: u32 = u32::MAX;
 // Larger batches improve amortization of dispatch overhead and host work.
-const MAX_CANDIDATES_PER_BATCH: usize = 5_182_240;
+const MAX_CANDIDATES_PER_BATCH: usize = 6_182_240;
 const MAX_WORD_BYTES_PER_BATCH: usize = 32 * 1024 * 1024;
 // Approximate shared-buffer bytes held by one `WordBatch` allocation. This is
 // the dominant memory cost when increasing producer/consumer pipeline depth.
@@ -85,6 +85,8 @@ pub struct Hs256WordlistArgs {
     pub parser_threads: Option<usize>,
     #[arg(long, value_parser = parse_positive_usize)]
     pub pipeline_depth: Option<usize>,
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub packer_threads: Option<usize>,
     #[arg(long)]
     pub autotune: bool,
 }
@@ -200,6 +202,18 @@ struct WordBatch {
     max_word_len: u16,
 }
 
+// Shared batch-capacity rule used by both the direct pack path and the new
+// planner stage so batch boundaries remain identical across implementations.
+fn batch_shape_can_fit(candidate_count: usize, word_bytes_len: usize, line_len: usize) -> bool {
+    // Preserve the original batching rule:
+    // - always enforce candidate-count cap
+    // - only enforce byte-cap after the first candidate is present
+    let would_exceed_count = candidate_count >= MAX_CANDIDATES_PER_BATCH;
+    let would_exceed_bytes =
+        candidate_count != 0 && (word_bytes_len + line_len > MAX_WORD_BYTES_PER_BATCH);
+    !(would_exceed_count || would_exceed_bytes)
+}
+
 impl WordBatch {
     // Allocate fixed-capacity shared buffers sized to the batch caps so parser
     // writes can go straight into memory later bound to the kernel.
@@ -241,6 +255,7 @@ impl WordBatch {
         self.max_word_len = 0;
     }
 
+    #[cfg(test)]
     // A batch is considered empty when it has no candidate metadata entries.
     fn is_empty(&self) -> bool {
         self.candidate_count == 0
@@ -295,13 +310,7 @@ impl WordBatch {
     }
 
     fn can_fit(&self, line_len: usize) -> bool {
-        // Preserve the original batching rule:
-        // - always enforce candidate-count cap
-        // - only enforce byte-cap after the first candidate is present
-        let would_exceed_count = self.candidate_count >= MAX_CANDIDATES_PER_BATCH;
-        let would_exceed_bytes = self.candidate_count != 0
-            && (self.word_bytes_len + line_len > MAX_WORD_BYTES_PER_BATCH);
-        !(would_exceed_count || would_exceed_bytes)
+        batch_shape_can_fit(self.candidate_count, self.word_bytes_len, line_len)
     }
 
     fn push_candidate(&mut self, line: &[u8]) -> anyhow::Result<()> {
@@ -671,6 +680,57 @@ enum ParserWorkerMessage {
     Error { chunk_id: u64, message: String },
 }
 
+#[derive(Debug, Clone)]
+// A contiguous range of candidate lines from one parsed chunk used to
+// reconstruct a planned GPU batch without copying parser metadata.
+struct BatchPlanSegment {
+    parsed_chunk: Arc<ParsedChunk>,
+    line_start: usize,
+    line_end: usize,
+}
+
+#[derive(Debug, Clone)]
+// Host-side batch plan produced by the ordered parser/planner stage and later
+// materialized into a `WordBatch` by a packer worker.
+struct BatchPlan {
+    seq_no: u64,
+    candidate_index_base: u64,
+    candidate_count: usize,
+    word_bytes_len: usize,
+    max_word_len: u16,
+    segments: Vec<BatchPlanSegment>,
+    parser_stats: ParserStats,
+    plan_time: Duration,
+}
+
+#[derive(Debug)]
+struct PackerJob {
+    plan: BatchPlan,
+    batch: WordBatch,
+}
+
+#[derive(Debug)]
+struct PackerResult {
+    seq_no: u64,
+    batch: WordBatch,
+    plan_time: Duration,
+    pack_time: Duration,
+    parser_stats: ParserStats,
+}
+
+#[derive(Debug)]
+enum PackerWorkerMessage {
+    Packed(PackerResult),
+    Error { seq_no: u64, message: String },
+}
+
+#[derive(Debug)]
+enum PlannerWorkerMessage {
+    Plan(BatchPlan),
+    Eof { parser_stats: ParserStats },
+    Error(String),
+}
+
 // Split the mapped file into newline-aligned chunks for parallel scanning.
 //
 // Important property: every byte belongs to exactly one chunk and chunk ends
@@ -777,6 +837,66 @@ fn parse_mmap_chunk(bytes: &[u8], job: ChunkJob) -> anyhow::Result<ParsedChunk> 
     })
 }
 
+// Materialize a planned batch into an owned `WordBatch` allocation.
+//
+// This helper is used by both the direct reader path (tests/reference behavior)
+// and the producer packer workers so packing logic stays identical.
+fn pack_batch_plan_into_batch(
+    mmap: &Mmap,
+    plan: &BatchPlan,
+    batch: &mut WordBatch,
+) -> anyhow::Result<()> {
+    batch.reset_for_reuse(plan.candidate_index_base);
+    let bytes = mmap.as_ref();
+
+    for segment in &plan.segments {
+        let chunk = segment.parsed_chunk.as_ref();
+        if segment.line_start > segment.line_end || segment.line_end > chunk.lengths.len() {
+            bail!(
+                "invalid batch plan segment {}..{} for chunk {} len {}",
+                segment.line_start,
+                segment.line_end,
+                chunk.chunk_id,
+                chunk.lengths.len()
+            );
+        }
+
+        for line_idx in segment.line_start..segment.line_end {
+            let line_len = chunk.lengths[line_idx] as usize;
+            let line_start = chunk.chunk_start + chunk.offsets_rel[line_idx] as usize;
+            let line_end = line_start + line_len;
+            let line = bytes
+                .get(line_start..line_end)
+                .ok_or_else(|| anyhow!("batch plan referenced out-of-bounds mmap slice"))?;
+            batch.push_candidate(line)?;
+        }
+    }
+
+    if batch.candidate_count() != plan.candidate_count {
+        bail!(
+            "batch plan candidate count mismatch: packed {} planned {}",
+            batch.candidate_count(),
+            plan.candidate_count
+        );
+    }
+    if batch.word_bytes_len() != plan.word_bytes_len {
+        bail!(
+            "batch plan packed byte length mismatch: packed {} planned {}",
+            batch.word_bytes_len(),
+            plan.word_bytes_len
+        );
+    }
+    if batch.max_word_len() != plan.max_word_len {
+        bail!(
+            "batch plan max word len mismatch: packed {} planned {}",
+            batch.max_word_len(),
+            plan.max_word_len
+        );
+    }
+
+    Ok(())
+}
+
 // Runtime wordlist reader that parallelizes newline scanning over an mmap file
 // while keeping batch emission ordered and deterministic.
 //
@@ -788,6 +908,7 @@ fn parse_mmap_chunk(bytes: &[u8], job: ChunkJob) -> anyhow::Result<ParsedChunk> 
 // This keeps concurrent code focused on pure parsing and preserves the existing
 // GPU dispatch contract (`WordBatch`) without parallel writes into Metal memory.
 struct ParallelMmapWordlistBatchReader {
+    #[cfg(test)]
     device: Device,
     mmap: Arc<Mmap>,
     // Precomputed newline-aligned chunk plan for the whole file.
@@ -802,9 +923,9 @@ struct ParallelMmapWordlistBatchReader {
     result_rx: crossbeam_channel::Receiver<ParserWorkerMessage>,
     worker_handles: Vec<JoinHandle<()>>,
     // Out-of-order worker results buffered until `next_chunk_to_emit` arrives.
-    pending_results: BTreeMap<u64, ParsedChunk>,
+    pending_results: BTreeMap<u64, Arc<ParsedChunk>>,
     // Current parsed chunk being drained into a `WordBatch`.
-    active_chunk: Option<ParsedChunk>,
+    active_chunk: Option<Arc<ParsedChunk>>,
     active_chunk_line_cursor: usize,
     // Absolute candidate index of the next accepted (non-empty, non-oversize)
     // line to be emitted into a batch.
@@ -818,6 +939,8 @@ impl ParallelMmapWordlistBatchReader {
     // 2) create bounded channels (backpressure)
     // 3) spawn worker threads that parse chunk metadata only
     fn new(device: Device, mmap: Mmap, config: ParserConfig) -> anyhow::Result<Self> {
+        #[cfg(not(test))]
+        let _ = device;
         let mmap = Arc::new(mmap);
         let chunks = plan_mmap_chunks(mmap.as_ref(), config.chunk_bytes)?;
         let (job_tx, job_rx) = crossbeam_channel::bounded(config.queue_capacity);
@@ -849,6 +972,7 @@ impl ParallelMmapWordlistBatchReader {
         drop(result_tx);
 
         Ok(Self {
+            #[cfg(test)]
             device,
             mmap,
             chunks,
@@ -875,6 +999,10 @@ impl ParallelMmapWordlistBatchReader {
     // include parser counters without shared atomics or locks.
     fn parser_stats(&self) -> ParserStats {
         self.parser_stats
+    }
+
+    fn shared_mmap(&self) -> Arc<Mmap> {
+        Arc::clone(&self.mmap)
     }
 
     // Submit more jobs until we hit the in-flight limit or exhaust the chunk
@@ -913,7 +1041,12 @@ impl ParallelMmapWordlistBatchReader {
                     .parser_stats
                     .parser_skipped_oversize
                     .saturating_add(chunk.skipped_oversize);
-                if self.pending_results.insert(chunk.chunk_id, chunk).is_some() {
+                let chunk_id = chunk.chunk_id;
+                if self
+                    .pending_results
+                    .insert(chunk_id, Arc::new(chunk))
+                    .is_some()
+                {
                     bail!("duplicate parsed chunk id received from parser workers");
                 }
                 Ok(())
@@ -972,53 +1105,57 @@ impl ParallelMmapWordlistBatchReader {
     // Build the next GPU batch by draining parsed chunk metadata in file order.
     //
     // Batch boundaries remain governed by the same `WordBatch::can_fit` rules as
-    // before; the redesign changes *how* we discover lines, not how we package
-    // them for the GPU.
-    fn next_batch_reusing(
-        &mut self,
-        recycled: Option<WordBatch>,
-    ) -> anyhow::Result<Option<WordBatch>> {
+    // before; the redesign changes *how* we discover lines, not the
+    // deterministic batch boundaries.
+    fn next_batch_plan(&mut self) -> anyhow::Result<Option<BatchPlan>> {
+        let plan_started = Instant::now();
         let candidate_index_base = self.next_index;
-        let mut batch = if let Some(mut batch) = recycled {
-            batch.reset_for_reuse(candidate_index_base);
-            batch
-        } else {
-            WordBatch::new(&self.device, candidate_index_base)
-        };
+        let mut segments = Vec::new();
+        let mut candidate_count = 0usize;
+        let mut word_bytes_len = 0usize;
+        let mut max_word_len = 0u16;
 
         loop {
             if !self.ensure_active_chunk()? {
                 break;
             }
 
-            let chunk_exhausted = {
-                let chunk = self
-                    .active_chunk
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("parser active chunk missing"))?;
-                let bytes = self.mmap.as_ref();
+            let chunk = self
+                .active_chunk
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow!("parser active chunk missing"))?;
+            let segment_start = self.active_chunk_line_cursor;
+            let mut line_cursor = segment_start;
 
-                // Drain as many lines from the current parsed chunk as will fit
-                // in this batch, leaving the cursor parked if the batch fills.
-                while self.active_chunk_line_cursor < chunk.lengths.len() {
-                    let line_len = chunk.lengths[self.active_chunk_line_cursor] as usize;
-                    if !batch.can_fit(line_len) {
-                        break;
-                    }
-
-                    let line_start = chunk.chunk_start
-                        + chunk.offsets_rel[self.active_chunk_line_cursor] as usize;
-                    let line_end = line_start + line_len;
-                    batch.push_candidate(&bytes[line_start..line_end])?;
-                    self.active_chunk_line_cursor += 1;
-                    self.next_index = self
-                        .next_index
-                        .checked_add(1)
-                        .ok_or_else(|| anyhow!("candidate index overflow"))?;
+            // Drain as many lines from the current parsed chunk as will fit in
+            // this planned batch, leaving the cursor parked if the batch fills.
+            while line_cursor < chunk.lengths.len() {
+                let line_len = chunk.lengths[line_cursor] as usize;
+                if !batch_shape_can_fit(candidate_count, word_bytes_len, line_len) {
+                    break;
                 }
 
-                self.active_chunk_line_cursor >= chunk.lengths.len()
-            };
+                candidate_count += 1;
+                word_bytes_len += line_len;
+                max_word_len = max_word_len.max(line_len as u16);
+                line_cursor += 1;
+                self.next_index = self
+                    .next_index
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("candidate index overflow"))?;
+            }
+
+            if line_cursor > segment_start {
+                segments.push(BatchPlanSegment {
+                    parsed_chunk: chunk.clone(),
+                    line_start: segment_start,
+                    line_end: line_cursor,
+                });
+            }
+
+            self.active_chunk_line_cursor = line_cursor;
+            let chunk_exhausted = self.active_chunk_line_cursor >= chunk.lengths.len();
 
             if chunk_exhausted {
                 self.active_chunk = None;
@@ -1033,10 +1170,149 @@ impl ParallelMmapWordlistBatchReader {
             break;
         }
 
-        if batch.is_empty() {
+        if candidate_count == 0 {
             Ok(None)
         } else {
-            Ok(Some(batch))
+            Ok(Some(BatchPlan {
+                seq_no: 0,
+                candidate_index_base,
+                candidate_count,
+                word_bytes_len,
+                max_word_len,
+                segments,
+                parser_stats: self.parser_stats(),
+                plan_time: plan_started.elapsed(),
+            }))
+        }
+    }
+
+    // Build the next GPU batch by first planning deterministic boundaries and
+    // then materializing the planned payload into a `WordBatch`.
+    #[cfg(test)]
+    fn next_batch_reusing(
+        &mut self,
+        recycled: Option<WordBatch>,
+    ) -> anyhow::Result<Option<WordBatch>> {
+        let Some(plan) = self.next_batch_plan()? else {
+            return Ok(None);
+        };
+        let mut batch = if let Some(mut batch) = recycled {
+            batch.reset_for_reuse(plan.candidate_index_base);
+            batch
+        } else {
+            WordBatch::new(&self.device, plan.candidate_index_base)
+        };
+        pack_batch_plan_into_batch(self.mmap.as_ref(), &plan, &mut batch)?;
+        Ok(Some(batch))
+    }
+}
+
+fn packer_worker_main(
+    mmap: Arc<Mmap>,
+    job_rx: crossbeam_channel::Receiver<PackerJob>,
+    result_tx: crossbeam_channel::Sender<PackerWorkerMessage>,
+) {
+    while let Ok(PackerJob { plan, mut batch }) = job_rx.recv() {
+        let pack_started = Instant::now();
+        match pack_batch_plan_into_batch(mmap.as_ref(), &plan, &mut batch) {
+            Ok(()) => {
+                let message = PackerWorkerMessage::Packed(PackerResult {
+                    seq_no: plan.seq_no,
+                    batch,
+                    plan_time: plan.plan_time,
+                    pack_time: pack_started.elapsed(),
+                    parser_stats: plan.parser_stats,
+                });
+                if result_tx.send(message).is_err() {
+                    return;
+                }
+            }
+            Err(err) => {
+                let _ = result_tx.send(PackerWorkerMessage::Error {
+                    seq_no: plan.seq_no,
+                    message: format!("{err:#}"),
+                });
+                return;
+            }
+        }
+    }
+}
+
+fn planner_worker_main(
+    mut reader: AnyWordlistBatchReader,
+    stop: Arc<AtomicBool>,
+    plan_tx: crossbeam_channel::Sender<PlannerWorkerMessage>,
+) {
+    let mut next_seq_no = 0u64;
+    while !stop.load(Ordering::Relaxed) {
+        match reader.next_batch_plan() {
+            Ok(Some(mut plan)) => {
+                plan.seq_no = next_seq_no;
+                next_seq_no = match next_seq_no.checked_add(1) {
+                    Some(v) => v,
+                    None => {
+                        let _ = plan_tx.send(PlannerWorkerMessage::Error(
+                            "batch sequence overflow".to_string(),
+                        ));
+                        return;
+                    }
+                };
+                if plan_tx.send(PlannerWorkerMessage::Plan(plan)).is_err() {
+                    return;
+                }
+            }
+            Ok(None) => {
+                let _ = plan_tx.send(PlannerWorkerMessage::Eof {
+                    parser_stats: reader.parser_stats(),
+                });
+                return;
+            }
+            Err(err) => {
+                let _ = plan_tx.send(PlannerWorkerMessage::Error(format!("{err:#}")));
+                return;
+            }
+        }
+    }
+}
+
+fn handle_planner_message(
+    message: PlannerWorkerMessage,
+    pending_plans: &mut VecDeque<BatchPlan>,
+    planner_eof: &mut bool,
+    latest_parser_stats: &mut ParserStats,
+) -> anyhow::Result<()> {
+    match message {
+        PlannerWorkerMessage::Plan(plan) => {
+            *latest_parser_stats = plan.parser_stats;
+            pending_plans.push_back(plan);
+            Ok(())
+        }
+        PlannerWorkerMessage::Eof { parser_stats } => {
+            *latest_parser_stats = parser_stats;
+            *planner_eof = true;
+            Ok(())
+        }
+        PlannerWorkerMessage::Error(message) => bail!("planner worker failed: {message}"),
+    }
+}
+
+fn handle_packer_message(
+    message: PackerWorkerMessage,
+    pending_packed: &mut BTreeMap<u64, PackerResult>,
+    in_flight_pack_jobs: &mut usize,
+    latest_parser_stats: &mut ParserStats,
+) -> anyhow::Result<()> {
+    *in_flight_pack_jobs = in_flight_pack_jobs.saturating_sub(1);
+    match message {
+        PackerWorkerMessage::Packed(result) => {
+            *latest_parser_stats = result.parser_stats;
+            if pending_packed.insert(result.seq_no, result).is_some() {
+                bail!("duplicate packed batch sequence id received from packer workers");
+            }
+            Ok(())
+        }
+        PackerWorkerMessage::Error { seq_no, message } => {
+            bail!("packer worker failed on batch seq {seq_no}: {message}")
         }
     }
 }
@@ -1084,15 +1360,15 @@ impl AnyWordlistBatchReader {
         }
     }
 
-    // Forward batch production to the selected reader strategy.
-    fn next_batch_reusing(
-        &mut self,
-        recycled: Option<WordBatch>,
-    ) -> anyhow::Result<Option<WordBatch>> {
-        // `recycled` is moved into exactly one concrete reader branch, so the
-        // batch allocation has a single owner throughout the rebuild step.
+    fn shared_mmap(&self) -> Arc<Mmap> {
         match self {
-            Self::ParallelMmap(reader) => reader.next_batch_reusing(recycled),
+            Self::ParallelMmap(reader) => reader.shared_mmap(),
+        }
+    }
+
+    fn next_batch_plan(&mut self) -> anyhow::Result<Option<BatchPlan>> {
+        match self {
+            Self::ParallelMmap(reader) => reader.next_batch_plan(),
         }
     }
 }
@@ -1104,6 +1380,8 @@ enum ProducerMessage {
     Batch {
         batch: WordBatch,
         build_time: Duration,
+        plan_time: Duration,
+        pack_time: Duration,
         parser_stats: ParserStats,
     },
     Eof {
@@ -1131,6 +1409,7 @@ impl WordlistProducer {
         device: Device,
         parser_config: ParserConfig,
         pipeline_depth: usize,
+        packer_threads: usize,
     ) -> Self {
         // CLI validation enforces >0; keep a defensive floor for internal
         // callers/tests so we never accidentally create a zero-capacity queue.
@@ -1148,6 +1427,7 @@ impl WordlistProducer {
                 device,
                 parser_config,
                 pipeline_depth,
+                packer_threads,
                 stop_for_thread,
                 tx,
                 recycle_rx,
@@ -1214,6 +1494,7 @@ fn run_wordlist_producer(
     device: Device,
     parser_config: ParserConfig,
     pipeline_depth: usize,
+    packer_threads: usize,
     stop: Arc<AtomicBool>,
     tx: SyncSender<ProducerMessage>,
     // Optional returned batches from the consumer. The producer owns the next
@@ -1221,43 +1502,218 @@ fn run_wordlist_producer(
     recycle_rx: Receiver<WordBatch>,
 ) -> anyhow::Result<()> {
     let pipeline_depth = pipeline_depth.max(1);
+    let packer_threads = packer_threads.max(1).min(pipeline_depth);
     // Preallocate the steady-state batch pool up front so the initial pipeline
     // fill does not pay large Metal buffer allocation costs on the hot path.
     let mut preallocated_batches = Vec::with_capacity(pipeline_depth);
     for _ in 0..pipeline_depth {
         preallocated_batches.push(WordBatch::new(&device, 0));
     }
-    let mut reader = AnyWordlistBatchReader::new(device, &wordlist_path, parser_config)?;
-    while !stop.load(Ordering::Relaxed) {
-        // The producer reports build time per batch so the consumer can measure
-        // how much parsing work is hidden behind GPU compute.
-        let batch_started = Instant::now();
-        let recycled = match recycle_rx.try_recv() {
-            Ok(batch) => Some(batch),
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
-        }
-        .or_else(|| preallocated_batches.pop());
-        // `next_batch_reusing` preserves batching semantics; only allocation
-        // source changes (fresh vs recycled).
-        let maybe_batch = reader.next_batch_reusing(recycled)?;
-        let build_time = batch_started.elapsed();
-        let parser_stats = reader.parser_stats();
-        let message = match maybe_batch {
-            Some(batch) => ProducerMessage::Batch {
-                batch,
-                build_time,
-                parser_stats,
-            },
-            None => {
-                let _ = tx.send(ProducerMessage::Eof { parser_stats });
+    let batch_alloc_device = device.clone();
+    let reader = AnyWordlistBatchReader::new(device, &wordlist_path, parser_config)?;
+    let shared_mmap = reader.shared_mmap();
+
+    let (plan_tx, plan_rx) = crossbeam_channel::bounded::<PlannerWorkerMessage>(pipeline_depth);
+    let stop_for_planner = Arc::clone(&stop);
+    let planner_handle =
+        thread::spawn(move || planner_worker_main(reader, stop_for_planner, plan_tx));
+
+    let (pack_job_tx, pack_job_rx) = crossbeam_channel::bounded::<PackerJob>(pipeline_depth);
+    let (pack_result_tx, pack_result_rx) =
+        crossbeam_channel::bounded::<PackerWorkerMessage>(pipeline_depth);
+    let mut packer_handles = Vec::with_capacity(packer_threads);
+    for _ in 0..packer_threads {
+        let mmap_for_worker = Arc::clone(&shared_mmap);
+        let job_rx_for_worker = pack_job_rx.clone();
+        let result_tx_for_worker = pack_result_tx.clone();
+        packer_handles.push(thread::spawn(move || {
+            packer_worker_main(mmap_for_worker, job_rx_for_worker, result_tx_for_worker)
+        }));
+    }
+    drop(pack_job_rx);
+    drop(pack_result_tx);
+
+    let coordinator_result = (|| -> anyhow::Result<()> {
+        let mut available_batches = preallocated_batches;
+        let mut pending_plans = VecDeque::<BatchPlan>::new();
+        let mut pending_packed = BTreeMap::<u64, PackerResult>::new();
+        let mut next_seq_to_emit = 0u64;
+        let mut in_flight_pack_jobs = 0usize;
+        let mut planner_eof = false;
+        let mut latest_parser_stats = ParserStats {
+            parser_threads: parser_config.parser_threads,
+            parser_chunk_bytes: parser_config.chunk_bytes,
+            ..ParserStats::default()
+        };
+
+        loop {
+            if stop.load(Ordering::Relaxed) {
                 return Ok(());
             }
-        };
-        if tx.send(message).is_err() {
-            return Ok(());
+
+            let mut made_progress = false;
+
+            // Pull back any batches the consumer has finished using.
+            loop {
+                match recycle_rx.try_recv() {
+                    Ok(batch) => {
+                        available_batches.push(batch);
+                        made_progress = true;
+                    }
+                    Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+                }
+            }
+
+            // Pull planner results without blocking so planning can progress
+            // independently from packer throughput and emission cadence.
+            loop {
+                match plan_rx.try_recv() {
+                    Ok(message) => {
+                        handle_planner_message(
+                            message,
+                            &mut pending_plans,
+                            &mut planner_eof,
+                            &mut latest_parser_stats,
+                        )?;
+                        made_progress = true;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        if !planner_eof && !stop.load(Ordering::Relaxed) {
+                            bail!("planner worker terminated unexpectedly");
+                        }
+                        planner_eof = true;
+                        break;
+                    }
+                }
+            }
+
+            // Harvest completed pack jobs without blocking.
+            loop {
+                match pack_result_rx.try_recv() {
+                    Ok(message) => {
+                        handle_packer_message(
+                            message,
+                            &mut pending_packed,
+                            &mut in_flight_pack_jobs,
+                            &mut latest_parser_stats,
+                        )?;
+                        made_progress = true;
+                    }
+                    Err(crossbeam_channel::TryRecvError::Empty) => break,
+                    Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                        if in_flight_pack_jobs > 0 {
+                            bail!("packer workers terminated unexpectedly");
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Emit packed batches strictly in sequence order.
+            while let Some(result) = pending_packed.remove(&next_seq_to_emit) {
+                let build_time = result
+                    .plan_time
+                    .checked_add(result.pack_time)
+                    .unwrap_or(result.plan_time + result.pack_time);
+                let message = ProducerMessage::Batch {
+                    batch: result.batch,
+                    build_time,
+                    plan_time: result.plan_time,
+                    pack_time: result.pack_time,
+                    parser_stats: result.parser_stats,
+                };
+                if tx.send(message).is_err() {
+                    return Ok(());
+                }
+                next_seq_to_emit = next_seq_to_emit
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("emit sequence overflow"))?;
+                made_progress = true;
+            }
+
+            // Keep packers busy by dispatching queued plans.
+            while in_flight_pack_jobs < pipeline_depth {
+                let Some(plan) = pending_plans.pop_front() else {
+                    break;
+                };
+                let batch = available_batches
+                    .pop()
+                    .unwrap_or_else(|| WordBatch::new(&batch_alloc_device, 0));
+                pack_job_tx
+                    .send(PackerJob { plan, batch })
+                    .map_err(|_| anyhow!("packer worker job queue closed unexpectedly"))?;
+                in_flight_pack_jobs = in_flight_pack_jobs.saturating_add(1);
+                made_progress = true;
+            }
+
+            if planner_eof
+                && pending_plans.is_empty()
+                && in_flight_pack_jobs == 0
+                && pending_packed.is_empty()
+            {
+                let _ = tx.send(ProducerMessage::Eof {
+                    parser_stats: latest_parser_stats,
+                });
+                return Ok(());
+            }
+
+            if made_progress {
+                continue;
+            }
+
+            // No immediate progress: block on the stream that can unblock the
+            // pipeline next (packer completions first, otherwise new plans).
+            if in_flight_pack_jobs > 0 {
+                let message = pack_result_rx
+                    .recv()
+                    .map_err(|_| anyhow!("packer workers terminated unexpectedly"))?;
+                handle_packer_message(
+                    message,
+                    &mut pending_packed,
+                    &mut in_flight_pack_jobs,
+                    &mut latest_parser_stats,
+                )?;
+                continue;
+            }
+
+            if !planner_eof {
+                match plan_rx.recv() {
+                    Ok(message) => {
+                        handle_planner_message(
+                            message,
+                            &mut pending_plans,
+                            &mut planner_eof,
+                            &mut latest_parser_stats,
+                        )?;
+                    }
+                    Err(_) if stop.load(Ordering::Relaxed) => return Ok(()),
+                    Err(_) => bail!("planner worker terminated unexpectedly"),
+                }
+                continue;
+            }
+        }
+    })();
+
+    drop(pack_job_tx);
+    drop(pack_result_rx);
+    drop(plan_rx);
+
+    let mut join_error: Option<anyhow::Error> = None;
+    if planner_handle.join().is_err() && join_error.is_none() {
+        join_error = Some(anyhow!("planner worker thread panicked"));
+    }
+    while let Some(handle) = packer_handles.pop() {
+        if handle.join().is_err() && join_error.is_none() {
+            join_error = Some(anyhow!("packer worker thread panicked"));
         }
     }
-    Ok(())
+
+    match (coordinator_result, join_error) {
+        (Err(err), _) => Err(err),
+        (Ok(_), Some(err)) => Err(err),
+        (Ok(()), None) => Ok(()),
+    }
 }
 
 // Owns Metal objects and the small persistent buffers reused across dispatches.
@@ -1291,6 +1747,8 @@ struct BatchDispatchTimings {
 #[derive(Debug, Default)]
 struct RunTimings {
     wordlist_batch_build: Duration,
+    wordlist_batch_plan: Duration,
+    wordlist_batch_pack: Duration,
     host_prep: Duration,
     command_encode: Duration,
     gpu_wait: Duration,
@@ -1301,6 +1759,7 @@ struct RunTimings {
     total_batch_candidates: u64,
     total_batch_word_bytes: u64,
     pipeline_depth: usize,
+    packer_threads: usize,
     parser_threads: usize,
     parser_chunk_bytes: usize,
     parser_chunks: u64,
@@ -1689,6 +2148,11 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
     let mut gpu = GpuHs256BruteForcer::new(&signing_input)?;
     let parser_config = ParserConfig::from_args(&args);
     let pipeline_depth = args.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH);
+    let packer_threads = args
+        .packer_threads
+        .unwrap_or(2)
+        .max(1)
+        .min(pipeline_depth.max(1));
     if let Some(tpg) = args.threads_per_group {
         gpu.set_threadgroup_width(tpg)?;
     }
@@ -1706,6 +2170,10 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
         format_human_count(APPROX_WORD_BATCH_BUFFER_BYTES as f64),
         format_human_count(approx_prefetch_bytes as f64),
     );
+    eprintln!(
+        "HOST parser_threads={} packer_threads={}",
+        parser_config.parser_threads, packer_threads
+    );
 
     // Start the parser thread before entering the main loop so batch
     // construction can overlap with GPU setup and dispatch wait time.
@@ -1714,6 +2182,7 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
         gpu.device.clone(),
         parser_config,
         pipeline_depth,
+        packer_threads,
     );
     let run_result = (|| -> anyhow::Result<bool> {
         let started_at = Instant::now();
@@ -1721,6 +2190,7 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
         let mut autotune_done = !args.autotune;
         let mut timings = RunTimings {
             pipeline_depth,
+            packer_threads,
             parser_threads: parser_config.parser_threads,
             parser_chunk_bytes: parser_config.chunk_bytes,
             ..RunTimings::default()
@@ -1739,12 +2209,16 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
                 ProducerMessage::Batch {
                     batch,
                     build_time,
+                    plan_time,
+                    pack_time,
                     parser_stats,
                 } => {
                     // Producer snapshots parser counters after each batch build.
                     // We refresh the consumer-side copy here so both periodic
                     // and final reports reflect the latest parser state.
                     timings.apply_parser_stats(parser_stats);
+                    timings.wordlist_batch_plan += plan_time;
+                    timings.wordlist_batch_pack += pack_time;
                     (batch, build_time)
                 }
                 ProducerMessage::Eof { parser_stats } => {
@@ -2008,6 +2482,7 @@ fn print_final_stats(
         format_human_count(avg_word_bytes_per_batch)
     );
     eprintln!("  pipeline_depth: {}", timings.pipeline_depth);
+    eprintln!("  packer_threads: {}", timings.packer_threads);
     eprintln!("  parser_threads: {}", timings.parser_threads);
     eprintln!(
         "  parser_chunk_bytes: {} bytes",
@@ -2021,6 +2496,14 @@ fn print_final_stats(
     eprintln!(
         "  timing.wordlist_batch_build: {:.3}s",
         timings.wordlist_batch_build.as_secs_f64()
+    );
+    eprintln!(
+        "  timing.wordlist_batch_plan: {:.3}s",
+        timings.wordlist_batch_plan.as_secs_f64()
+    );
+    eprintln!(
+        "  timing.wordlist_batch_pack: {:.3}s",
+        timings.wordlist_batch_pack.as_secs_f64()
     );
     eprintln!(
         "  timing.consumer_idle_wait: {:.3}s",
@@ -2280,13 +2763,14 @@ mod tests {
     // Verifies that the absolute wordlist index continues across batch splits,
     // which is required for deterministic GPU result reporting.
     fn wordlist_batch_reader_preserves_absolute_indices_across_batches() {
-        let lines = (0..(MAX_CANDIDATES_PER_BATCH + 2))
-            .map(|i| format!("pw{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let data = format!("{lines}\n");
-        let mut reader =
-            BufferedWordlistBatchReader::new(test_device(), Cursor::new(data.into_bytes()));
+        // Use fixed one-byte candidates so the split is caused by the
+        // candidate-count cap (not `MAX_WORD_BYTES_PER_BATCH`).
+        let total = MAX_CANDIDATES_PER_BATCH + 2;
+        let mut data = Vec::with_capacity(total * 2);
+        for _ in 0..total {
+            data.extend_from_slice(b"x\n");
+        }
+        let mut reader = BufferedWordlistBatchReader::new(test_device(), Cursor::new(data));
 
         let first = reader.next_batch().unwrap().unwrap();
         let second = reader.next_batch().unwrap().unwrap();
@@ -2431,6 +2915,70 @@ mod tests {
     }
 
     #[test]
+    fn parallel_mmap_reader_next_batch_plan_matches_direct_batch_pack() {
+        let data = b"alpha\r\n\nbeta\ngamma-delta\nx\nfinal";
+        let (mut planned_reader, planned_path) = parallel_mmap_reader_from_temp_file(data, 3, 7);
+        let (mut direct_reader, direct_path) = parallel_mmap_reader_from_temp_file(data, 3, 7);
+        let mmap = planned_reader.shared_mmap();
+        let device = test_device();
+
+        loop {
+            let planned = planned_reader.next_batch_plan().expect("batch plan");
+            let direct = direct_reader
+                .next_batch_reusing(None)
+                .expect("direct batch");
+            match (planned, direct) {
+                (None, None) => break,
+                (Some(plan), Some(direct_batch)) => {
+                    let mut packed = WordBatch::new(&device, 0);
+                    pack_batch_plan_into_batch(mmap.as_ref(), &plan, &mut packed)
+                        .expect("pack planned batch");
+
+                    assert_eq!(
+                        packed.candidate_index_base,
+                        direct_batch.candidate_index_base
+                    );
+                    assert_eq!(packed.candidate_count(), direct_batch.candidate_count());
+                    assert_eq!(packed.word_bytes_len(), direct_batch.word_bytes_len());
+                    assert_eq!(packed.max_word_len(), direct_batch.max_word_len());
+                    assert_eq!(packed.offsets_slice(), direct_batch.offsets_slice());
+                    assert_eq!(packed.lengths_slice(), direct_batch.lengths_slice());
+                    assert_eq!(packed.word_bytes_slice(), direct_batch.word_bytes_slice());
+                }
+                (lhs, rhs) => panic!(
+                    "planned/direct batch stream length mismatch: planned={} direct={}",
+                    lhs.is_some(),
+                    rhs.is_some()
+                ),
+            }
+        }
+
+        let _ = fs::remove_file(planned_path);
+        let _ = fs::remove_file(direct_path);
+    }
+
+    #[test]
+    fn batch_planner_preserves_absolute_indices_across_batches() {
+        let total = MAX_CANDIDATES_PER_BATCH + 2;
+        let mut data = Vec::with_capacity(total * 2);
+        for _ in 0..total {
+            data.extend_from_slice(b"x\n");
+        }
+
+        let (mut reader, path) = parallel_mmap_reader_from_temp_file(&data, 4, 1024);
+        let first = reader.next_batch_plan().unwrap().unwrap();
+        let second = reader.next_batch_plan().unwrap().unwrap();
+
+        assert_eq!(first.candidate_index_base, 0);
+        assert_eq!(first.candidate_count, MAX_CANDIDATES_PER_BATCH);
+        assert_eq!(second.candidate_index_base, MAX_CANDIDATES_PER_BATCH as u64);
+        assert_eq!(second.candidate_count, 2);
+        assert!(reader.next_batch_plan().unwrap().is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn wordlist_producer_parallel_path_emits_batches_and_joins_cleanly() {
         let path = write_temp_wordlist(b"alpha\nbeta\n");
         let mut producer = WordlistProducer::spawn(
@@ -2438,6 +2986,7 @@ mod tests {
             test_device(),
             test_parser_config(2, 8),
             DEFAULT_PIPELINE_DEPTH,
+            2,
         );
 
         let first = producer.recv().expect("producer batch");
@@ -2461,6 +3010,37 @@ mod tests {
                 assert!(parser_stats.parser_chunks >= 1);
             }
             ProducerMessage::Batch { .. } => panic!("unexpected second batch"),
+            ProducerMessage::Error(err) => panic!("unexpected producer error: {err}"),
+        }
+
+        producer.stop();
+        producer.close_receiver();
+        producer.join().expect("producer join");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn wordlist_producer_parallel_path_emits_batches_with_multiple_packer_workers() {
+        let path = write_temp_wordlist(b"alpha\nbeta\ngamma\ndelta\n");
+        let mut producer =
+            WordlistProducer::spawn(path.clone(), test_device(), test_parser_config(2, 8), 4, 2);
+
+        let first = producer.recv().expect("producer first message");
+        match first {
+            ProducerMessage::Batch { batch, .. } => {
+                assert_eq!(batch.candidate_count(), 4);
+                producer.recycle(batch);
+            }
+            ProducerMessage::Eof { .. } => panic!("unexpected eof before batch"),
+            ProducerMessage::Error(err) => panic!("unexpected producer error: {err}"),
+        }
+
+        let second = producer.recv().expect("producer second message");
+        match second {
+            ProducerMessage::Eof { parser_stats } => {
+                assert!(parser_stats.parser_chunks >= 1);
+            }
+            ProducerMessage::Batch { .. } => panic!("unexpected extra batch"),
             ProducerMessage::Error(err) => panic!("unexpected producer error: {err}"),
         }
 
