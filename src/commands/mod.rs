@@ -64,6 +64,7 @@ mod tests {
         );
         assert_eq!(args.threads_per_group, None);
         assert_eq!(args.parser_threads, None);
+        assert_eq!(args.pipeline_depth, None);
         assert!(!args.autotune);
     }
 
@@ -126,7 +127,23 @@ mod tests {
         let Commands::Hs256wordlist(args) = cli.command;
         assert_eq!(args.threads_per_group, Some(512));
         assert_eq!(args.parser_threads, Some(3));
+        assert_eq!(args.pipeline_depth, None);
         assert!(args.autotune);
+    }
+
+    #[test]
+    fn clap_cli_accepts_pipeline_depth() {
+        let cli = Cli::try_parse_from([
+            "jotcrack",
+            "hs256wordlist",
+            "abc.def.ghi",
+            "--pipeline-depth",
+            "10",
+        ])
+        .unwrap();
+
+        let Commands::Hs256wordlist(args) = cli.command;
+        assert_eq!(args.pipeline_depth, Some(10));
     }
 
     #[test]
@@ -136,6 +153,19 @@ mod tests {
             "hs256wordlist",
             "abc.def.ghi",
             "--parser-threads",
+            "0",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    #[test]
+    fn clap_cli_rejects_zero_pipeline_depth() {
+        let err = Cli::try_parse_from([
+            "jotcrack",
+            "hs256wordlist",
+            "abc.def.ghi",
+            "--pipeline-depth",
             "0",
         ])
         .unwrap_err();

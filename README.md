@@ -26,13 +26,13 @@ cargo build --release
 ## Usage
 
 ```bash
-cargo run --release -- hs256wordlist '<jwt>' [--wordlist <path>] [--parser-threads <n>]
+cargo run --release -- hs256wordlist '<jwt>' [--wordlist <path>] [--parser-threads <n>] [--pipeline-depth <n>]
 ```
 
 Or run the built binary:
 
 ```bash
-./target/release/jotcrack hs256wordlist '<jwt>' [--wordlist <path>] [--parser-threads <n>]
+./target/release/jotcrack hs256wordlist '<jwt>' [--wordlist <path>] [--parser-threads <n>] [--pipeline-depth <n>]
 ```
 
 ## Examples
@@ -82,6 +82,7 @@ Exit codes:
 - Currently available subcommand: `hs256wordlist` (uses the `hs256_wordlist` Metal kernel).
 - `--wordlist` is currently supported on `hs256wordlist`.
 - `--parser-threads` optionally overrides the auto-selected parallel wordlist parser worker count.
+- `--pipeline-depth` optionally increases prefetched `WordBatch` queue depth (higher RAM use, lower GPU idle risk).
 - The default `breach.txt` is ignored by git (not included in the repo).
 
 ## Performance benchmarking (before/after kernel changes)

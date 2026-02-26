@@ -57,9 +57,14 @@ const RESULT_NOT_FOUND_SENTINEL: u32 = u32::MAX;
 // Larger batches improve amortization of dispatch overhead and host work.
 const MAX_CANDIDATES_PER_BATCH: usize = 5_182_240;
 const MAX_WORD_BYTES_PER_BATCH: usize = 32 * 1024 * 1024;
-// Small bounded queue: enough to overlap CPU/GPU without letting parsed data
-// accumulate unbounded in memory when the GPU is slower.
-const DEFAULT_PIPELINE_DEPTH: usize = 2;
+// Approximate shared-buffer bytes held by one `WordBatch` allocation. This is
+// the dominant memory cost when increasing producer/consumer pipeline depth.
+const APPROX_WORD_BATCH_BUFFER_BYTES: usize = MAX_WORD_BYTES_PER_BATCH
+    + (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u32>())
+    + (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u16>());
+// Small bounded queue: enough to overlap CPU/GPU and smooth producer jitter
+// without letting parsed data accumulate unbounded in memory.
+const DEFAULT_PIPELINE_DEPTH: usize = 10;
 // Parser workers scan mmap chunks in parallel and return line metadata for
 // ordered batch assembly on the producer thread.
 const DEFAULT_PARSER_CHUNK_BYTES: usize = 16 * 1024 * 1024;
@@ -78,6 +83,8 @@ pub struct Hs256WordlistArgs {
     pub threads_per_group: Option<usize>,
     #[arg(long, value_parser = parse_positive_usize)]
     pub parser_threads: Option<usize>,
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub pipeline_depth: Option<usize>,
     #[arg(long)]
     pub autotune: bool,
 }
@@ -1119,11 +1126,19 @@ struct WordlistProducer {
 impl WordlistProducer {
     // Start the producer thread immediately so parsing can begin while the
     // consumer is initializing autotune / first dispatch state.
-    fn spawn(wordlist_path: PathBuf, device: Device, parser_config: ParserConfig) -> Self {
-        let (tx, rx) = sync_channel(DEFAULT_PIPELINE_DEPTH);
+    fn spawn(
+        wordlist_path: PathBuf,
+        device: Device,
+        parser_config: ParserConfig,
+        pipeline_depth: usize,
+    ) -> Self {
+        // CLI validation enforces >0; keep a defensive floor for internal
+        // callers/tests so we never accidentally create a zero-capacity queue.
+        let pipeline_depth = pipeline_depth.max(1);
+        let (tx, rx) = sync_channel(pipeline_depth);
         // Match the forward pipeline depth so we can recycle a small pool of
         // batch allocations without letting memory usage grow unbounded.
-        let (recycle_tx, recycle_rx) = sync_channel(DEFAULT_PIPELINE_DEPTH);
+        let (recycle_tx, recycle_rx) = sync_channel(pipeline_depth);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = Arc::clone(&stop);
         let tx_err = tx.clone();
@@ -1132,6 +1147,7 @@ impl WordlistProducer {
                 wordlist_path,
                 device,
                 parser_config,
+                pipeline_depth,
                 stop_for_thread,
                 tx,
                 recycle_rx,
@@ -1197,12 +1213,20 @@ fn run_wordlist_producer(
     wordlist_path: PathBuf,
     device: Device,
     parser_config: ParserConfig,
+    pipeline_depth: usize,
     stop: Arc<AtomicBool>,
     tx: SyncSender<ProducerMessage>,
     // Optional returned batches from the consumer. The producer owns the next
     // parse/build step, so this is where allocation reuse naturally fits.
     recycle_rx: Receiver<WordBatch>,
 ) -> anyhow::Result<()> {
+    let pipeline_depth = pipeline_depth.max(1);
+    // Preallocate the steady-state batch pool up front so the initial pipeline
+    // fill does not pay large Metal buffer allocation costs on the hot path.
+    let mut preallocated_batches = Vec::with_capacity(pipeline_depth);
+    for _ in 0..pipeline_depth {
+        preallocated_batches.push(WordBatch::new(&device, 0));
+    }
     let mut reader = AnyWordlistBatchReader::new(device, &wordlist_path, parser_config)?;
     while !stop.load(Ordering::Relaxed) {
         // The producer reports build time per batch so the consumer can measure
@@ -1211,7 +1235,8 @@ fn run_wordlist_producer(
         let recycled = match recycle_rx.try_recv() {
             Ok(batch) => Some(batch),
             Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => None,
-        };
+        }
+        .or_else(|| preallocated_batches.pop());
         // `next_batch_reusing` preserves batching semantics; only allocation
         // source changes (fresh vs recycled).
         let maybe_batch = reader.next_batch_reusing(recycled)?;
@@ -1275,6 +1300,7 @@ struct RunTimings {
     batch_count: u64,
     total_batch_candidates: u64,
     total_batch_word_bytes: u64,
+    pipeline_depth: usize,
     parser_threads: usize,
     parser_chunk_bytes: usize,
     parser_chunks: u64,
@@ -1662,9 +1688,11 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
     let (signing_input, target_signature) = parse_hs256_jwt(&args.jwt)?;
     let mut gpu = GpuHs256BruteForcer::new(&signing_input)?;
     let parser_config = ParserConfig::from_args(&args);
+    let pipeline_depth = args.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH);
     if let Some(tpg) = args.threads_per_group {
         gpu.set_threadgroup_width(tpg)?;
     }
+    let approx_prefetch_bytes = APPROX_WORD_BATCH_BUFFER_BYTES.saturating_mul(pipeline_depth);
     eprintln!(
         "GPU device={} tew={} max_tpg={} selected_tpg={}",
         gpu.device_name(),
@@ -1672,16 +1700,27 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
         gpu.max_total_threads_per_threadgroup(),
         gpu.current_threadgroup_width()
     );
+    eprintln!(
+        "PIPELINE depth={} approx_batch_bytes={} bytes approx_prefetch_bytes={} bytes",
+        pipeline_depth,
+        format_human_count(APPROX_WORD_BATCH_BUFFER_BYTES as f64),
+        format_human_count(approx_prefetch_bytes as f64),
+    );
 
     // Start the parser thread before entering the main loop so batch
     // construction can overlap with GPU setup and dispatch wait time.
-    let mut producer =
-        WordlistProducer::spawn(args.wordlist.clone(), gpu.device.clone(), parser_config);
+    let mut producer = WordlistProducer::spawn(
+        args.wordlist.clone(),
+        gpu.device.clone(),
+        parser_config,
+        pipeline_depth,
+    );
     let run_result = (|| -> anyhow::Result<bool> {
         let started_at = Instant::now();
         let mut candidates_tested: u64 = 0;
         let mut autotune_done = !args.autotune;
         let mut timings = RunTimings {
+            pipeline_depth,
             parser_threads: parser_config.parser_threads,
             parser_chunk_bytes: parser_config.chunk_bytes,
             ..RunTimings::default()
@@ -1968,6 +2007,7 @@ fn print_final_stats(
         "  avg_word_bytes_per_batch: {} bytes",
         format_human_count(avg_word_bytes_per_batch)
     );
+    eprintln!("  pipeline_depth: {}", timings.pipeline_depth);
     eprintln!("  parser_threads: {}", timings.parser_threads);
     eprintln!(
         "  parser_chunk_bytes: {} bytes",
@@ -2393,8 +2433,12 @@ mod tests {
     #[test]
     fn wordlist_producer_parallel_path_emits_batches_and_joins_cleanly() {
         let path = write_temp_wordlist(b"alpha\nbeta\n");
-        let mut producer =
-            WordlistProducer::spawn(path.clone(), test_device(), test_parser_config(2, 8));
+        let mut producer = WordlistProducer::spawn(
+            path.clone(),
+            test_device(),
+            test_parser_config(2, 8),
+            DEFAULT_PIPELINE_DEPTH,
+        );
 
         let first = producer.recv().expect("producer batch");
         match first {
