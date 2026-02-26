@@ -87,6 +87,11 @@ Exit codes:
 
 Use the same JWT and wordlist ordering for every run so `RATE .../s` numbers are comparable.
 
+Notes on throughput logs:
+
+- Periodic `RATE` lines report windowed (interval) throughput, not cumulative averages.
+- Final `STATS` lines report aggregate/cumulative throughput and timing totals.
+
 Recommended scenarios:
 
 - Short signing input (`header.payload` < 128 bytes), mostly short candidate secrets

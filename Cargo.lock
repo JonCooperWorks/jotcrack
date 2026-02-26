@@ -240,6 +240,7 @@ dependencies = [
  "base64",
  "clap",
  "jsonwebtoken",
+ "memchr",
  "memmap2",
  "metal",
  "objc",

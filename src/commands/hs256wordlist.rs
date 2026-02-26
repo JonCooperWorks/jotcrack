@@ -1,3 +1,20 @@
+//! HS256 JWT wordlist cracking command (Metal-backed).
+//!
+//! Educational overview of the runtime pipeline:
+//! 1. Parse and validate the JWT (`parse_hs256_jwt`) and extract the signing
+//!    input + target HS256 signature bytes.
+//! 2. Initialize the GPU runtime (`GpuHs256BruteForcer`) once, including Metal
+//!    kernels and small persistent shared buffers (params/message/result).
+//! 3. Spawn a producer thread that reads the wordlist and packs candidates into
+//!    GPU-ready batches (`WordBatch`) using mmap-backed parsing.
+//! 4. On the main thread, consume batches, optionally autotune threadgroup
+//!    width, dispatch GPU work, and track timing buckets.
+//! 5. Report progress using windowed (interval) `RATE` lines, then print final
+//!    cumulative `STATS` when a key is found or the wordlist is exhausted.
+//!
+//! The file is intentionally organized in the same order as the runtime data
+//! flow (batch packing -> producer pipeline -> GPU dispatch -> command `run()`).
+
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,7 +27,8 @@ use anyhow::{Context, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use clap::Args;
-use memmap2::{Mmap, MmapOptions};
+use memchr::memchr;
+use memmap2::{Advice, Mmap, MmapOptions};
 use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
 use serde::Deserialize;
 #[cfg(test)]
@@ -36,8 +54,8 @@ const METAL_FUNCTION_NAME_SHORT_KEYS: &str = "hs256_wordlist_short_keys";
 // `u32::MAX` remains the sentinel for "no match in this batch".
 const RESULT_NOT_FOUND_SENTINEL: u32 = u32::MAX;
 // Larger batches improve amortization of dispatch overhead and host work.
-const MAX_CANDIDATES_PER_BATCH: usize = 1_048_576;
-const MAX_WORD_BYTES_PER_BATCH: usize = 64 * 1024 * 1024;
+const MAX_CANDIDATES_PER_BATCH: usize = 518_224;
+const MAX_WORD_BYTES_PER_BATCH: usize = 32 * 1024 * 1024;
 // Small bounded queue: enough to overlap CPU/GPU without letting parsed data
 // accumulate unbounded in memory when the GPU is slower.
 const DEFAULT_PIPELINE_DEPTH: usize = 2;
@@ -191,10 +209,7 @@ impl WordBatch {
         // SAFETY: `word_offsets_buf` stores `u32` entries; the first
         // `candidate_count` entries are initialized by `push_candidate`.
         unsafe {
-            std::slice::from_raw_parts(
-                self.word_offsets_ptr as *const u32,
-                self.candidate_count,
-            )
+            std::slice::from_raw_parts(self.word_offsets_ptr as *const u32, self.candidate_count)
         }
     }
 
@@ -202,22 +217,14 @@ impl WordBatch {
         // SAFETY: `word_lengths_buf` stores `u16` entries; the first
         // `candidate_count` entries are initialized by `push_candidate`.
         unsafe {
-            std::slice::from_raw_parts(
-                self.word_lengths_ptr as *const u16,
-                self.candidate_count,
-            )
+            std::slice::from_raw_parts(self.word_lengths_ptr as *const u16, self.candidate_count)
         }
     }
 
     fn word_bytes_slice(&self) -> &[u8] {
         // SAFETY: the first `word_bytes_len` bytes are initialized by
         // `push_candidate`.
-        unsafe {
-            std::slice::from_raw_parts(
-                self.word_bytes_ptr as *const u8,
-                self.word_bytes_len,
-            )
-        }
+        unsafe { std::slice::from_raw_parts(self.word_bytes_ptr as *const u8, self.word_bytes_len) }
     }
 
     fn can_fit(&self, line_len: usize) -> bool {
@@ -225,8 +232,8 @@ impl WordBatch {
         // - always enforce candidate-count cap
         // - only enforce byte-cap after the first candidate is present
         let would_exceed_count = self.candidate_count >= MAX_CANDIDATES_PER_BATCH;
-        let would_exceed_bytes =
-            self.candidate_count != 0 && (self.word_bytes_len + line_len > MAX_WORD_BYTES_PER_BATCH);
+        let would_exceed_bytes = self.candidate_count != 0
+            && (self.word_bytes_len + line_len > MAX_WORD_BYTES_PER_BATCH);
         !(would_exceed_count || would_exceed_bytes)
     }
 
@@ -502,21 +509,20 @@ impl MmapWordlistBatchReader {
         while self.cursor < bytes.len() {
             // Find the next line without allocating intermediate strings.
             let line_start = self.cursor;
-            let mut line_end = line_start;
-            while line_end < bytes.len() && bytes[line_end] != b'\n' {
-                line_end += 1;
-            }
+            let remaining = &bytes[line_start..];
+            let (line_end, next_cursor) = match memchr(b'\n', remaining) {
+                Some(rel_newline) => {
+                    let line_end = line_start + rel_newline;
+                    (line_end, line_end + 1)
+                }
+                None => (bytes.len(), bytes.len()),
+            };
             // Match the buffered reader's CRLF behavior by trimming a trailing
             // carriage return before packaging the candidate.
             let mut trimmed_end = line_end;
             if trimmed_end > line_start && bytes[trimmed_end - 1] == b'\r' {
                 trimmed_end -= 1;
             }
-            let next_cursor = if line_end < bytes.len() {
-                line_end + 1
-            } else {
-                line_end
-            };
             let line_len = trimmed_end - line_start;
 
             if line_len == 0 {
@@ -570,6 +576,9 @@ impl AnyWordlistBatchReader {
             .with_context(|| format!("failed to open wordlist {}", path.display()))?;
         let mmap = unsafe { MmapOptions::new().map(&file) }
             .with_context(|| format!("failed to mmap wordlist {}", path.display()))?;
+        // Best-effort OS hint: this workload scans the wordlist sequentially.
+        // Ignore failures so advisory support differences do not affect correctness.
+        let _ = mmap.advise(Advice::Sequential);
         Ok(Self::Mmap(MmapWordlistBatchReader::new(device, mmap)))
     }
 
@@ -759,6 +768,59 @@ struct RunTimings {
     total_batch_word_bytes: u64,
 }
 
+// Snapshot of cumulative counters/timings at a periodic progress report.
+// Deltas between snapshots produce interval ("windowed") rates and wait times.
+#[derive(Debug, Clone, Copy)]
+struct RateReportSnapshot {
+    reported_at: Instant,
+    candidates_tested: u64,
+    gpu_wait: Duration,
+    wordlist_batch_build: Duration,
+    consumer_idle_wait: Duration,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RateReportDelta {
+    wall_time: Duration,
+    candidates_tested: u64,
+    gpu_wait: Duration,
+    wordlist_batch_build: Duration,
+    consumer_idle_wait: Duration,
+}
+
+impl RateReportSnapshot {
+    fn capture(reported_at: Instant, candidates_tested: u64, timings: &RunTimings) -> Self {
+        Self {
+            reported_at,
+            candidates_tested,
+            gpu_wait: timings.gpu_wait,
+            wordlist_batch_build: timings.wordlist_batch_build,
+            consumer_idle_wait: timings.consumer_idle_wait,
+        }
+    }
+
+    fn delta_since(self, previous: Self) -> RateReportDelta {
+        RateReportDelta {
+            wall_time: self
+                .reported_at
+                .checked_duration_since(previous.reported_at)
+                .unwrap_or_default(),
+            candidates_tested: self
+                .candidates_tested
+                .saturating_sub(previous.candidates_tested),
+            gpu_wait: saturating_duration_sub(self.gpu_wait, previous.gpu_wait),
+            wordlist_batch_build: saturating_duration_sub(
+                self.wordlist_batch_build,
+                previous.wordlist_batch_build,
+            ),
+            consumer_idle_wait: saturating_duration_sub(
+                self.consumer_idle_wait,
+                previous.consumer_idle_wait,
+            ),
+        }
+    }
+}
+
 // ---- Host -> Metal shared-buffer copy helpers ------------------------------
 // After the no-copy refactor these are only for small state writes (params,
 // result sentinel, one-time JWT message upload), not batch payload bytes.
@@ -846,7 +908,10 @@ impl GpuHs256BruteForcer {
     // Select the specialized short-key kernel when every candidate in the
     // dispatch view is <= 64 bytes; otherwise fall back to the mixed kernel.
     // `DispatchBatchView` lets autotune reuse this logic on a sampled prefix.
-    fn active_pipeline_for_view(&self, batch: DispatchBatchView<'_>) -> &metal::ComputePipelineState {
+    fn active_pipeline_for_view(
+        &self,
+        batch: DispatchBatchView<'_>,
+    ) -> &metal::ComputePipelineState {
         if batch.max_word_len <= 64 {
             &self.pipeline_short_keys
         } else {
@@ -899,7 +964,11 @@ impl GpuHs256BruteForcer {
         target_signature: [u8; 32],
         batch: &WordBatch,
     ) -> anyhow::Result<(Option<u32>, BatchDispatchTimings)> {
-        self.dispatch_batch_view(target_signature, batch.as_dispatch_view(), self.threadgroup_width)
+        self.dispatch_batch_view(
+            target_signature,
+            batch.as_dispatch_view(),
+            self.threadgroup_width,
+        )
     }
 
     // Encode and execute a single GPU dispatch, then read back the match index.
@@ -1034,7 +1103,8 @@ impl GpuHs256BruteForcer {
         // apples GPU-only throughput measurement (same data, only width changes).
         let mut best: Option<(usize, f64)> = None;
         for width in candidates {
-            let (_result, timings) = self.dispatch_batch_view(target_signature, sample_view, width)?;
+            let (_result, timings) =
+                self.dispatch_batch_view(target_signature, sample_view, width)?;
             if timings.gpu_wait.is_zero() {
                 continue;
             }
@@ -1081,10 +1151,11 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
     let mut producer = WordlistProducer::spawn(args.wordlist.clone(), gpu.device.clone());
     let run_result = (|| -> anyhow::Result<bool> {
         let started_at = Instant::now();
-        let mut last_rate_report_at = started_at;
         let mut candidates_tested: u64 = 0;
         let mut autotune_done = !args.autotune;
         let mut timings = RunTimings::default();
+        let mut last_rate_report =
+            RateReportSnapshot::capture(started_at, candidates_tested, &timings);
 
         loop {
             // Time how long the consumer waits on the producer. This measures
@@ -1147,7 +1218,9 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
                 let _global_index = batch
                     .candidate_index_base
                     .checked_add(local_match_index as u64)
-                    .ok_or_else(|| anyhow!("candidate index overflow while reconstructing result"))?;
+                    .ok_or_else(|| {
+                        anyhow!("candidate index overflow while reconstructing result")
+                    })?;
                 let local_index =
                     // The GPU result must fit `usize` because every dispatch is
                     // bounded by `MAX_CANDIDATES_PER_BATCH` (far below `usize`
@@ -1162,21 +1235,31 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
 
             candidates_tested = candidates_tested.saturating_add(batch_candidate_count);
             let now = Instant::now();
-            if now.duration_since(last_rate_report_at) >= Duration::from_secs(1) {
-                // Periodic progress uses cumulative counts so the rate smooths
-                // out per-batch timing variance.
-                let elapsed = now.duration_since(started_at);
-                let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
-                let rate_gpu_only = rate_per_second(candidates_tested, timings.gpu_wait);
+            let elapsed_since_last_report = now
+                .checked_duration_since(last_rate_report.reported_at)
+                .unwrap_or_default();
+            if elapsed_since_last_report >= Duration::from_secs(1) {
+                let current_rate_report =
+                    RateReportSnapshot::capture(now, candidates_tested, &timings);
+                let delta = current_rate_report.delta_since(last_rate_report);
+                // `RATE` is windowed (interval) by design: use deltas from the
+                // last report, while final `STATS` remains cumulative.
+                let rate_end_to_end = rate_per_second(delta.candidates_tested, delta.wall_time);
+                let rate_gpu_only = rate_per_second(delta.candidates_tested, delta.gpu_wait);
+                let elapsed_total = now.duration_since(started_at);
                 eprintln!(
-                    "RATE end_to_end={}/s gpu_only={}/s ({} tested in {:.2}s, tpg={})",
+                    "RATE end_to_end={}/s gpu_only={}/s idle_wait={}ms build={}ms (delta={} in {:.2}s, total={} in {:.2}s, tpg={})",
                     format_human_count(rate_end_to_end),
                     format_human_count(rate_gpu_only),
+                    format_duration_millis(delta.consumer_idle_wait),
+                    format_duration_millis(delta.wordlist_batch_build),
+                    format_human_count(delta.candidates_tested as f64),
+                    delta.wall_time.as_secs_f64(),
                     format_human_count(candidates_tested as f64),
-                    elapsed.as_secs_f64(),
+                    elapsed_total.as_secs_f64(),
                     gpu.current_threadgroup_width()
                 );
-                last_rate_report_at = now;
+                last_rate_report = current_rate_report;
             }
 
             // After dispatch/readback completes with no match, the consumer no
@@ -1254,12 +1337,25 @@ fn parse_hs256_jwt(jwt: &str) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
 
 // Helper used by both periodic and final reporting. Returns 0 when no time has
 // elapsed yet to avoid division-by-zero during startup.
+fn saturating_duration_sub(current: Duration, previous: Duration) -> Duration {
+    // Defensive helper for "delta from cumulative totals" math used by the
+    // progress reporter. Underflow should not happen in normal execution, but
+    // returning zero keeps tests and future refactors safe.
+    current.checked_sub(previous).unwrap_or_default()
+}
+
 fn rate_per_second(candidates_tested: u64, elapsed: Duration) -> f64 {
     if elapsed.is_zero() {
         0.0
     } else {
         candidates_tested as f64 / elapsed.as_secs_f64()
     }
+}
+
+fn format_duration_millis(duration: Duration) -> String {
+    // Keep progress logs compact and stable: milliseconds are easy to compare
+    // across runs when diagnosing host-side stalls.
+    format!("{:.1}", duration.as_secs_f64() * 1_000.0)
 }
 
 // Render large counts/rates in a stable human-readable format so benchmark logs
@@ -1367,10 +1463,36 @@ fn bytes_of<T>(value: &T) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::{self, File as StdFile};
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEMP_WORDLIST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn test_device() -> Device {
         Device::system_default().expect("Metal device is required for hs256wordlist tests")
+    }
+
+    fn write_temp_wordlist(bytes: &[u8]) -> std::path::PathBuf {
+        let unique = TEMP_WORDLIST_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "jotcrack-hs256wordlist-test-{}-{nanos}-{unique}.txt",
+            std::process::id()
+        ));
+        fs::write(&path, bytes).expect("failed to write temp wordlist");
+        path
+    }
+
+    fn mmap_reader_from_temp_file(bytes: &[u8]) -> (MmapWordlistBatchReader, std::path::PathBuf) {
+        let path = write_temp_wordlist(bytes);
+        let file = StdFile::open(&path).expect("failed to open temp wordlist");
+        let mmap = unsafe { MmapOptions::new().map(&file) }.expect("failed to mmap temp wordlist");
+        (MmapWordlistBatchReader::new(test_device(), mmap), path)
     }
 
     // ---- Layout / host-kernel contract tests --------------------------------
@@ -1379,6 +1501,52 @@ mod tests {
         let params = Hs256BruteForceParams::default();
         let bytes = bytes_of(&params);
         assert_eq!(bytes.len(), std::mem::size_of::<Hs256BruteForceParams>());
+    }
+
+    // ---- Reporting helper behavior ------------------------------------------
+    #[test]
+    fn rate_report_snapshot_delta_computes_window_metrics() {
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(2);
+        let previous = RateReportSnapshot {
+            reported_at: t0,
+            candidates_tested: 100,
+            gpu_wait: Duration::from_millis(400),
+            wordlist_batch_build: Duration::from_millis(50),
+            consumer_idle_wait: Duration::from_millis(10),
+        };
+        let current = RateReportSnapshot {
+            reported_at: t1,
+            candidates_tested: 300,
+            gpu_wait: Duration::from_millis(900),
+            wordlist_batch_build: Duration::from_millis(90),
+            consumer_idle_wait: Duration::from_millis(25),
+        };
+
+        let delta = current.delta_since(previous);
+        assert_eq!(delta.wall_time, Duration::from_secs(2));
+        assert_eq!(delta.candidates_tested, 200);
+        assert_eq!(delta.gpu_wait, Duration::from_millis(500));
+        assert_eq!(delta.wordlist_batch_build, Duration::from_millis(40));
+        assert_eq!(delta.consumer_idle_wait, Duration::from_millis(15));
+
+        let end_to_end_rate = rate_per_second(delta.candidates_tested, delta.wall_time);
+        let gpu_only_rate = rate_per_second(delta.candidates_tested, delta.gpu_wait);
+        assert!((end_to_end_rate - 100.0).abs() < 0.000_001);
+        assert!((gpu_only_rate - 400.0).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn rate_per_second_returns_zero_for_zero_elapsed() {
+        assert_eq!(rate_per_second(123, Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn saturating_duration_sub_returns_zero_on_underflow() {
+        assert_eq!(
+            saturating_duration_sub(Duration::from_millis(10), Duration::from_millis(25)),
+            Duration::ZERO
+        );
     }
 
     // ---- JWT parsing validation ----------------------------------------------
@@ -1435,7 +1603,8 @@ mod tests {
     #[test]
     fn wordlist_batch_reader_packs_offsets_and_lengths() {
         let data = b"alpha\r\n\nbe\ncharlie\n";
-        let mut reader = BufferedWordlistBatchReader::new(test_device(), Cursor::new(data.as_slice()));
+        let mut reader =
+            BufferedWordlistBatchReader::new(test_device(), Cursor::new(data.as_slice()));
         let batch = reader.next_batch().unwrap().unwrap();
 
         assert_eq!(batch.candidate_index_base, 0);
@@ -1453,7 +1622,8 @@ mod tests {
     fn wordlist_batch_reader_rejects_too_long_line() {
         let oversized = "a".repeat((u16::MAX as usize) + 1);
         let data = format!("{oversized}\n");
-        let mut reader = BufferedWordlistBatchReader::new(test_device(), Cursor::new(data.into_bytes()));
+        let mut reader =
+            BufferedWordlistBatchReader::new(test_device(), Cursor::new(data.into_bytes()));
         let err = reader.next_batch().unwrap_err();
         assert!(format!("{err:#}").contains("exceeds"));
     }
@@ -1467,7 +1637,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let data = format!("{lines}\n");
-        let mut reader = BufferedWordlistBatchReader::new(test_device(), Cursor::new(data.into_bytes()));
+        let mut reader =
+            BufferedWordlistBatchReader::new(test_device(), Cursor::new(data.into_bytes()));
 
         let first = reader.next_batch().unwrap().unwrap();
         let second = reader.next_batch().unwrap().unwrap();
@@ -1478,10 +1649,42 @@ mod tests {
         assert_eq!(second.candidate_count(), 2);
     }
 
+    #[test]
+    fn mmap_wordlist_batch_reader_packs_offsets_lengths_and_trims_crlf() {
+        let (mut reader, path) = mmap_reader_from_temp_file(b"alpha\r\n\nbe\ncharlie\n");
+        let batch = reader.next_batch_reusing(None).unwrap().unwrap();
+
+        assert_eq!(batch.candidate_index_base, 0);
+        assert_eq!(batch.offsets_slice(), &[0, 5, 7]);
+        assert_eq!(batch.lengths_slice(), &[5, 2, 7]);
+        assert_eq!(batch.word_bytes_slice(), b"alphabecharlie");
+        assert_eq!(batch.max_word_len(), 7);
+        assert_eq!(batch.word(0).unwrap(), b"alpha");
+        assert_eq!(batch.word(1).unwrap(), b"be");
+        assert_eq!(batch.word(2).unwrap(), b"charlie");
+        assert!(reader.next_batch_reusing(None).unwrap().is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn mmap_wordlist_batch_reader_handles_final_line_without_newline() {
+        let (mut reader, path) = mmap_reader_from_temp_file(b"alpha\nbeta");
+        let batch = reader.next_batch_reusing(None).unwrap().unwrap();
+
+        assert_eq!(batch.candidate_count(), 2);
+        assert_eq!(batch.word(0).unwrap(), b"alpha");
+        assert_eq!(batch.word(1).unwrap(), b"beta");
+        assert!(reader.next_batch_reusing(None).unwrap().is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
     // ---- Edge cases: empty input, missing newline, CRLF/LF normalization -----
     #[test]
     fn wordlist_batch_reader_returns_none_for_all_empty_lines() {
-        let mut reader = BufferedWordlistBatchReader::new(test_device(), Cursor::new(b"\n\r\n".as_slice()));
+        let mut reader =
+            BufferedWordlistBatchReader::new(test_device(), Cursor::new(b"\n\r\n".as_slice()));
         assert!(reader.next_batch().unwrap().is_none());
     }
 
