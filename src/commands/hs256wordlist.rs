@@ -55,7 +55,7 @@ const METAL_FUNCTION_NAME_SHORT_KEYS: &str = "hs256_wordlist_short_keys";
 // `u32::MAX` remains the sentinel for "no match in this batch".
 const RESULT_NOT_FOUND_SENTINEL: u32 = u32::MAX;
 // Larger batches improve amortization of dispatch overhead and host work.
-const MAX_CANDIDATES_PER_BATCH: usize = 518_224;
+const MAX_CANDIDATES_PER_BATCH: usize = 5_182_240;
 const MAX_WORD_BYTES_PER_BATCH: usize = 32 * 1024 * 1024;
 // Small bounded queue: enough to overlap CPU/GPU without letting parsed data
 // accumulate unbounded in memory when the GPU is slower.
