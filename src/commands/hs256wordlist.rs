@@ -5,8 +5,8 @@
 //!    input + target HS256 signature bytes.
 //! 2. Initialize the GPU runtime (`GpuHs256BruteForcer`) once, including Metal
 //!    kernels and small persistent shared buffers (params/message/result).
-//! 3. Spawn a producer thread that reads the wordlist and packs candidates into
-//!    GPU-ready batches (`WordBatch`) using mmap-backed parsing.
+//! 3. Spawn a producer thread that coordinates a parallel mmap parser and packs
+//!    candidates into GPU-ready batches (`WordBatch`).
 //! 4. On the main thread, consume batches, optionally autotune threadgroup
 //!    width, dispatch GPU work, and track timing buckets.
 //! 5. Report progress using windowed (interval) `RATE` lines, then print final
@@ -15,6 +15,7 @@
 //! The file is intentionally organized in the same order as the runtime data
 //! flow (batch packing -> producer pipeline -> GPU dispatch -> command `run()`).
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -59,6 +60,9 @@ const MAX_WORD_BYTES_PER_BATCH: usize = 32 * 1024 * 1024;
 // Small bounded queue: enough to overlap CPU/GPU without letting parsed data
 // accumulate unbounded in memory when the GPU is slower.
 const DEFAULT_PIPELINE_DEPTH: usize = 2;
+// Parser workers scan mmap chunks in parallel and return line metadata for
+// ordered batch assembly on the producer thread.
+const DEFAULT_PARSER_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 /// CLI arguments for the `hs256wordlist` subcommand.
 ///
@@ -72,8 +76,64 @@ pub struct Hs256WordlistArgs {
     pub wordlist: PathBuf,
     #[arg(long)]
     pub threads_per_group: Option<usize>,
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub parser_threads: Option<usize>,
     #[arg(long)]
     pub autotune: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+// Host-side parser tuning resolved once at command startup.
+//
+// Keeping this as a plain struct (instead of reading CLI args everywhere)
+// makes the producer/parser code easier to test and keeps policy decisions
+// (auto thread count, chunk size, queue depth) in one place.
+struct ParserConfig {
+    parser_threads: usize,
+    chunk_bytes: usize,
+    queue_capacity: usize,
+}
+
+impl ParserConfig {
+    fn from_args(args: &Hs256WordlistArgs) -> Self {
+        let auto_threads = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(1).max(1))
+            .unwrap_or(1);
+        let parser_threads = args.parser_threads.unwrap_or(auto_threads);
+        let queue_capacity = parser_threads.saturating_mul(4).max(1);
+        Self {
+            parser_threads,
+            chunk_bytes: DEFAULT_PARSER_CHUNK_BYTES,
+            queue_capacity,
+        }
+    }
+}
+
+// Clap parser helper used for `--parser-threads`.
+//
+// We validate here so CLI errors are reported before any GPU/parser startup
+// work begins, and the rest of the code can assume a strictly positive value.
+fn parse_positive_usize(input: &str) -> Result<usize, String> {
+    let parsed = input
+        .parse::<usize>()
+        .map_err(|_| format!("invalid integer value: {input}"))?;
+    if parsed == 0 {
+        return Err("must be > 0".to_string());
+    }
+    Ok(parsed)
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+// Snapshot of parser-side counters/configuration reported by the producer.
+//
+// This is copied into `ProducerMessage` so the consumer can print final `STATS`
+// without reaching into parser internals or sharing mutable state across
+// threads.
+struct ParserStats {
+    parser_threads: usize,
+    parser_chunk_bytes: usize,
+    parser_chunks: u64,
+    parser_skipped_oversize: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -467,6 +527,11 @@ impl<R: BufRead> BufferedWordlistBatchReader<R> {
 //
 // mmap removes per-line read syscalls. We still copy candidate bytes once into
 // the packed batch buffer because the kernel expects a contiguous payload.
+//
+// Runtime now uses the parallel parser. We keep this sequential reader as a
+// test-only reference implementation so parser behavior can be compared in
+// unit tests (especially ordering and line-trimming semantics).
+#[cfg(test)]
 struct MmapWordlistBatchReader {
     device: Device,
     mmap: Mmap,
@@ -476,6 +541,7 @@ struct MmapWordlistBatchReader {
     next_index: u64,
 }
 
+#[cfg(test)]
 impl MmapWordlistBatchReader {
     // Wrap a mapped wordlist file for sequential batch extraction.
     fn new(device: Device, mmap: Mmap) -> Self {
@@ -562,24 +628,453 @@ impl MmapWordlistBatchReader {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+// Immutable work item describing one newline-aligned byte range in the mmap.
+//
+// Each worker receives a `ChunkJob`, scans that slice independently, and
+// returns only metadata (offsets/lengths) so the coordinator can preserve
+// file-order emission while still parallelizing scanning.
+struct ChunkJob {
+    chunk_id: u64,
+    start: usize,
+    end: usize,
+}
+
+#[derive(Debug)]
+// Parsed metadata for one chunk.
+//
+// The worker deliberately does *not* copy candidate bytes into GPU buffers.
+// Instead it records relative offsets and lengths so the producer thread can
+// later pack candidates into `WordBatch` in deterministic file order.
+struct ParsedChunk {
+    chunk_id: u64,
+    chunk_start: usize,
+    offsets_rel: Vec<u32>,
+    lengths: Vec<u16>,
+    skipped_oversize: u64,
+}
+
+#[derive(Debug)]
+// Messages from parser workers back to the producer/coordinator thread.
+//
+// We send strings for errors (instead of `anyhow::Error`) to keep the channel
+// payload simple and `Send` without additional wrappers.
+enum ParserWorkerMessage {
+    Parsed(ParsedChunk),
+    Error { chunk_id: u64, message: String },
+}
+
+// Split the mapped file into newline-aligned chunks for parallel scanning.
+//
+// Important property: every byte belongs to exactly one chunk and chunk ends
+// are extended to include the newline that terminates the last line in that
+// chunk. This removes partial-line ambiguity across workers.
+fn plan_mmap_chunks(bytes: &[u8], chunk_bytes: usize) -> anyhow::Result<Vec<ChunkJob>> {
+    if chunk_bytes == 0 {
+        bail!("parser chunk size must be > 0");
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut chunk_id = 0u64;
+    while start < bytes.len() {
+        let target_end = (start + chunk_bytes).min(bytes.len());
+        let end = if target_end >= bytes.len() {
+            bytes.len()
+        } else {
+            match memchr(b'\n', &bytes[target_end..]) {
+                Some(rel_newline) => target_end + rel_newline + 1,
+                None => bytes.len(),
+            }
+        };
+
+        if end < start {
+            bail!("invalid chunk planner state: chunk end before start");
+        }
+
+        chunks.push(ChunkJob {
+            chunk_id,
+            start,
+            end,
+        });
+        chunk_id = chunk_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("parser chunk id overflow"))?;
+        start = end;
+    }
+    Ok(chunks)
+}
+
+// Parse one newline-aligned chunk into compact line metadata.
+//
+// The parser trims a trailing `\\r`, skips empty lines, and (intentionally for
+// throughput) skips oversized entries instead of failing the entire run.
+fn parse_mmap_chunk(bytes: &[u8], job: ChunkJob) -> anyhow::Result<ParsedChunk> {
+    if job.start > job.end || job.end > bytes.len() {
+        bail!(
+            "invalid parser chunk bounds {}..{} for file len {}",
+            job.start,
+            job.end,
+            bytes.len()
+        );
+    }
+
+    let chunk = &bytes[job.start..job.end];
+    let mut offsets_rel = Vec::new();
+    let mut lengths = Vec::new();
+    let mut skipped_oversize = 0u64;
+    let mut cursor = 0usize;
+
+    while cursor < chunk.len() {
+        let line_start = cursor;
+        let remaining = &chunk[line_start..];
+        let (line_end, next_cursor) = match memchr(b'\n', remaining) {
+            Some(rel_newline) => {
+                let line_end = line_start + rel_newline;
+                (line_end, line_end + 1)
+            }
+            None => (chunk.len(), chunk.len()),
+        };
+
+        let mut trimmed_end = line_end;
+        if trimmed_end > line_start && chunk[trimmed_end - 1] == b'\r' {
+            trimmed_end -= 1;
+        }
+        let line_len = trimmed_end - line_start;
+
+        if line_len == 0 {
+            cursor = next_cursor;
+            continue;
+        }
+
+        if line_len > u16::MAX as usize {
+            skipped_oversize = skipped_oversize.saturating_add(1);
+            cursor = next_cursor;
+            continue;
+        }
+
+        offsets_rel.push(
+            u32::try_from(line_start)
+                .context("parser chunk relative offset exceeds u32 while recording line")?,
+        );
+        lengths.push(line_len as u16);
+        cursor = next_cursor;
+    }
+
+    Ok(ParsedChunk {
+        chunk_id: job.chunk_id,
+        chunk_start: job.start,
+        offsets_rel,
+        lengths,
+        skipped_oversize,
+    })
+}
+
+// Runtime wordlist reader that parallelizes newline scanning over an mmap file
+// while keeping batch emission ordered and deterministic.
+//
+// Design overview:
+// - worker threads parse chunks into metadata (`ParsedChunk`)
+// - the producer thread (coordinator) reorders results by `chunk_id`
+// - the producer thread alone packs bytes into `WordBatch` GPU buffers
+//
+// This keeps concurrent code focused on pure parsing and preserves the existing
+// GPU dispatch contract (`WordBatch`) without parallel writes into Metal memory.
+struct ParallelMmapWordlistBatchReader {
+    device: Device,
+    mmap: Arc<Mmap>,
+    // Precomputed newline-aligned chunk plan for the whole file.
+    chunks: Vec<ChunkJob>,
+    // Job scheduling cursors / limits.
+    next_job_to_send: usize,
+    next_chunk_to_emit: u64,
+    in_flight_jobs: usize,
+    max_in_flight_jobs: usize,
+    // Coordinator -> workers and workers -> coordinator channels.
+    job_tx: Option<crossbeam_channel::Sender<ChunkJob>>,
+    result_rx: crossbeam_channel::Receiver<ParserWorkerMessage>,
+    worker_handles: Vec<JoinHandle<()>>,
+    // Out-of-order worker results buffered until `next_chunk_to_emit` arrives.
+    pending_results: BTreeMap<u64, ParsedChunk>,
+    // Current parsed chunk being drained into a `WordBatch`.
+    active_chunk: Option<ParsedChunk>,
+    active_chunk_line_cursor: usize,
+    // Absolute candidate index of the next accepted (non-empty, non-oversize)
+    // line to be emitted into a batch.
+    next_index: u64,
+    parser_stats: ParserStats,
+}
+
+impl ParallelMmapWordlistBatchReader {
+    // Build the parser subsystem:
+    // 1) map+plan chunks (already done before this call)
+    // 2) create bounded channels (backpressure)
+    // 3) spawn worker threads that parse chunk metadata only
+    fn new(device: Device, mmap: Mmap, config: ParserConfig) -> anyhow::Result<Self> {
+        let mmap = Arc::new(mmap);
+        let chunks = plan_mmap_chunks(mmap.as_ref(), config.chunk_bytes)?;
+        let (job_tx, job_rx) = crossbeam_channel::bounded(config.queue_capacity);
+        let (result_tx, result_rx) = crossbeam_channel::bounded(config.queue_capacity);
+        let mut worker_handles = Vec::with_capacity(config.parser_threads);
+
+        for _ in 0..config.parser_threads {
+            let mmap_for_worker = Arc::clone(&mmap);
+            let job_rx_for_worker = job_rx.clone();
+            let result_tx_for_worker = result_tx.clone();
+            worker_handles.push(thread::spawn(move || {
+                // Each worker is a simple parse loop: recv job -> parse -> send
+                // metadata. No shared mutable state is touched here.
+                while let Ok(job) = job_rx_for_worker.recv() {
+                    let message = match parse_mmap_chunk(mmap_for_worker.as_ref(), job) {
+                        Ok(chunk) => ParserWorkerMessage::Parsed(chunk),
+                        Err(err) => ParserWorkerMessage::Error {
+                            chunk_id: job.chunk_id,
+                            message: format!("{err:#}"),
+                        },
+                    };
+                    if result_tx_for_worker.send(message).is_err() {
+                        return;
+                    }
+                }
+            }));
+        }
+        drop(job_rx);
+        drop(result_tx);
+
+        Ok(Self {
+            device,
+            mmap,
+            chunks,
+            next_job_to_send: 0,
+            next_chunk_to_emit: 0,
+            in_flight_jobs: 0,
+            max_in_flight_jobs: config.queue_capacity.max(1),
+            job_tx: Some(job_tx),
+            result_rx,
+            worker_handles,
+            pending_results: BTreeMap::new(),
+            active_chunk: None,
+            active_chunk_line_cursor: 0,
+            next_index: 0,
+            parser_stats: ParserStats {
+                parser_threads: config.parser_threads,
+                parser_chunk_bytes: config.chunk_bytes,
+                ..ParserStats::default()
+            },
+        })
+    }
+
+    // Cheap snapshot consumed by the producer so progress/final reporting can
+    // include parser counters without shared atomics or locks.
+    fn parser_stats(&self) -> ParserStats {
+        self.parser_stats
+    }
+
+    // Submit more jobs until we hit the in-flight limit or exhaust the chunk
+    // plan. The bounded channel keeps memory growth predictable.
+    fn pump_jobs(&mut self) -> anyhow::Result<()> {
+        while self.in_flight_jobs < self.max_in_flight_jobs
+            && self.next_job_to_send < self.chunks.len()
+        {
+            let job = self.chunks[self.next_job_to_send];
+            let tx = self
+                .job_tx
+                .as_ref()
+                .ok_or_else(|| anyhow!("parser worker job queue already closed"))?;
+            tx.send(job)
+                .map_err(|_| anyhow!("parser worker job queue closed unexpectedly"))?;
+            self.next_job_to_send += 1;
+            self.in_flight_jobs = self.in_flight_jobs.saturating_add(1);
+        }
+
+        if self.next_job_to_send >= self.chunks.len() {
+            let _ = self.job_tx.take();
+        }
+        Ok(())
+    }
+
+    // Merge one worker message into coordinator state.
+    //
+    // Successful chunks are recorded in `pending_results` and become eligible
+    // for ordered emission once all earlier chunk ids have been drained.
+    fn handle_worker_message(&mut self, message: ParserWorkerMessage) -> anyhow::Result<()> {
+        self.in_flight_jobs = self.in_flight_jobs.saturating_sub(1);
+        match message {
+            ParserWorkerMessage::Parsed(chunk) => {
+                self.parser_stats.parser_chunks = self.parser_stats.parser_chunks.saturating_add(1);
+                self.parser_stats.parser_skipped_oversize = self
+                    .parser_stats
+                    .parser_skipped_oversize
+                    .saturating_add(chunk.skipped_oversize);
+                if self.pending_results.insert(chunk.chunk_id, chunk).is_some() {
+                    bail!("duplicate parsed chunk id received from parser workers");
+                }
+                Ok(())
+            }
+            ParserWorkerMessage::Error { chunk_id, message } => {
+                bail!("parser worker failed on chunk {chunk_id}: {message}")
+            }
+        }
+    }
+
+    // Promote the next in-order parsed chunk (if already available) into the
+    // active-drain slot used by `next_batch_reusing`.
+    fn try_activate_ready_chunk(&mut self) -> bool {
+        if self.active_chunk.is_some() {
+            return true;
+        }
+        if let Some(chunk) = self.pending_results.remove(&self.next_chunk_to_emit) {
+            self.active_chunk = Some(chunk);
+            self.active_chunk_line_cursor = 0;
+            return true;
+        }
+        false
+    }
+
+    // Ensure there is an active parsed chunk ready to drain, blocking on worker
+    // results only when necessary.
+    //
+    // Returns `Ok(false)` only when every chunk has been emitted and no more
+    // parser work is in flight.
+    fn ensure_active_chunk(&mut self) -> anyhow::Result<bool> {
+        loop {
+            if self.try_activate_ready_chunk() {
+                return Ok(true);
+            }
+
+            self.pump_jobs()?;
+            if self.try_activate_ready_chunk() {
+                return Ok(true);
+            }
+
+            let all_chunks_emitted = usize::try_from(self.next_chunk_to_emit)
+                .ok()
+                .is_some_and(|idx| idx >= self.chunks.len());
+            if all_chunks_emitted && self.in_flight_jobs == 0 {
+                return Ok(false);
+            }
+
+            let message = self
+                .result_rx
+                .recv()
+                .map_err(|_| anyhow!("parser workers terminated unexpectedly"))?;
+            self.handle_worker_message(message)?;
+        }
+    }
+
+    // Build the next GPU batch by draining parsed chunk metadata in file order.
+    //
+    // Batch boundaries remain governed by the same `WordBatch::can_fit` rules as
+    // before; the redesign changes *how* we discover lines, not how we package
+    // them for the GPU.
+    fn next_batch_reusing(
+        &mut self,
+        recycled: Option<WordBatch>,
+    ) -> anyhow::Result<Option<WordBatch>> {
+        let candidate_index_base = self.next_index;
+        let mut batch = if let Some(mut batch) = recycled {
+            batch.reset_for_reuse(candidate_index_base);
+            batch
+        } else {
+            WordBatch::new(&self.device, candidate_index_base)
+        };
+
+        loop {
+            if !self.ensure_active_chunk()? {
+                break;
+            }
+
+            let chunk_exhausted = {
+                let chunk = self
+                    .active_chunk
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("parser active chunk missing"))?;
+                let bytes = self.mmap.as_ref();
+
+                // Drain as many lines from the current parsed chunk as will fit
+                // in this batch, leaving the cursor parked if the batch fills.
+                while self.active_chunk_line_cursor < chunk.lengths.len() {
+                    let line_len = chunk.lengths[self.active_chunk_line_cursor] as usize;
+                    if !batch.can_fit(line_len) {
+                        break;
+                    }
+
+                    let line_start = chunk.chunk_start
+                        + chunk.offsets_rel[self.active_chunk_line_cursor] as usize;
+                    let line_end = line_start + line_len;
+                    batch.push_candidate(&bytes[line_start..line_end])?;
+                    self.active_chunk_line_cursor += 1;
+                    self.next_index = self
+                        .next_index
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("candidate index overflow"))?;
+                }
+
+                self.active_chunk_line_cursor >= chunk.lengths.len()
+            };
+
+            if chunk_exhausted {
+                self.active_chunk = None;
+                self.active_chunk_line_cursor = 0;
+                self.next_chunk_to_emit = self
+                    .next_chunk_to_emit
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("parser chunk index overflow"))?;
+                continue;
+            }
+
+            break;
+        }
+
+        if batch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(batch))
+        }
+    }
+}
+
+impl Drop for ParallelMmapWordlistBatchReader {
+    fn drop(&mut self) {
+        // Closing the job sender causes workers blocked on `recv()` to exit.
+        let _ = self.job_tx.take();
+        // Join workers so parser-thread panics do not silently outlive the
+        // reader and to avoid detached threads during early shutdown paths.
+        while let Some(handle) = self.worker_handles.pop() {
+            let _ = handle.join();
+        }
+    }
+}
+
 // Small abstraction so the producer thread can remain agnostic to reader
-// details. Runtime currently has a single concrete path (mmap).
+// details. Runtime currently has a single concrete path (parallel mmap parser).
 enum AnyWordlistBatchReader {
-    Mmap(MmapWordlistBatchReader),
+    ParallelMmap(ParallelMmapWordlistBatchReader),
 }
 
 impl AnyWordlistBatchReader {
     // Runtime path is mmap-only. If mapping fails, return an error instead of
     // silently switching to a slower path (which would hide perf regressions).
-    fn new(device: Device, path: &PathBuf) -> anyhow::Result<Self> {
+    fn new(device: Device, path: &PathBuf, parser_config: ParserConfig) -> anyhow::Result<Self> {
         let file = File::open(path)
             .with_context(|| format!("failed to open wordlist {}", path.display()))?;
         let mmap = unsafe { MmapOptions::new().map(&file) }
             .with_context(|| format!("failed to mmap wordlist {}", path.display()))?;
-        // Best-effort OS hint: this workload scans the wordlist sequentially.
-        // Ignore failures so advisory support differences do not affect correctness.
+        // Best-effort OS hint: chunk workers still perform forward scans over
+        // their assigned slices. Ignore failures so advisory support
+        // differences do not affect correctness.
         let _ = mmap.advise(Advice::Sequential);
-        Ok(Self::Mmap(MmapWordlistBatchReader::new(device, mmap)))
+        Ok(Self::ParallelMmap(ParallelMmapWordlistBatchReader::new(
+            device,
+            mmap,
+            parser_config,
+        )?))
+    }
+
+    fn parser_stats(&self) -> ParserStats {
+        match self {
+            Self::ParallelMmap(reader) => reader.parser_stats(),
+        }
     }
 
     // Forward batch production to the selected reader strategy.
@@ -590,7 +1085,7 @@ impl AnyWordlistBatchReader {
         // `recycled` is moved into exactly one concrete reader branch, so the
         // batch allocation has a single owner throughout the rebuild step.
         match self {
-            Self::Mmap(reader) => reader.next_batch_reusing(recycled),
+            Self::ParallelMmap(reader) => reader.next_batch_reusing(recycled),
         }
     }
 }
@@ -602,8 +1097,11 @@ enum ProducerMessage {
     Batch {
         batch: WordBatch,
         build_time: Duration,
+        parser_stats: ParserStats,
     },
-    Eof,
+    Eof {
+        parser_stats: ParserStats,
+    },
     Error(String),
 }
 
@@ -621,7 +1119,7 @@ struct WordlistProducer {
 impl WordlistProducer {
     // Start the producer thread immediately so parsing can begin while the
     // consumer is initializing autotune / first dispatch state.
-    fn spawn(wordlist_path: PathBuf, device: Device) -> Self {
+    fn spawn(wordlist_path: PathBuf, device: Device, parser_config: ParserConfig) -> Self {
         let (tx, rx) = sync_channel(DEFAULT_PIPELINE_DEPTH);
         // Match the forward pipeline depth so we can recycle a small pool of
         // batch allocations without letting memory usage grow unbounded.
@@ -630,9 +1128,14 @@ impl WordlistProducer {
         let stop_for_thread = Arc::clone(&stop);
         let tx_err = tx.clone();
         let handle = thread::spawn(move || {
-            if let Err(err) =
-                run_wordlist_producer(wordlist_path, device, stop_for_thread, tx, recycle_rx)
-            {
+            if let Err(err) = run_wordlist_producer(
+                wordlist_path,
+                device,
+                parser_config,
+                stop_for_thread,
+                tx,
+                recycle_rx,
+            ) {
                 // Best effort: the receiver may already be dropped on early exit.
                 let _ = tx_err.send(ProducerMessage::Error(format!("{err:#}")));
             }
@@ -693,13 +1196,14 @@ impl WordlistProducer {
 fn run_wordlist_producer(
     wordlist_path: PathBuf,
     device: Device,
+    parser_config: ParserConfig,
     stop: Arc<AtomicBool>,
     tx: SyncSender<ProducerMessage>,
     // Optional returned batches from the consumer. The producer owns the next
     // parse/build step, so this is where allocation reuse naturally fits.
     recycle_rx: Receiver<WordBatch>,
 ) -> anyhow::Result<()> {
-    let mut reader = AnyWordlistBatchReader::new(device, &wordlist_path)?;
+    let mut reader = AnyWordlistBatchReader::new(device, &wordlist_path, parser_config)?;
     while !stop.load(Ordering::Relaxed) {
         // The producer reports build time per batch so the consumer can measure
         // how much parsing work is hidden behind GPU compute.
@@ -712,10 +1216,15 @@ fn run_wordlist_producer(
         // source changes (fresh vs recycled).
         let maybe_batch = reader.next_batch_reusing(recycled)?;
         let build_time = batch_started.elapsed();
+        let parser_stats = reader.parser_stats();
         let message = match maybe_batch {
-            Some(batch) => ProducerMessage::Batch { batch, build_time },
+            Some(batch) => ProducerMessage::Batch {
+                batch,
+                build_time,
+                parser_stats,
+            },
             None => {
-                let _ = tx.send(ProducerMessage::Eof);
+                let _ = tx.send(ProducerMessage::Eof { parser_stats });
                 return Ok(());
             }
         };
@@ -766,6 +1275,23 @@ struct RunTimings {
     batch_count: u64,
     total_batch_candidates: u64,
     total_batch_word_bytes: u64,
+    parser_threads: usize,
+    parser_chunk_bytes: usize,
+    parser_chunks: u64,
+    parser_skipped_oversize: u64,
+}
+
+impl RunTimings {
+    // Copy the latest parser-side counters/config into the reporting snapshot.
+    //
+    // The producer includes this with each message so the consumer can print a
+    // complete final report even if the run ends early (match found) or at EOF.
+    fn apply_parser_stats(&mut self, parser_stats: ParserStats) {
+        self.parser_threads = parser_stats.parser_threads;
+        self.parser_chunk_bytes = parser_stats.parser_chunk_bytes;
+        self.parser_chunks = parser_stats.parser_chunks;
+        self.parser_skipped_oversize = parser_stats.parser_skipped_oversize;
+    }
 }
 
 // Snapshot of cumulative counters/timings at a periodic progress report.
@@ -1135,6 +1661,7 @@ impl GpuHs256BruteForcer {
 pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
     let (signing_input, target_signature) = parse_hs256_jwt(&args.jwt)?;
     let mut gpu = GpuHs256BruteForcer::new(&signing_input)?;
+    let parser_config = ParserConfig::from_args(&args);
     if let Some(tpg) = args.threads_per_group {
         gpu.set_threadgroup_width(tpg)?;
     }
@@ -1148,12 +1675,17 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
 
     // Start the parser thread before entering the main loop so batch
     // construction can overlap with GPU setup and dispatch wait time.
-    let mut producer = WordlistProducer::spawn(args.wordlist.clone(), gpu.device.clone());
+    let mut producer =
+        WordlistProducer::spawn(args.wordlist.clone(), gpu.device.clone(), parser_config);
     let run_result = (|| -> anyhow::Result<bool> {
         let started_at = Instant::now();
         let mut candidates_tested: u64 = 0;
         let mut autotune_done = !args.autotune;
-        let mut timings = RunTimings::default();
+        let mut timings = RunTimings {
+            parser_threads: parser_config.parser_threads,
+            parser_chunk_bytes: parser_config.chunk_bytes,
+            ..RunTimings::default()
+        };
         let mut last_rate_report =
             RateReportSnapshot::capture(started_at, candidates_tested, &timings);
 
@@ -1165,8 +1697,21 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
             timings.consumer_idle_wait += recv_started.elapsed();
 
             let (batch, build_time) = match message {
-                ProducerMessage::Batch { batch, build_time } => (batch, build_time),
-                ProducerMessage::Eof => break,
+                ProducerMessage::Batch {
+                    batch,
+                    build_time,
+                    parser_stats,
+                } => {
+                    // Producer snapshots parser counters after each batch build.
+                    // We refresh the consumer-side copy here so both periodic
+                    // and final reports reflect the latest parser state.
+                    timings.apply_parser_stats(parser_stats);
+                    (batch, build_time)
+                }
+                ProducerMessage::Eof { parser_stats } => {
+                    timings.apply_parser_stats(parser_stats);
+                    break;
+                }
                 ProducerMessage::Error(err) => bail!("{err}"),
             };
 
@@ -1423,6 +1968,16 @@ fn print_final_stats(
         "  avg_word_bytes_per_batch: {} bytes",
         format_human_count(avg_word_bytes_per_batch)
     );
+    eprintln!("  parser_threads: {}", timings.parser_threads);
+    eprintln!(
+        "  parser_chunk_bytes: {} bytes",
+        format_human_count(timings.parser_chunk_bytes as f64)
+    );
+    eprintln!("  parser_chunks: {}", timings.parser_chunks);
+    eprintln!(
+        "  parser_skipped_oversize: {}",
+        timings.parser_skipped_oversize
+    );
     eprintln!(
         "  timing.wordlist_batch_build: {:.3}s",
         timings.wordlist_batch_build.as_secs_f64()
@@ -1493,6 +2048,59 @@ mod tests {
         let file = StdFile::open(&path).expect("failed to open temp wordlist");
         let mmap = unsafe { MmapOptions::new().map(&file) }.expect("failed to mmap temp wordlist");
         (MmapWordlistBatchReader::new(test_device(), mmap), path)
+    }
+
+    fn test_parser_config(parser_threads: usize, chunk_bytes: usize) -> ParserConfig {
+        ParserConfig {
+            parser_threads,
+            chunk_bytes,
+            queue_capacity: parser_threads.saturating_mul(4).max(1),
+        }
+    }
+
+    fn parallel_mmap_reader_from_temp_file(
+        bytes: &[u8],
+        parser_threads: usize,
+        chunk_bytes: usize,
+    ) -> (ParallelMmapWordlistBatchReader, std::path::PathBuf) {
+        let path = write_temp_wordlist(bytes);
+        let file = StdFile::open(&path).expect("failed to open temp wordlist");
+        let mmap = unsafe { MmapOptions::new().map(&file) }.expect("failed to mmap temp wordlist");
+        let reader = ParallelMmapWordlistBatchReader::new(
+            test_device(),
+            mmap,
+            test_parser_config(parser_threads, chunk_bytes),
+        )
+        .expect("failed to build parallel mmap reader");
+        (reader, path)
+    }
+
+    fn collect_all_words_from_mmap_reader(reader: &mut MmapWordlistBatchReader) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(batch) = reader
+            .next_batch_reusing(None)
+            .expect("sequential mmap batch")
+        {
+            for i in 0..batch.candidate_count() {
+                out.push(batch.word(i).expect("candidate").to_vec());
+            }
+        }
+        out
+    }
+
+    fn collect_all_words_from_parallel_reader(
+        reader: &mut ParallelMmapWordlistBatchReader,
+    ) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Some(batch) = reader
+            .next_batch_reusing(None)
+            .expect("parallel mmap batch")
+        {
+            for i in 0..batch.candidate_count() {
+                out.push(batch.word(i).expect("candidate").to_vec());
+            }
+        }
+        out
     }
 
     // ---- Layout / host-kernel contract tests --------------------------------
@@ -1677,6 +2285,144 @@ mod tests {
         assert_eq!(batch.word(1).unwrap(), b"beta");
         assert!(reader.next_batch_reusing(None).unwrap().is_none());
 
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parallel_mmap_reader_packs_offsets_lengths_and_trims_crlf() {
+        let (mut reader, path) =
+            parallel_mmap_reader_from_temp_file(b"alpha\r\n\nbe\ncharlie\n", 2, 8);
+        let batch = reader.next_batch_reusing(None).unwrap().unwrap();
+
+        assert_eq!(batch.candidate_index_base, 0);
+        assert_eq!(batch.offsets_slice(), &[0, 5, 7]);
+        assert_eq!(batch.lengths_slice(), &[5, 2, 7]);
+        assert_eq!(batch.word_bytes_slice(), b"alphabecharlie");
+        assert_eq!(batch.max_word_len(), 7);
+        assert_eq!(batch.word(0).unwrap(), b"alpha");
+        assert_eq!(batch.word(1).unwrap(), b"be");
+        assert_eq!(batch.word(2).unwrap(), b"charlie");
+        assert!(reader.next_batch_reusing(None).unwrap().is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parallel_mmap_reader_handles_final_line_without_newline() {
+        let (mut reader, path) = parallel_mmap_reader_from_temp_file(b"alpha\nbeta", 2, 5);
+        let batch = reader.next_batch_reusing(None).unwrap().unwrap();
+
+        assert_eq!(batch.candidate_count(), 2);
+        assert_eq!(batch.word(0).unwrap(), b"alpha");
+        assert_eq!(batch.word(1).unwrap(), b"beta");
+        assert!(reader.next_batch_reusing(None).unwrap().is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parallel_mmap_reader_matches_sequential_reference_with_one_worker() {
+        let data = b"alpha\r\n\nbeta\ngamma-delta\nx\nfinal";
+        let (mut sequential, seq_path) = mmap_reader_from_temp_file(data);
+        let (mut parallel, par_path) = parallel_mmap_reader_from_temp_file(data, 1, 7);
+
+        let seq_words = collect_all_words_from_mmap_reader(&mut sequential);
+        let par_words = collect_all_words_from_parallel_reader(&mut parallel);
+
+        assert_eq!(par_words, seq_words);
+
+        let _ = fs::remove_file(seq_path);
+        let _ = fs::remove_file(par_path);
+    }
+
+    #[test]
+    fn parallel_mmap_reader_matches_sequential_reference_with_multiple_workers() {
+        let data = b"alpha\r\n\nverylongcandidate1234567890\nbe\ncharlie\nzzz\r\nomega";
+        let (mut sequential, seq_path) = mmap_reader_from_temp_file(data);
+        let (mut parallel, par_path) = parallel_mmap_reader_from_temp_file(data, 4, 9);
+
+        let seq_words = collect_all_words_from_mmap_reader(&mut sequential);
+        let par_words = collect_all_words_from_parallel_reader(&mut parallel);
+
+        assert_eq!(par_words, seq_words);
+
+        let _ = fs::remove_file(seq_path);
+        let _ = fs::remove_file(par_path);
+    }
+
+    #[test]
+    fn parallel_mmap_reader_preserves_absolute_indices_across_batches() {
+        let total = MAX_CANDIDATES_PER_BATCH + 2;
+        let mut data = Vec::with_capacity(total * 2);
+        for _ in 0..total {
+            data.extend_from_slice(b"x\n");
+        }
+
+        let (mut reader, path) = parallel_mmap_reader_from_temp_file(&data, 4, 1024);
+        let first = reader.next_batch_reusing(None).unwrap().unwrap();
+        let second = reader.next_batch_reusing(None).unwrap().unwrap();
+
+        assert_eq!(first.candidate_index_base, 0);
+        assert_eq!(first.candidate_count(), MAX_CANDIDATES_PER_BATCH);
+        assert_eq!(second.candidate_index_base, MAX_CANDIDATES_PER_BATCH as u64);
+        assert_eq!(second.candidate_count(), 2);
+        assert!(reader.next_batch_reusing(None).unwrap().is_none());
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parallel_mmap_reader_skips_oversized_lines_and_counts_them() {
+        let oversized = "a".repeat((u16::MAX as usize) + 1);
+        let data = format!("alpha\n{oversized}\nbeta\n");
+        let (mut reader, path) = parallel_mmap_reader_from_temp_file(data.as_bytes(), 2, 64);
+
+        let words = collect_all_words_from_parallel_reader(&mut reader);
+        let words = words
+            .into_iter()
+            .map(|w| String::from_utf8(w).unwrap())
+            .collect::<Vec<_>>();
+        let stats = reader.parser_stats();
+
+        assert_eq!(words, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(stats.parser_skipped_oversize, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn wordlist_producer_parallel_path_emits_batches_and_joins_cleanly() {
+        let path = write_temp_wordlist(b"alpha\nbeta\n");
+        let mut producer =
+            WordlistProducer::spawn(path.clone(), test_device(), test_parser_config(2, 8));
+
+        let first = producer.recv().expect("producer batch");
+        match first {
+            ProducerMessage::Batch {
+                batch,
+                parser_stats,
+                ..
+            } => {
+                assert_eq!(batch.candidate_count(), 2);
+                assert!(parser_stats.parser_threads >= 1);
+                producer.recycle(batch);
+            }
+            ProducerMessage::Eof { .. } => panic!("unexpected EOF before first batch"),
+            ProducerMessage::Error(err) => panic!("unexpected producer error: {err}"),
+        }
+
+        let second = producer.recv().expect("producer eof");
+        match second {
+            ProducerMessage::Eof { parser_stats } => {
+                assert!(parser_stats.parser_chunks >= 1);
+            }
+            ProducerMessage::Batch { .. } => panic!("unexpected second batch"),
+            ProducerMessage::Error(err) => panic!("unexpected producer error: {err}"),
+        }
+
+        producer.stop();
+        producer.close_receiver();
+        producer.join().expect("producer join");
         let _ = fs::remove_file(path);
     }
 

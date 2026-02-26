@@ -63,6 +63,7 @@ mod tests {
             PathBuf::from(hs256wordlist::DEFAULT_WORDLIST_PATH)
         );
         assert_eq!(args.threads_per_group, None);
+        assert_eq!(args.parser_threads, None);
         assert!(!args.autotune);
     }
 
@@ -116,12 +117,28 @@ mod tests {
             "abc.def.ghi",
             "--threads-per-group",
             "512",
+            "--parser-threads",
+            "3",
             "--autotune",
         ])
         .unwrap();
 
         let Commands::Hs256wordlist(args) = cli.command;
         assert_eq!(args.threads_per_group, Some(512));
+        assert_eq!(args.parser_threads, Some(3));
         assert!(args.autotune);
+    }
+
+    #[test]
+    fn clap_cli_rejects_zero_parser_threads() {
+        let err = Cli::try_parse_from([
+            "jotcrack",
+            "hs256wordlist",
+            "abc.def.ghi",
+            "--parser-threads",
+            "0",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
     }
 }

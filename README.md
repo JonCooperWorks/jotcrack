@@ -26,13 +26,13 @@ cargo build --release
 ## Usage
 
 ```bash
-cargo run --release -- hs256wordlist '<jwt>' [--wordlist <path>]
+cargo run --release -- hs256wordlist '<jwt>' [--wordlist <path>] [--parser-threads <n>]
 ```
 
 Or run the built binary:
 
 ```bash
-./target/release/jotcrack hs256wordlist '<jwt>' [--wordlist <path>]
+./target/release/jotcrack hs256wordlist '<jwt>' [--wordlist <path>] [--parser-threads <n>]
 ```
 
 ## Examples
@@ -55,7 +55,7 @@ cargo run --release -- hs256wordlist "$JWT"
 - Plain text file
 - One candidate secret per line
 - Empty lines are ignored
-- Very long lines are rejected (over 65535 bytes)
+- Very long lines (over 65535 bytes) are skipped and counted in final `STATS`
 
 ## Output and exit codes
 
@@ -81,6 +81,7 @@ Exit codes:
 
 - Currently available subcommand: `hs256wordlist` (uses the `hs256_wordlist` Metal kernel).
 - `--wordlist` is currently supported on `hs256wordlist`.
+- `--parser-threads` optionally overrides the auto-selected parallel wordlist parser worker count.
 - The default `breach.txt` is ignored by git (not included in the repo).
 
 ## Performance benchmarking (before/after kernel changes)
@@ -91,6 +92,7 @@ Notes on throughput logs:
 
 - Periodic `RATE` lines report windowed (interval) throughput, not cumulative averages.
 - Final `STATS` lines report aggregate/cumulative throughput and timing totals.
+- Final `STATS` also include parser settings/counters (`parser_threads`, `parser_chunk_bytes`, `parser_chunks`, `parser_skipped_oversize`).
 
 Recommended scenarios:
 
