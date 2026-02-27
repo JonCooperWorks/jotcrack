@@ -127,7 +127,7 @@ Benchmarking guidance:
 Exact command used (112GB wordlist):
 
 ```bash
-cargo run --release -- hs256wordlist --threads-per-group 256 --wordlist wordlists.txt "$(cat jwt_example.txt)" --pipeline-depth 12 --packer-threads 3
+cargo run --release -- hs256wordlist --threads-per-group 256 --wordlist wordlists.txt "$(cat jwt_example.txt)" --pipeline-depth 12 --packer-threads 6
 ```
 
 ### Hardware used
@@ -142,29 +142,29 @@ cargo run --release -- hs256wordlist --threads-per-group 256 --wordlist wordlist
 ### Final run summary
 
 ```text
-STATS
+TATS
   tested: 16.4 billion
-  elapsed: 66.27s
-  rate_end_to_end: 248 million/s
-  rate_gpu_only: 412 million/s
+  elapsed: 64.78s
+  rate_end_to_end: 254 million/s
+  rate_gpu_only: 427 million/s
   batches: 2720
   avg_candidates_per_batch: 6.05 million
   avg_word_bytes_per_batch: 31.0 million bytes
   pipeline_depth: 12
-  packer_threads: 3
+  packer_threads: 6
   parser_threads: 15
   parser_chunk_bytes: 16.8 million bytes
   parser_chunks: 6964
   parser_skipped_oversize: 0
-  timing.wordlist_batch_build: 126.224s
-  timing.wordlist_batch_plan: 66.187s
-  timing.wordlist_batch_pack: 60.037s
-  timing.consumer_idle_wait: 26.282s
+  timing.wordlist_batch_build: 132.916s
+  timing.wordlist_batch_plan: 63.154s
+  timing.wordlist_batch_pack: 69.763s
+  timing.consumer_idle_wait: 26.211s
   timing.host_prep: 0.001s
-  timing.command_encode: 0.057s
-  timing.gpu_wait: 39.918s
+  timing.command_encode: 0.062s
+  timing.gpu_wait: 38.503s
   timing.result_readback: 0.002s
-  timing.dispatch_total: 39.978s
+  timing.dispatch_total: 38.569s
 NOT FOUND
 ```
 
