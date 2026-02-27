@@ -76,17 +76,24 @@ const DEFAULT_PARSER_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 /// straight into `run()` with minimal translation.
 #[derive(Debug, Clone, Args)]
 pub struct Hs256WordlistArgs {
+    /// JWT in compact form (`header.payload.signature`) with `alg=HS256`.
     pub jwt: String,
+    /// Wordlist file path (one candidate secret per line).
     #[arg(long, default_value = DEFAULT_WORDLIST_PATH)]
     pub wordlist: PathBuf,
+    /// Fixed Metal threadgroup width override (default picks a safe value).
     #[arg(long)]
     pub threads_per_group: Option<usize>,
+    /// Number of parser worker threads for mmap chunk scanning.
     #[arg(long, value_parser = parse_positive_usize)]
     pub parser_threads: Option<usize>,
+    /// Max number of in-flight batches queued between parser and GPU consumer.
     #[arg(long, value_parser = parse_positive_usize)]
     pub pipeline_depth: Option<usize>,
+    /// Number of host packer workers that materialize planned batches.
     #[arg(long, value_parser = parse_positive_usize)]
     pub packer_threads: Option<usize>,
+    /// Benchmark several threadgroup widths on the first batch before steady-state dispatch.
     #[arg(long)]
     pub autotune: bool,
 }
@@ -711,7 +718,6 @@ struct PackerJob {
 
 #[derive(Debug)]
 struct PackerResult {
-    seq_no: u64,
     batch: WordBatch,
     plan_time: Duration,
     pack_time: Duration,
@@ -1217,7 +1223,6 @@ fn packer_worker_main(
         match pack_batch_plan_into_batch(mmap.as_ref(), &plan, &mut batch) {
             Ok(()) => {
                 let message = PackerWorkerMessage::Packed(PackerResult {
-                    seq_no: plan.seq_no,
                     batch,
                     plan_time: plan.plan_time,
                     pack_time: pack_started.elapsed(),
@@ -1244,6 +1249,8 @@ fn planner_worker_main(
     plan_tx: crossbeam_channel::Sender<PlannerWorkerMessage>,
 ) {
     let mut next_seq_no = 0u64;
+    // Planner owns sequential plan numbering so downstream stages can keep
+    // deterministic emission and error messages without shared counters.
     while !stop.load(Ordering::Relaxed) {
         match reader.next_batch_plan() {
             Ok(Some(mut plan)) => {
@@ -1257,11 +1264,15 @@ fn planner_worker_main(
                         return;
                     }
                 };
+                // A disconnected receiver means the coordinator is already
+                // exiting, so this worker should stop quietly as well.
                 if plan_tx.send(PlannerWorkerMessage::Plan(plan)).is_err() {
                     return;
                 }
             }
             Ok(None) => {
+                // Forward final parser stats snapshot with EOF so the consumer
+                // can print accurate cumulative parser counters.
                 let _ = plan_tx.send(PlannerWorkerMessage::Eof {
                     parser_stats: reader.parser_stats(),
                 });
@@ -1283,11 +1294,15 @@ fn handle_planner_message(
 ) -> anyhow::Result<()> {
     match message {
         PlannerWorkerMessage::Plan(plan) => {
+            // Stats are cumulative snapshots; replacing is correct because each
+            // later snapshot dominates earlier ones.
             *latest_parser_stats = plan.parser_stats;
             pending_plans.push_back(plan);
             Ok(())
         }
         PlannerWorkerMessage::Eof { parser_stats } => {
+            // EOF from planner does not imply no pack jobs are left; caller
+            // still waits for queued work to drain before sending producer EOF.
             *latest_parser_stats = parser_stats;
             *planner_eof = true;
             Ok(())
@@ -1298,18 +1313,27 @@ fn handle_planner_message(
 
 fn handle_packer_message(
     message: PackerWorkerMessage,
-    pending_packed: &mut BTreeMap<u64, PackerResult>,
     in_flight_pack_jobs: &mut usize,
     latest_parser_stats: &mut ParserStats,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<ProducerMessage>> {
+    // Every received packer message completes exactly one scheduled pack job.
     *in_flight_pack_jobs = in_flight_pack_jobs.saturating_sub(1);
     match message {
         PackerWorkerMessage::Packed(result) => {
             *latest_parser_stats = result.parser_stats;
-            if pending_packed.insert(result.seq_no, result).is_some() {
-                bail!("duplicate packed batch sequence id received from packer workers");
-            }
-            Ok(())
+            // Producer "build" time is intentionally modeled as plan + pack so
+            // final reporting can compare host-side build work vs GPU wait.
+            let build_time = result
+                .plan_time
+                .checked_add(result.pack_time)
+                .unwrap_or(result.plan_time + result.pack_time);
+            Ok(Some(ProducerMessage::Batch {
+                batch: result.batch,
+                build_time,
+                plan_time: result.plan_time,
+                pack_time: result.pack_time,
+                parser_stats: result.parser_stats,
+            }))
         }
         PackerWorkerMessage::Error { seq_no, message } => {
             bail!("packer worker failed on batch seq {seq_no}: {message}")
@@ -1503,6 +1527,8 @@ fn run_wordlist_producer(
 ) -> anyhow::Result<()> {
     let pipeline_depth = pipeline_depth.max(1);
     let packer_threads = packer_threads.max(1).min(pipeline_depth);
+    // `pipeline_depth` is both throughput overlap target and memory cap for
+    // owned `WordBatch` allocations.
     // Preallocate the steady-state batch pool up front so the initial pipeline
     // fill does not pay large Metal buffer allocation costs on the hot path.
     let mut preallocated_batches = Vec::with_capacity(pipeline_depth);
@@ -1534,10 +1560,10 @@ fn run_wordlist_producer(
     drop(pack_result_tx);
 
     let coordinator_result = (|| -> anyhow::Result<()> {
+        // Coordinator owns all mutable pipeline state so workers can stay
+        // "pure" (parse or pack) and communicate only via channels.
         let mut available_batches = preallocated_batches;
         let mut pending_plans = VecDeque::<BatchPlan>::new();
-        let mut pending_packed = BTreeMap::<u64, PackerResult>::new();
-        let mut next_seq_to_emit = 0u64;
         let mut in_flight_pack_jobs = 0usize;
         let mut planner_eof = false;
         let mut latest_parser_stats = ParserStats {
@@ -1569,6 +1595,8 @@ fn run_wordlist_producer(
             loop {
                 match plan_rx.try_recv() {
                     Ok(message) => {
+                        // Planner can run ahead of packers; stash plans in FIFO
+                        // order so pack scheduling remains deterministic.
                         handle_planner_message(
                             message,
                             &mut pending_plans,
@@ -1592,13 +1620,18 @@ fn run_wordlist_producer(
             loop {
                 match pack_result_rx.try_recv() {
                     Ok(message) => {
-                        handle_packer_message(
+                        if let Some(producer_message) = handle_packer_message(
                             message,
-                            &mut pending_packed,
                             &mut in_flight_pack_jobs,
                             &mut latest_parser_stats,
-                        )?;
-                        made_progress = true;
+                        )? {
+                            // If consumer is gone (early match/exit), producer
+                            // stops without treating it as an error.
+                            if tx.send(producer_message).is_err() {
+                                return Ok(());
+                            }
+                            made_progress = true;
+                        }
                     }
                     Err(crossbeam_channel::TryRecvError::Empty) => break,
                     Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -1610,28 +1643,6 @@ fn run_wordlist_producer(
                 }
             }
 
-            // Emit packed batches strictly in sequence order.
-            while let Some(result) = pending_packed.remove(&next_seq_to_emit) {
-                let build_time = result
-                    .plan_time
-                    .checked_add(result.pack_time)
-                    .unwrap_or(result.plan_time + result.pack_time);
-                let message = ProducerMessage::Batch {
-                    batch: result.batch,
-                    build_time,
-                    plan_time: result.plan_time,
-                    pack_time: result.pack_time,
-                    parser_stats: result.parser_stats,
-                };
-                if tx.send(message).is_err() {
-                    return Ok(());
-                }
-                next_seq_to_emit = next_seq_to_emit
-                    .checked_add(1)
-                    .ok_or_else(|| anyhow!("emit sequence overflow"))?;
-                made_progress = true;
-            }
-
             // Keep packers busy by dispatching queued plans.
             while in_flight_pack_jobs < pipeline_depth {
                 let Some(plan) = pending_plans.pop_front() else {
@@ -1639,6 +1650,8 @@ fn run_wordlist_producer(
                 };
                 let batch = available_batches
                     .pop()
+                    // Recycling is best-effort; if the recycle queue is empty,
+                    // allocate a fresh batch so packers keep flowing.
                     .unwrap_or_else(|| WordBatch::new(&batch_alloc_device, 0));
                 pack_job_tx
                     .send(PackerJob { plan, batch })
@@ -1647,11 +1660,9 @@ fn run_wordlist_producer(
                 made_progress = true;
             }
 
-            if planner_eof
-                && pending_plans.is_empty()
-                && in_flight_pack_jobs == 0
-                && pending_packed.is_empty()
-            {
+            if planner_eof && pending_plans.is_empty() && in_flight_pack_jobs == 0 {
+                // EOF is emitted exactly once only after all queued plans and
+                // in-flight pack jobs are fully drained.
                 let _ = tx.send(ProducerMessage::Eof {
                     parser_stats: latest_parser_stats,
                 });
@@ -1668,12 +1679,15 @@ fn run_wordlist_producer(
                 let message = pack_result_rx
                     .recv()
                     .map_err(|_| anyhow!("packer workers terminated unexpectedly"))?;
-                handle_packer_message(
+                if let Some(producer_message) = handle_packer_message(
                     message,
-                    &mut pending_packed,
                     &mut in_flight_pack_jobs,
                     &mut latest_parser_stats,
-                )?;
+                )? {
+                    if tx.send(producer_message).is_err() {
+                        return Ok(());
+                    }
+                }
                 continue;
             }
 
@@ -1695,6 +1709,8 @@ fn run_wordlist_producer(
         }
     })();
 
+    // Closing sender sides first guarantees worker `recv()` loops can observe
+    // channel closure and exit before we join them.
     drop(pack_job_tx);
     drop(pack_result_rx);
     drop(plan_rx);
@@ -1801,6 +1817,8 @@ struct RateReportDelta {
 
 impl RateReportSnapshot {
     fn capture(reported_at: Instant, candidates_tested: u64, timings: &RunTimings) -> Self {
+        // Capture cumulative totals at one point in time; periodic logging uses
+        // `delta_since` to turn two cumulative snapshots into interval metrics.
         Self {
             reported_at,
             candidates_tested,
@@ -1811,6 +1829,8 @@ impl RateReportSnapshot {
     }
 
     fn delta_since(self, previous: Self) -> RateReportDelta {
+        // Subtractions are saturating/checked so clock regressions or future
+        // refactors cannot panic the reporter path.
         RateReportDelta {
             wall_time: self
                 .reported_at
@@ -1992,9 +2012,11 @@ impl GpuHs256BruteForcer {
     ) -> anyhow::Result<(Option<u32>, BatchDispatchTimings)> {
         let started = Instant::now();
         let mut timings = BatchDispatchTimings::default();
+        // GPU contract uses `u32 candidate_count`, so validate once at boundary.
         let candidate_count =
             u32::try_from(batch.candidate_count).context("candidate count exceeds u32")?;
         if candidate_count == 0 {
+            // Empty dispatch is a legal no-op in some test paths.
             timings.total = started.elapsed();
             return Ok((None, timings));
         }
@@ -2403,6 +2425,7 @@ fn saturating_duration_sub(current: Duration, previous: Duration) -> Duration {
 }
 
 fn rate_per_second(candidates_tested: u64, elapsed: Duration) -> f64 {
+    // Used for both cumulative (`STATS`) and interval (`RATE`) throughput.
     if elapsed.is_zero() {
         0.0
     } else {

@@ -110,7 +110,7 @@ cargo build --release
 
 # Run and capture throughput logs (stderr includes RATE/STATS lines)
 JWT="$(cat jwt_example.txt)"
-./target/release/jotcrack "$JWT" --wordlist ./my_wordlist.txt 2>bench.log
+./target/release/jotcrack hs256wordlist "$JWT" --wordlist ./my_wordlist.txt 2>bench.log
 
 # Extract throughput snapshots
 rg '^RATE |^STATS|^  rate:' bench.log
@@ -121,3 +121,55 @@ Benchmarking guidance:
 - Run each scenario at least 3 times and compare median throughput.
 - Keep the machine in a similar thermal/power state.
 - Record candidate count and elapsed time along with the reported rate.
+
+## Documented tuned run (2026-02-27)
+
+Exact command used (112GB wordlist):
+
+```bash
+cargo run --release -- hs256wordlist --threads-per-group 256 --wordlist wordlists.txt "$(cat jwt_example.txt)" --pipeline-depth 12 --packer-threads 3
+```
+
+### Hardware used
+
+- MacBook Pro (Mac16,6)
+- Apple M4 Max
+- 16-core CPU (12 Performance + 4 Efficiency)
+- 40-core GPU
+- 64 GB RAM
+- macOS 26.3 (Build 25D125)
+
+### Final run summary
+
+```text
+STATS
+  tested: 16.1 billion
+  elapsed: 70.20s
+  rate_end_to_end: 229 million/s
+  rate_gpu_only: 421 million/s
+  batches: 2604
+  avg_candidates_per_batch: 6.18 million
+  avg_word_bytes_per_batch: 30.9 million bytes
+  pipeline_depth: 12
+  packer_threads: 3
+  parser_threads: 15
+  parser_chunk_bytes: 16.8 million bytes
+  parser_chunks: 6711
+  parser_skipped_oversize: 0
+  timing.wordlist_batch_build: 131.245s
+  timing.wordlist_batch_plan: 70.118s
+  timing.wordlist_batch_pack: 61.127s
+  timing.consumer_idle_wait: 31.864s
+  timing.host_prep: 0.002s
+  timing.command_encode: 0.062s
+  timing.gpu_wait: 38.268s
+  timing.result_readback: 0.002s
+  timing.dispatch_total: 38.334s
+NOT FOUND
+```
+
+### Interpretation
+
+- `RATE` lines are interval/windowed snapshots (delta since the previous report), not cumulative averages.
+- Final `STATS` rates are cumulative over the full run.
+- Early high windows (for example 400M+/s) can lift the cumulative average significantly: if the first 1 billion candidates land in about 2.x seconds instead of 4.x seconds, the overall average remains higher even if later windows settle lower.
