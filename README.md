@@ -143,28 +143,28 @@ cargo run --release -- hs256wordlist --threads-per-group 256 --wordlist wordlist
 
 ```text
 STATS
-  tested: 16.1 billion
-  elapsed: 70.20s
-  rate_end_to_end: 229 million/s
-  rate_gpu_only: 421 million/s
-  batches: 2604
-  avg_candidates_per_batch: 6.18 million
-  avg_word_bytes_per_batch: 30.9 million bytes
+  tested: 16.4 billion
+  elapsed: 66.27s
+  rate_end_to_end: 248 million/s
+  rate_gpu_only: 412 million/s
+  batches: 2720
+  avg_candidates_per_batch: 6.05 million
+  avg_word_bytes_per_batch: 31.0 million bytes
   pipeline_depth: 12
   packer_threads: 3
   parser_threads: 15
   parser_chunk_bytes: 16.8 million bytes
-  parser_chunks: 6711
+  parser_chunks: 6964
   parser_skipped_oversize: 0
-  timing.wordlist_batch_build: 131.245s
-  timing.wordlist_batch_plan: 70.118s
-  timing.wordlist_batch_pack: 61.127s
-  timing.consumer_idle_wait: 31.864s
-  timing.host_prep: 0.002s
-  timing.command_encode: 0.062s
-  timing.gpu_wait: 38.268s
+  timing.wordlist_batch_build: 126.224s
+  timing.wordlist_batch_plan: 66.187s
+  timing.wordlist_batch_pack: 60.037s
+  timing.consumer_idle_wait: 26.282s
+  timing.host_prep: 0.001s
+  timing.command_encode: 0.057s
+  timing.gpu_wait: 39.918s
   timing.result_readback: 0.002s
-  timing.dispatch_total: 38.334s
+  timing.dispatch_total: 39.978s
 NOT FOUND
 ```
 
