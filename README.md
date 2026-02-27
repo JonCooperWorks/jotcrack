@@ -40,7 +40,7 @@ Or run the built binary:
 Use the sample JWT in `jwt_example.txt`:
 
 ```bash
-JWT="$(cat jwt_example.txt)"
+JWT="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.kXSdJhhUKTJemgs8O0rfIJmUaxoSIDdClL_OPmaC7Eo"
 cargo run --release -- hs256wordlist "$JWT" --wordlist ./my_wordlist.txt
 ```
 
@@ -109,7 +109,7 @@ Example workflow:
 cargo build --release
 
 # Run and capture throughput logs (stderr includes RATE/STATS lines)
-JWT="$(cat jwt_example.txt)"
+JWT="$eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.kXSdJhhUKTJemgs8O0rfIJmUaxoSIDdClL_OPmaC7Eo"
 ./target/release/jotcrack hs256wordlist "$JWT" --wordlist ./my_wordlist.txt 2>bench.log
 
 # Extract throughput snapshots
