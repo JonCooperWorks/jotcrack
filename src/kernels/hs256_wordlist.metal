@@ -318,217 +318,187 @@ static inline void sha256_update_constant(thread Sha256Ctx& ctx, constant const 
 
 // Finalize SHA-256: add padding + length, compress final block(s), and write 32-byte digest.
 static inline void sha256_final(thread Sha256Ctx& ctx, thread uint8_t out[32]) {
-    const uint64_t bit_len = ctx.total_len * 8ull; // SHA-256 appends message length in bits, not bytes.
+    const uint64_t bit_len = ctx.total_len * 8ull;
 
-    ctx.block[ctx.block_len++] = 0x80u;            // Append the required single '1' bit (10000000 byte).
-    if (ctx.block_len > 56u) {                     // If not enough room for 8-byte length field,
-        while (ctx.block_len < 64u) {              // pad this block with zeros,
-            ctx.block[ctx.block_len++] = 0u;       // zero-fill remaining bytes.
-        }
-        sha256_compress(ctx, ctx.block);           // Compress padded block.
-        ctx.block_len = 0;                         // Start a new final block.
+    ctx.block[ctx.block_len++] = 0x80u;
+    if (ctx.block_len > 56u) {
+        while (ctx.block_len < 64u) ctx.block[ctx.block_len++] = 0u;
+        sha256_compress(ctx, ctx.block);
+        ctx.block_len = 0;
     }
-
-    while (ctx.block_len < 56u) {                  // Zero-pad until byte 56,
-        ctx.block[ctx.block_len++] = 0u;           // leaving bytes 56..63 for the 64-bit length.
-    }
-
-    for (uint i = 0; i < 8; ++i) {                 // Write `bit_len` in big-endian order.
+    while (ctx.block_len < 56u) ctx.block[ctx.block_len++] = 0u;
+    for (uint i = 0; i < 8; ++i)
         ctx.block[56u + i] = uint8_t((bit_len >> (56u - 8u * i)) & 0xffull);
-    }
-    sha256_compress(ctx, ctx.block);               // Compress the final block.
-    ctx.block_len = 0;                             // Reset buffer length (not strictly needed after finalize).
+    sha256_compress(ctx, ctx.block);
+    ctx.block_len = 0;
 
-    for (uint i = 0; i < 8; ++i) {                 // Convert 8 state words into 32 output bytes.
+    for (uint i = 0; i < 8; ++i)
         store_be_u32(out + (i * 4u), ctx.state[i]);
+}
+
+// Finalize SHA-256 without serializing output to bytes.
+// After this call, ctx.state[0..7] contains the digest as big-endian uint32_t words.
+// This avoids the store_be_u32 output loop when the digest will be consumed as words.
+static inline void sha256_finalize(thread Sha256Ctx& ctx) {
+    const uint64_t bit_len = ctx.total_len * 8ull;
+    ctx.block[ctx.block_len++] = 0x80u;
+    if (ctx.block_len > 56u) {
+        while (ctx.block_len < 64u) ctx.block[ctx.block_len++] = 0u;
+        sha256_compress(ctx, ctx.block);
+        ctx.block_len = 0u;
+    }
+    while (ctx.block_len < 56u) ctx.block[ctx.block_len++] = 0u;
+    for (uint i = 0; i < 8; ++i)
+        ctx.block[56u + i] = uint8_t((bit_len >> (56u - 8u * i)) & 0xffull);
+    sha256_compress(ctx, ctx.block);
+    ctx.block_len = 0u;
+}
+
+// Load an HMAC key from device memory into 16 big-endian uint32_t words (zero-padded).
+// Eliminates the byte-level key_block[64] array in favor of word-level operations.
+static inline void load_key_words(device const uint8_t* key, uint32_t key_len, thread uint32_t kw[16]) {
+    #pragma unroll
+    for (uint i = 0; i < 16; ++i) kw[i] = 0u;
+
+    const uint32_t full_words = key_len >> 2;
+    for (uint32_t i = 0; i < full_words; ++i)
+        kw[i] = load_be_u32(key + i * 4u);
+
+    const uint32_t remaining = key_len & 3u;
+    if (remaining > 0u) {
+        uint32_t val = 0u;
+        device const uint8_t* tail = key + (full_words * 4u);
+        for (uint32_t i = 0; i < remaining; ++i)
+            val |= uint32_t(tail[i]) << (24u - 8u * i);
+        kw[full_words] = val;
     }
 }
 
-// Specialized finalization for appending a known 32-byte tail when `ctx.block_len == 0`.
-// This virtualizes the final SHA-256 block as message words instead of materializing a 64-byte buffer.
-static inline void sha256_final_append_tail32(thread Sha256Ctx& ctx, thread const uint8_t tail[32], thread uint8_t out[32]) {
-    uint32_t w[64];                               // Full SHA-256 message schedule for one final 512-bit block.
-    for (uint i = 0; i < 8; ++i) {                 // Tail contributes exactly 8 words.
-        w[i] = load_be_u32(tail + (i * 4u));
-    }
-    // The final block shape is:
-    //   [32-byte tail][0x80][zero padding ...][8-byte bit length]
-    // Since `tail` is exactly 32 bytes and `ctx.block_len == 0`, this always fits in one block.
-    w[8] = 0x80000000u;                            // First byte after tail is 0x80, rest of the word is zeros.
-    w[9] = 0u;
-    w[10] = 0u;
-    w[11] = 0u;
-    w[12] = 0u;
-    w[13] = 0u;
-
-    const uint64_t final_total_len = ctx.total_len + 32ull; // Account for the 32-byte `tail`.
-    const uint64_t bit_len = final_total_len * 8ull;        // SHA-256 length field is in bits.
-    w[14] = uint32_t((bit_len >> 32u) & 0xffffffffull);     // High 32 bits of total bit length.
-    w[15] = uint32_t(bit_len & 0xffffffffull);              // Low 32 bits of total bit length.
-
-    ctx.total_len = final_total_len;               // Keep context length consistent with the finalized digest.
-    sha256_compress_words(ctx, w);                 // Compress this final synthetic block directly from words.
-    ctx.block_len = 0u;                            // No buffered bytes remain after finalize.
-
-    for (uint i = 0; i < 8; ++i) {                 // Serialize final state words to a 32-byte digest.
-        store_be_u32(out + (i * 4u), ctx.state[i]);
-    }
-}
-
-// Compute HMAC-SHA256(key, message) into `out`.
-// `key` lives in device memory (candidate-specific), `message` lives in constant memory (shared JWT input).
-// HMAC formula:
-//   HMAC(K, M) = SHA256((K0 xor opad) || SHA256((K0 xor ipad) || M))
-// where K0 is the key normalized to one 64-byte SHA-256 block:
-//   - if len(K) <= 64: K padded with zeros to 64 bytes
-//   - if len(K) > 64 : SHA256(K) padded with zeros to 64 bytes
-static inline void hmac_sha256(
-    device const uint8_t* key,                  // Candidate secret bytes (wordlist entry) for this thread.
-    uint32_t key_len,                           // Candidate secret length in bytes.
-    constant const uint8_t* message,            // Shared JWT signing input bytes (`header.payload`).
-    uint32_t message_len,                       // Length of the JWT signing input.
-    thread uint8_t out[32]                      // Output digest buffer in thread-local memory.
+// Core word-level HMAC-SHA256 computation from pre-loaded key words.
+// Eliminates key_block[64], ipad[64], opad[64], inner_digest[32], and digest[32]
+// byte arrays. Works entirely with uint32_t words and compares ctx.state directly.
+// Returns true if the HMAC matches `target`.
+static inline bool hmac_sha256_from_key_words(
+    thread const uint32_t kw[16],
+    constant const uint8_t* message,
+    uint32_t message_len,
+    constant const uint8_t target[32]
 ) {
-    uint8_t key_block[64];                      // HMAC uses a 64-byte block for SHA-256 keys.
-    #pragma unroll
-    for (uint i = 0; i < 64; ++i) {             // Start from a zero-padded 64-byte key block.
-        key_block[i] = 0u;                      // If the key is short, untouched bytes remain the required zeros.
-    }
-
-    if (key_len > 64u) {                        // Long HMAC keys must be hashed first (RFC 2104 behavior).
-        Sha256Ctx key_ctx;                      // Temporary SHA-256 context to hash the long key.
-        uint8_t hashed_key[32];                 // Hashed key becomes 32 bytes.
-        sha256_init(key_ctx);                   // Initialize SHA-256 context.
-        sha256_update_device(key_ctx, key, key_len); // Feed original key bytes.
-        sha256_final(key_ctx, hashed_key);      // Finalize into `hashed_key`.
+    // Inner hash: compress (kw XOR 0x36363636) as the ipad block, then message.
+    Sha256Ctx inner;
+    sha256_init(inner);
+    {
+        uint32_t w[64];
         #pragma unroll
-        for (uint i = 0; i < 32; ++i) {         // Copy hashed key into the 64-byte HMAC key block.
-            key_block[i] = hashed_key[i];       // Remaining bytes stay zero-padded.
-        }
-    } else {
-        for (uint32_t i = 0; i < key_len; ++i) { // Short keys are copied directly into the normalized key block.
-            key_block[i] = key[i];               // Remaining bytes stay zero (right-padding with zeros).
-        }
+        for (uint i = 0; i < 16; ++i) w[i] = kw[i] ^ 0x36363636u;
+        sha256_compress_words(inner, w);
+    }
+    inner.total_len = 64ull;
+    inner.block_len = 0u;
+    sha256_update_constant(inner, message, message_len);
+    sha256_finalize(inner);
+    // inner.state[0..7] now holds the inner digest as words.
+
+    // Outer hash: compress (kw XOR 0x5c5c5c5c) as the opad block,
+    // then finalize with inner digest as a 32-byte tail.
+    Sha256Ctx outer;
+    sha256_init(outer);
+    {
+        uint32_t w[64];
+        #pragma unroll
+        for (uint i = 0; i < 16; ++i) w[i] = kw[i] ^ 0x5c5c5c5cu;
+        sha256_compress_words(outer, w);
+    }
+    outer.total_len = 64ull;
+    outer.block_len = 0u;
+
+    // Build the final outer block directly from inner digest words.
+    // Block layout: [inner_digest(32 bytes)][0x80][zeros][bit_length(8 bytes)]
+    {
+        uint32_t w[64];
+        for (uint i = 0; i < 8; ++i) w[i] = inner.state[i];
+        w[8] = 0x80000000u;
+        w[9] = 0u; w[10] = 0u; w[11] = 0u; w[12] = 0u; w[13] = 0u;
+        const uint64_t bit_len = (64ull + 32ull) * 8ull;
+        w[14] = uint32_t((bit_len >> 32u) & 0xffffffffull);
+        w[15] = uint32_t(bit_len & 0xffffffffull);
+        sha256_compress_words(outer, w);
     }
 
-    uint8_t ipad[64];                            // Inner padding block (key xor 0x36).
-    uint8_t opad[64];                            // Outer padding block (key xor 0x5c).
+    // Compare outer hash state words directly against the target signature.
+    // No digest serialization needed — saves 8x store_be_u32 + 8x load_be_u32.
     #pragma unroll
-    for (uint i = 0; i < 64; ++i) {              // Build both pads byte-by-byte.
-        ipad[i] = key_block[i] ^ 0x36u;          // `ipad` = normalized key xor 0x36.
-        opad[i] = key_block[i] ^ 0x5cu;          // `opad` = normalized key xor 0x5c.
+    for (uint i = 0; i < 8; ++i) {
+        if (outer.state[i] != load_be_u32(target + i * 4u)) return false;
     }
-
-    Sha256Ctx inner;                             // SHA-256 context for the inner hash.
-    uint8_t inner_digest[32];                    // Output of SHA256(ipad || message).
-    sha256_init(inner);                          // Start inner hash.
-    sha256_update_thread(inner, ipad, 64u);      // First 64 bytes are always `(K0 xor ipad)`.
-    sha256_update_constant(inner, message, message_len); // Then append the JWT signing input bytes.
-    sha256_final(inner, inner_digest);           // inner_digest = SHA256((K0 xor ipad) || message)
-
-    Sha256Ctx outer;                             // SHA-256 context for the outer hash.
-    sha256_init(outer);                          // Start outer hash.
-    sha256_compress(outer, opad);                // `opad` is a full 64-byte block, so compress directly.
-    outer.total_len = 64ull;                     // Tell the context we've already consumed 64 bytes.
-    outer.block_len = 0u;                        // No partial bytes are buffered after direct compression.
-    // The remaining outer-hash input is exactly the 32-byte inner digest, so we can use the
-    // specialized one-block finalizer instead of a generic update + final path.
-    sha256_final_append_tail32(outer, inner_digest, out); // out = SHA256((K0 xor opad) || inner_digest)
+    return true;
 }
 
-// Specialized HMAC-SHA256 for keys known to be <= 64 bytes.
-// This avoids the long-key hash branch and its extra temporaries in the hot path.
-static inline void hmac_sha256_short_key(
+// HMAC-SHA256 that handles any key length and returns match result directly.
+// For keys > 64 bytes, hashes the key first (RFC 2104), then uses word-level path.
+static inline bool hmac_sha256_matches(
     device const uint8_t* key,
     uint32_t key_len,
     constant const uint8_t* message,
     uint32_t message_len,
-    thread uint8_t out[32]
+    constant const uint8_t target[32]
 ) {
-    // Same HMAC construction as `hmac_sha256`, but without the "hash long key"
-    // normalization branch because the host only dispatches this kernel when
-    // every candidate length in the batch is <= 64 bytes.
-    uint8_t key_block[64];
-    #pragma unroll
-    for (uint i = 0; i < 64; ++i) {
-        key_block[i] = 0u;                       // Zero-padding for keys shorter than one SHA-256 block.
-    }
-    for (uint32_t i = 0; i < key_len; ++i) {
-        key_block[i] = key[i];                   // Copy the key directly into K0.
-    }
+    uint32_t kw[16];
 
-    uint8_t ipad[64];
-    uint8_t opad[64];
-    #pragma unroll
-    for (uint i = 0; i < 64; ++i) {
-        ipad[i] = key_block[i] ^ 0x36u;          // Build `(K0 xor ipad)`.
-        opad[i] = key_block[i] ^ 0x5cu;          // Build `(K0 xor opad)`.
+    if (key_len > 64u) {
+        // Long keys: hash first, then use the 32-byte hash as the key.
+        #pragma unroll
+        for (uint i = 0; i < 16; ++i) kw[i] = 0u;
+        Sha256Ctx key_ctx;
+        sha256_init(key_ctx);
+        sha256_update_device(key_ctx, key, key_len);
+        sha256_finalize(key_ctx);
+        #pragma unroll
+        for (uint i = 0; i < 8; ++i) kw[i] = key_ctx.state[i];
+    } else {
+        load_key_words(key, key_len, kw);
     }
 
-    Sha256Ctx inner;
-    uint8_t inner_digest[32];
-    sha256_init(inner);                          // Inner SHA-256 context.
-    sha256_update_thread(inner, ipad, 64u);      // Feed `(K0 xor ipad)`.
-    sha256_update_constant(inner, message, message_len); // Feed message bytes.
-    sha256_final(inner, inner_digest);           // inner_digest = SHA256((K0 xor ipad) || message)
-
-    Sha256Ctx outer;
-    sha256_init(outer);                          // Outer SHA-256 context.
-    sha256_compress(outer, opad);                // First block is `(K0 xor opad)`.
-    outer.total_len = 64ull;                     // Account for that compressed block.
-    outer.block_len = 0u;
-    sha256_final_append_tail32(outer, inner_digest, out); // out = SHA256((K0 xor opad) || inner_digest)
+    return hmac_sha256_from_key_words(kw, message, message_len, target);
 }
 
-// Compare two 32-byte digests byte-by-byte.
-static inline bool digest_matches(thread const uint8_t digest[32], constant const uint8_t target[32]) {
-    #pragma unroll
-    for (uint i = 0; i < 8; ++i) {               // Compare as 8 big-endian words to reduce branch checks.
-        if (load_be_u32(digest + (i * 4u)) != load_be_u32(target + (i * 4u))) {
-            return false;                        // Exit early on first mismatch.
-        }
-    }
-    return true;                                 // All bytes matched.
+// Short-key specialization: keys guaranteed <= 64 bytes, no hash-long-key branch.
+static inline bool hmac_sha256_short_key_matches(
+    device const uint8_t* key,
+    uint32_t key_len,
+    constant const uint8_t* message,
+    uint32_t message_len,
+    constant const uint8_t target[32]
+) {
+    uint32_t kw[16];
+    load_key_words(key, key_len, kw);
+    return hmac_sha256_from_key_words(kw, message, message_len, target);
 }
 
-// Main compute kernel: one GPU thread tests exactly one candidate secret from the wordlist batch.
+// Main compute kernel: one GPU thread tests exactly one candidate secret.
 kernel void hs256_wordlist(
-    constant Hs256BruteForceParams& params [[buffer(0)]], // Small shared params uploaded by Rust.
-    constant const uint8_t* message_bytes [[buffer(1)]],  // JWT signing input bytes (`header.payload`).
-    device const uint8_t* word_bytes [[buffer(2)]],       // Packed wordlist bytes for this batch.
-    device const uint32_t* word_offsets [[buffer(3)]],    // Start offset of each candidate into `word_bytes`.
-    device const uint16_t* word_lengths [[buffer(4)]],    // Length of each candidate secret.
-    device atomic_uint* result_index [[buffer(5)]],       // Shared output slot (earliest matching *batch-local* index, or sentinel).
-    uint gid [[thread_position_in_grid]]                  // Global thread id = candidate index within this batch.
+    constant Hs256BruteForceParams& params [[buffer(0)]],
+    constant const uint8_t* message_bytes [[buffer(1)]],
+    device const uint8_t* word_bytes [[buffer(2)]],
+    device const uint32_t* word_offsets [[buffer(3)]],
+    device const uint16_t* word_lengths [[buffer(4)]],
+    device atomic_uint* result_index [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
 ) {
-    if (gid >= params.candidate_count) {                  // Guard against over-dispatch from rounded grid sizes.
-        return;                                           // Thread has no real candidate assigned.
-    }
+    if (gid >= params.candidate_count) return;
 
-    const uint32_t candidate_offset = word_offsets[gid];  // Read this candidate's start offset.
-    const uint32_t candidate_length = uint32_t(word_lengths[gid]); // Read and widen this candidate's length.
-    device const uint8_t* candidate_secret = word_bytes + candidate_offset; // Pointer to candidate bytes.
+    const uint32_t candidate_offset = word_offsets[gid];
+    const uint32_t candidate_length = uint32_t(word_lengths[gid]);
+    device const uint8_t* candidate_secret = word_bytes + candidate_offset;
 
-    uint8_t digest[32];                                   // Thread-local output buffer for computed HMAC digest.
-    hmac_sha256(candidate_secret,                         // Candidate secret acts as the HS256 key.
-                candidate_length,                         // Candidate key length.
-                message_bytes,                            // Shared JWT signing input bytes.
-                params.message_length,                    // Shared JWT signing input length.
-                digest);                                  // Receive computed HMAC-SHA256 digest here.
-
-    if (digest_matches(digest, params.target_signature)) { // If this candidate produced the target signature,
-        // Multiple GPU threads can match in theory (e.g. duplicate secrets in the
-        // same batch). We publish the minimum `gid` so the host preserves the same
-        // deterministic "earliest candidate wins" behavior as before.
-        //
-        // Important design choice: we intentionally store `gid` (batch-local) and
-        // not an absolute wordlist index. That keeps the kernel result path in a
-        // single `uint32_t` while the host tracks absolute batch bases in `u64`.
+    if (hmac_sha256_matches(candidate_secret, candidate_length,
+                            message_bytes, params.message_length,
+                            params.target_signature)) {
         atomic_fetch_min_explicit(result_index, gid, memory_order_relaxed);
     }
 }
 
-// Short-key specialization. Host dispatches this only when every key in the batch is <= 64 bytes.
+// Short-key specialization. Host dispatches this when every key in the batch is <= 64 bytes.
 kernel void hs256_wordlist_short_keys(
     constant Hs256BruteForceParams& params [[buffer(0)]],
     constant const uint8_t* message_bytes [[buffer(1)]],
@@ -538,24 +508,15 @@ kernel void hs256_wordlist_short_keys(
     device atomic_uint* result_index [[buffer(5)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (gid >= params.candidate_count) {
-        return;
-    }
+    if (gid >= params.candidate_count) return;
 
     const uint32_t candidate_offset = word_offsets[gid];
     const uint32_t candidate_length = uint32_t(word_lengths[gid]);
     device const uint8_t* candidate_secret = word_bytes + candidate_offset;
 
-    uint8_t digest[32];
-    hmac_sha256_short_key(candidate_secret,      // Candidate bytes are the HMAC key K.
-                          candidate_length,      // Host guarantees K length <= 64 for this kernel.
-                          message_bytes,         // Shared JWT signing input M.
-                          params.message_length, // Message length in bytes.
-                          digest);               // Output HMAC-SHA256(K, M)
-
-    if (digest_matches(digest, params.target_signature)) {
-        // Same deterministic "earliest match wins" policy as the mixed kernel:
-        // write the minimum batch-local `gid`, not an absolute wordlist index.
+    if (hmac_sha256_short_key_matches(candidate_secret, candidate_length,
+                                      message_bytes, params.message_length,
+                                      params.target_signature)) {
         atomic_fetch_min_explicit(result_index, gid, memory_order_relaxed);
     }
 }

@@ -72,12 +72,94 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
         let mut last_rate_report =
             RateReportSnapshot::capture(started_at, candidates_tested, &timings);
 
+        // Double-buffered dispatch: receive batch N+1 while GPU executes batch N.
+        // `in_flight` holds the command buffer + batch for the currently executing
+        // GPU dispatch; the consumer loop overlaps recv with GPU execution.
+        struct InFlightBatch {
+            cmd_buf: metal::CommandBuffer,
+            batch: super::batch::WordBatch,
+            candidate_count: u64,
+        }
+        let mut in_flight: Option<InFlightBatch> = None;
+
         loop {
-            // Time how long the consumer waits on the producer. This measures
-            // exposed parser latency (work not hidden behind GPU execution).
+            // Receive the next batch while the GPU processes the in-flight one.
+            // This overlap is the key throughput improvement: idle_wait now runs
+            // concurrently with gpu_wait instead of serially.
             let recv_started = Instant::now();
             let message = producer.recv()?;
             timings.consumer_idle_wait += recv_started.elapsed();
+
+            // Complete the previous in-flight GPU dispatch before encoding a new
+            // one (params_buf/result_buf are shared across dispatches).
+            if let Some(flight) = in_flight.take() {
+                let (maybe_match, gpu_wait, result_readback) = gpu.wait_and_readback(&flight.cmd_buf);
+                timings.gpu_wait += gpu_wait;
+                timings.result_readback += result_readback;
+                timings.dispatch_total += gpu_wait + result_readback;
+                candidates_tested =
+                    candidates_tested.saturating_add(flight.candidate_count);
+
+                if let Some(local_match_index) = maybe_match {
+                    let elapsed = started_at.elapsed();
+                    let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
+                    let rate_gpu_only =
+                        rate_per_second(candidates_tested, timings.gpu_wait);
+                    print_final_stats(
+                        candidates_tested,
+                        elapsed,
+                        rate_end_to_end,
+                        rate_gpu_only,
+                        &timings,
+                    );
+                    let _global_index = flight
+                        .batch
+                        .candidate_index_base
+                        .checked_add(local_match_index as u64)
+                        .ok_or_else(|| {
+                            anyhow!("candidate index overflow while reconstructing result")
+                        })?;
+                    let local_index = usize::try_from(local_match_index)
+                        .context("GPU returned invalid result index")?;
+                    let secret = flight
+                        .batch
+                        .word_string_lossy(local_index)
+                        .ok_or_else(|| anyhow!("GPU returned invalid local candidate index"))?;
+                    println!("HS256 key: {secret}");
+                    return Ok(true);
+                }
+
+                // Periodic rate reporting after completing a GPU batch.
+                let now = Instant::now();
+                let elapsed_since_last_report = now
+                    .checked_duration_since(last_rate_report.reported_at)
+                    .unwrap_or_default();
+                if elapsed_since_last_report >= Duration::from_secs(1) {
+                    let current_rate_report =
+                        RateReportSnapshot::capture(now, candidates_tested, &timings);
+                    let delta = current_rate_report.delta_since(last_rate_report);
+                    let rate_end_to_end =
+                        rate_per_second(delta.candidates_tested, delta.wall_time);
+                    let rate_gpu_only =
+                        rate_per_second(delta.candidates_tested, delta.gpu_wait);
+                    let elapsed_total = now.duration_since(started_at);
+                    eprintln!(
+                        "RATE end_to_end={}/s gpu_only={}/s idle_wait={}ms build={}ms (delta={} in {:.2}s, total={} in {:.2}s, tpg={})",
+                        format_human_count(rate_end_to_end),
+                        format_human_count(rate_gpu_only),
+                        format_duration_millis(delta.consumer_idle_wait),
+                        format_duration_millis(delta.wordlist_batch_build),
+                        format_human_count(delta.candidates_tested as f64),
+                        delta.wall_time.as_secs_f64(),
+                        format_human_count(candidates_tested as f64),
+                        elapsed_total.as_secs_f64(),
+                        gpu.current_threadgroup_width()
+                    );
+                    last_rate_report = current_rate_report;
+                }
+
+                producer.recycle(flight.batch);
+            }
 
             let (batch, build_time) = match message {
                 ProducerMessage::Batch {
@@ -87,9 +169,6 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
                     pack_time,
                     parser_stats,
                 } => {
-                    // Producer snapshots parser counters after each batch build.
-                    // We refresh the consumer-side copy here so both periodic
-                    // and final reports reflect the latest parser state.
                     timings.apply_parser_stats(parser_stats);
                     timings.wordlist_batch_plan += plan_time;
                     timings.wordlist_batch_pack += pack_time;
@@ -104,8 +183,6 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
 
             timings.wordlist_batch_build += build_time;
             if !autotune_done {
-                // Autotune once, using the first real batch shape as a proxy
-                // for the rest of the run.
                 gpu.autotune_threadgroup_width(target_signature, &batch)?;
                 autotune_done = true;
             }
@@ -119,22 +196,35 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
                 .total_batch_word_bytes
                 .saturating_add(batch.word_bytes_len() as u64);
 
-            // Dispatch the batch and accumulate fine-grained timing buckets.
-            let (maybe_match, batch_timings) = gpu.try_batch(target_signature, &batch)?;
-            timings.host_prep += batch_timings.host_prep;
-            timings.command_encode += batch_timings.command_encode;
-            timings.gpu_wait += batch_timings.gpu_wait;
-            timings.result_readback += batch_timings.result_readback;
-            timings.dispatch_total += batch_timings.total;
+            // Encode and commit immediately (non-blocking). The GPU starts
+            // executing while we loop back to recv the next batch.
+            let (cmd_buf, host_prep, command_encode) =
+                gpu.encode_and_commit(target_signature, &batch)?;
+            timings.host_prep += host_prep;
+            timings.command_encode += command_encode;
+            timings.dispatch_total += host_prep + command_encode;
+
+            in_flight = Some(InFlightBatch {
+                cmd_buf,
+                batch,
+                candidate_count: batch_candidate_count,
+            });
+        }
+
+        // Drain the last in-flight batch after EOF from the producer.
+        if let Some(flight) = in_flight.take() {
+            let (maybe_match, gpu_wait, result_readback) = gpu.wait_and_readback(&flight.cmd_buf);
+            timings.gpu_wait += gpu_wait;
+            timings.result_readback += result_readback;
+            timings.dispatch_total += gpu_wait + result_readback;
+            candidates_tested =
+                candidates_tested.saturating_add(flight.candidate_count);
 
             if let Some(local_match_index) = maybe_match {
-                // The GPU returns a batch-local index. Reconstruct the absolute
-                // wordlist index on the host so large (>u32) wordlists remain
-                // supported without changing the GPU result slot width.
-                candidates_tested = candidates_tested.saturating_add(batch_candidate_count);
                 let elapsed = started_at.elapsed();
                 let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
-                let rate_gpu_only = rate_per_second(candidates_tested, timings.gpu_wait);
+                let rate_gpu_only =
+                    rate_per_second(candidates_tested, timings.gpu_wait);
                 print_final_stats(
                     candidates_tested,
                     elapsed,
@@ -142,65 +232,24 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
                     rate_gpu_only,
                     &timings,
                 );
-
-                // Reconstruct the absolute wordlist index using the host-side
-                // `u64` batch base. `_global_index` is currently only validated
-                // (for overflow) and not printed, but keeping the computation
-                // here documents the invariant and catches impossible states.
-                let _global_index = batch
+                let _global_index = flight
+                    .batch
                     .candidate_index_base
                     .checked_add(local_match_index as u64)
                     .ok_or_else(|| {
                         anyhow!("candidate index overflow while reconstructing result")
                     })?;
-                let local_index =
-                    // The GPU result must fit `usize` because every dispatch is
-                    // bounded by `MAX_CANDIDATES_PER_BATCH` (far below `usize`
-                    // on supported targets). Convert explicitly for safety.
-                    usize::try_from(local_match_index).context("GPU returned invalid result index")?;
-                let secret = batch
+                let local_index = usize::try_from(local_match_index)
+                    .context("GPU returned invalid result index")?;
+                let secret = flight
+                    .batch
                     .word_string_lossy(local_index)
                     .ok_or_else(|| anyhow!("GPU returned invalid local candidate index"))?;
                 println!("HS256 key: {secret}");
                 return Ok(true);
             }
 
-            candidates_tested = candidates_tested.saturating_add(batch_candidate_count);
-            let now = Instant::now();
-            let elapsed_since_last_report = now
-                .checked_duration_since(last_rate_report.reported_at)
-                .unwrap_or_default();
-            if elapsed_since_last_report >= Duration::from_secs(1) {
-                let current_rate_report =
-                    RateReportSnapshot::capture(now, candidates_tested, &timings);
-                let delta = current_rate_report.delta_since(last_rate_report);
-                // `RATE` is windowed (interval) by design: use deltas from the
-                // last report, while final `STATS` remains cumulative.
-                let rate_end_to_end = rate_per_second(delta.candidates_tested, delta.wall_time);
-                let rate_gpu_only = rate_per_second(delta.candidates_tested, delta.gpu_wait);
-                let elapsed_total = now.duration_since(started_at);
-                eprintln!(
-                    "RATE end_to_end={}/s gpu_only={}/s idle_wait={}ms build={}ms (delta={} in {:.2}s, total={} in {:.2}s, tpg={})",
-                    format_human_count(rate_end_to_end),
-                    format_human_count(rate_gpu_only),
-                    format_duration_millis(delta.consumer_idle_wait),
-                    format_duration_millis(delta.wordlist_batch_build),
-                    format_human_count(delta.candidates_tested as f64),
-                    delta.wall_time.as_secs_f64(),
-                    format_human_count(candidates_tested as f64),
-                    elapsed_total.as_secs_f64(),
-                    gpu.current_threadgroup_width()
-                );
-                last_rate_report = current_rate_report;
-            }
-
-            // After dispatch/readback completes with no match, the consumer no
-            // longer needs the batch contents. Return ownership to the producer
-            // so it can refill the same allocation on the next iteration.
-            //
-            // We intentionally do not recycle on the match path above because we
-            // still need `batch` to reconstruct and print the winning secret.
-            producer.recycle(batch);
+            producer.recycle(flight.batch);
         }
 
         let elapsed = started_at.elapsed();

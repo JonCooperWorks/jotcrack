@@ -1,6 +1,6 @@
 use anyhow::{Context, anyhow, bail};
 use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::batch::{DispatchBatchView, WordBatch};
 use super::stats::{BatchDispatchTimings, format_human_count};
@@ -210,46 +210,45 @@ impl GpuHs256BruteForcer {
         )
     }
 
-    // Encode and execute a single GPU dispatch, then read back the match index.
-    // Timing is split so we can distinguish host overhead from actual GPU wait.
-    fn dispatch_batch_view(
+    // Encode, commit, and return immediately without waiting for GPU completion.
+    // The returned `CommandBuffer` must be passed to `wait_and_readback` before
+    // the next dispatch (params_buf/result_buf are shared across dispatches).
+    pub(super) fn encode_and_commit(
+        &self,
+        target_signature: [u8; 32],
+        batch: &WordBatch,
+    ) -> anyhow::Result<(metal::CommandBuffer, Duration, Duration)> {
+        self.encode_and_commit_view(
+            target_signature,
+            batch.as_dispatch_view(),
+            self.threadgroup_width,
+        )
+    }
+
+    fn encode_and_commit_view(
         &self,
         target_signature: [u8; 32],
         batch: DispatchBatchView<'_>,
         threadgroup_width: usize,
-    ) -> anyhow::Result<(Option<u32>, BatchDispatchTimings)> {
-        let started = Instant::now();
-        let mut timings = BatchDispatchTimings::default();
-        // GPU contract uses `u32 candidate_count`, so validate once at boundary.
+    ) -> anyhow::Result<(metal::CommandBuffer, Duration, Duration)> {
         let candidate_count =
             u32::try_from(batch.candidate_count).context("candidate count exceeds u32")?;
         if candidate_count == 0 {
-            // Empty dispatch is a legal no-op in some test paths.
-            timings.total = started.elapsed();
-            return Ok((None, timings));
+            bail!("cannot encode empty batch for async dispatch");
         }
 
         let params = Hs256BruteForceParams {
             target_signature,
             message_length: self.message_length,
             candidate_count,
-            // The kernel no longer needs the absolute wordlist base. It only
-            // needs `candidate_count` and writes back the earliest matching
-            // batch-local index (`gid`) to the shared result slot.
             reserved0: 0,
         };
 
-        // Host prep phase: update params and reset the result slot.
-        //
-        // The large offsets/lengths/payload buffers are already populated in
-        // shared memory by the producer thread and are bound directly below.
         let prep_started = Instant::now();
         copy_value_to_buffer(&self.params_buf, &params);
         copy_value_to_buffer(&self.result_buf, &RESULT_NOT_FOUND_SENTINEL);
-        timings.host_prep = prep_started.elapsed();
+        let host_prep = prep_started.elapsed();
 
-        // Encode phase: bind the selected kernel and batch-owned shared buffers,
-        // then schedule exactly one thread per candidate.
         let encode_started = Instant::now();
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
@@ -266,34 +265,66 @@ impl GpuHs256BruteForcer {
         let threads_per_grid = MTLSize::new(candidate_count as u64, 1, 1);
         encoder.dispatch_threads(threads_per_grid, threads_per_group);
         encoder.end_encoding();
-        timings.command_encode = encode_started.elapsed();
+        let command_encode = encode_started.elapsed();
 
-        // GPU wait measures the blocking portion seen by the host after commit.
-        let gpu_wait_started = Instant::now();
         command_buffer.commit();
-        command_buffer.wait_until_completed();
-        timings.gpu_wait = gpu_wait_started.elapsed();
 
-        // Read back the result from shared memory after completion.
-        //
-        // Result contract:
-        // - `RESULT_NOT_FOUND_SENTINEL` => no match in this batch
-        // - any other value => earliest matching batch-local candidate index
-        //
-        // Host code combines that local index with `batch.candidate_index_base`
-        // (tracked as `u64`) when it needs a globally meaningful position.
+        // Retain the command buffer so it survives past the autorelease pool.
+        let owned = command_buffer.to_owned();
+        Ok((owned, host_prep, command_encode))
+    }
+
+    // Block until a previously committed command buffer completes, then read
+    // the match result from shared memory.
+    pub(super) fn wait_and_readback(
+        &self,
+        cmd_buf: &metal::CommandBufferRef,
+    ) -> (Option<u32>, Duration, Duration) {
+        let gpu_wait_started = Instant::now();
+        cmd_buf.wait_until_completed();
+        let gpu_wait = gpu_wait_started.elapsed();
+
         let readback_started = Instant::now();
         let result_ptr = self.result_buf.contents().cast::<u32>();
-        // SAFETY: `result_buf` is a 4-byte shared buffer that stays alive for the dispatch lifetime.
+        // SAFETY: `result_buf` is a 4-byte shared buffer; GPU has completed.
         let result = unsafe { *result_ptr };
-        timings.result_readback = readback_started.elapsed();
+        let result_readback = readback_started.elapsed();
 
-        timings.total = started.elapsed();
-        if result == RESULT_NOT_FOUND_SENTINEL {
-            Ok((None, timings))
+        let maybe_match = if result == RESULT_NOT_FOUND_SENTINEL {
+            None
         } else {
-            Ok((Some(result), timings))
+            Some(result)
+        };
+        (maybe_match, gpu_wait, result_readback)
+    }
+
+    // Synchronous dispatch: encode, commit, wait, and readback in one call.
+    // Used by autotune and test paths where pipelining is not needed.
+    fn dispatch_batch_view(
+        &self,
+        target_signature: [u8; 32],
+        batch: DispatchBatchView<'_>,
+        threadgroup_width: usize,
+    ) -> anyhow::Result<(Option<u32>, BatchDispatchTimings)> {
+        let started = Instant::now();
+        let mut timings = BatchDispatchTimings::default();
+        let candidate_count =
+            u32::try_from(batch.candidate_count).context("candidate count exceeds u32")?;
+        if candidate_count == 0 {
+            timings.total = started.elapsed();
+            return Ok((None, timings));
         }
+
+        let (cmd_buf, host_prep, command_encode) =
+            self.encode_and_commit_view(target_signature, batch, threadgroup_width)?;
+        timings.host_prep = host_prep;
+        timings.command_encode = command_encode;
+
+        let (maybe_match, gpu_wait, result_readback) = self.wait_and_readback(&cmd_buf);
+        timings.gpu_wait = gpu_wait;
+        timings.result_readback = result_readback;
+        timings.total = started.elapsed();
+        Ok((maybe_match, timings))
     }
 
     // Benchmark a small sample from the first batch across several candidate
