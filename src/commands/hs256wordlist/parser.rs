@@ -277,9 +277,8 @@ struct ChunkJob {
 #[derive(Debug)]
 // Parsed metadata for one chunk.
 //
-// The worker deliberately does *not* copy candidate bytes into GPU buffers.
-// Instead it records relative offsets and lengths so the producer thread can
-// later pack candidates into `WordBatch` in deterministic file order.
+// Records line offsets/lengths relative to the chunk's start in the mmap so
+// the packer can later copy candidate bytes into a `WordBatch`.
 struct ParsedChunk {
     chunk_id: u64,
     chunk_start: usize,
@@ -451,15 +450,14 @@ pub(super) fn pack_batch_plan_into_batch(
             );
         }
 
-        for line_idx in segment.line_start..segment.line_end {
-            let line_len = chunk.lengths[line_idx] as usize;
-            let line_start = chunk.chunk_start + chunk.offsets_rel[line_idx] as usize;
-            let line_end = line_start + line_len;
-            let line = bytes
-                .get(line_start..line_end)
-                .ok_or_else(|| anyhow!("batch plan referenced out-of-bounds mmap slice"))?;
-            batch.push_candidate(line)?;
-        }
+        batch.push_segment_bulk(
+            bytes,
+            chunk.chunk_start,
+            &chunk.offsets_rel,
+            &chunk.lengths,
+            segment.line_start,
+            segment.line_end,
+        );
     }
 
     if batch.candidate_count() != plan.candidate_count {
@@ -533,8 +531,8 @@ impl ParallelMmapWordlistBatchReader {
         let _ = device;
         let mmap = Arc::new(mmap);
         let chunks = plan_mmap_chunks(mmap.as_ref(), config.chunk_bytes)?;
-        let (job_tx, job_rx) = crossbeam_channel::bounded(config.queue_capacity);
-        let (result_tx, result_rx) = crossbeam_channel::bounded(config.queue_capacity);
+        let (job_tx, job_rx) = crossbeam_channel::bounded::<ChunkJob>(config.queue_capacity);
+        let (result_tx, result_rx) = crossbeam_channel::bounded::<ParserWorkerMessage>(config.queue_capacity);
         let mut worker_handles = Vec::with_capacity(config.parser_threads);
 
         for _ in 0..config.parser_threads {
@@ -545,6 +543,16 @@ impl ParallelMmapWordlistBatchReader {
                 // Each worker is a simple parse loop: recv job -> parse -> send
                 // metadata. No shared mutable state is touched here.
                 while let Ok(job) = job_rx_for_worker.recv() {
+                    let chunk_len = job.end.saturating_sub(job.start);
+                    // Prefetch chunk pages asynchronously before scanning.
+                    // Best-effort: ignore failures (advisory only).
+                    if chunk_len > 0 {
+                        let _ = mmap_for_worker.advise_range(
+                            Advice::WillNeed,
+                            job.start,
+                            chunk_len,
+                        );
+                    }
                     let message = match parse_mmap_chunk(mmap_for_worker.as_ref(), job) {
                         Ok(chunk) => ParserWorkerMessage::Parsed(chunk),
                         Err(err) => ParserWorkerMessage::Error {

@@ -209,6 +209,70 @@ impl WordBatch {
         Some(String::from_utf8_lossy(self.word(local_index)?).into_owned())
     }
 
+    /// Bulk-append a contiguous run of candidates from parsed chunk metadata.
+    ///
+    /// This avoids the per-candidate overhead of `push_candidate` (bounds
+    /// checking, `u32::try_from`, `can_fit`) by validating once up front and
+    /// filling offsets/lengths/word_bytes via tight unsafe loops.
+    ///
+    /// # Safety contract
+    /// Caller must guarantee:
+    /// - `chunk_offsets_rel[i] + chunk_start` and `chunk_lengths[i]` are valid
+    ///   mmap byte ranges for all `i` in `line_start..line_end`
+    /// - The total bytes fit in the batch (checked here via debug_assert)
+    pub(super) fn push_segment_bulk(
+        &mut self,
+        mmap: &[u8],
+        chunk_start: usize,
+        chunk_offsets_rel: &[u32],
+        chunk_lengths: &[u16],
+        line_start: usize,
+        line_end: usize,
+    ) {
+        let count = line_end - line_start;
+        if count == 0 {
+            return;
+        }
+
+        let base_idx = self.candidate_count;
+        let mut wb_cursor = self.word_bytes_len;
+
+        // SAFETY: all capacity checks were performed at plan time via
+        // `batch_shape_can_fit`. The plan guarantees candidate_count and
+        // word_bytes_len will not exceed the batch caps.
+        unsafe {
+            let offsets_base = (self.word_offsets_ptr as *mut u32).add(base_idx);
+            let lengths_base = (self.word_lengths_ptr as *mut u16).add(base_idx);
+            let wb_base = self.word_bytes_ptr as *mut u8;
+
+            for i in 0..count {
+                let src_idx = line_start + i;
+                let len = *chunk_lengths.get_unchecked(src_idx) as usize;
+                let src_offset =
+                    chunk_start + *chunk_offsets_rel.get_unchecked(src_idx) as usize;
+
+                *offsets_base.add(i) = wb_cursor as u32;
+                *lengths_base.add(i) = len as u16;
+                std::ptr::copy_nonoverlapping(
+                    mmap.as_ptr().add(src_offset),
+                    wb_base.add(wb_cursor),
+                    len,
+                );
+                wb_cursor += len;
+            }
+        }
+
+        // Update max_word_len by scanning the segment's lengths.
+        let seg_max = chunk_lengths[line_start..line_end]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        self.max_word_len = self.max_word_len.max(seg_max);
+        self.candidate_count += count;
+        self.word_bytes_len = wb_cursor;
+    }
+
     pub(super) fn as_dispatch_view(&self) -> DispatchBatchView<'_> {
         // Views let us dispatch or autotune against the same buffers without
         // cloning `WordBatch` or copying any payload bytes.
