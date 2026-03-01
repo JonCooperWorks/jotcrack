@@ -150,10 +150,12 @@ impl WordBatch {
         unsafe { std::slice::from_raw_parts(self.word_bytes_ptr as *const u8, self.word_bytes_len) }
     }
 
+    #[allow(dead_code)] // Used by MmapWordlistBatchReader (test-only sequential path)
     pub(super) fn can_fit(&self, line_len: usize) -> bool {
         batch_shape_can_fit(self.candidate_count, self.word_bytes_len, line_len)
     }
 
+    #[allow(dead_code)] // Used by MmapWordlistBatchReader (test-only sequential path)
     pub(super) fn push_candidate(&mut self, line: &[u8]) -> anyhow::Result<()> {
         if line.len() > u16::MAX as usize {
             bail!("wordlist entry exceeds {} bytes", u16::MAX);

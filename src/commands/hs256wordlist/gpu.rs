@@ -197,19 +197,6 @@ impl GpuHs256BruteForcer {
         self.device.name()
     }
 
-    // Dispatch one batch using the currently selected threadgroup width.
-    pub(super) fn try_batch(
-        &self,
-        target_signature: [u8; 32],
-        batch: &WordBatch,
-    ) -> anyhow::Result<(Option<u32>, BatchDispatchTimings)> {
-        self.dispatch_batch_view(
-            target_signature,
-            batch.as_dispatch_view(),
-            self.threadgroup_width,
-        )
-    }
-
     // Encode, commit, and return immediately without waiting for GPU completion.
     // The returned `CommandBuffer` must be passed to `wait_and_readback` before
     // the next dispatch (params_buf/result_buf are shared across dispatches).

@@ -19,5 +19,7 @@ mod stats;
 mod test_support;
 
 pub use args::Hs256WordlistArgs;
+// Re-exported for CLI contract tests in `commands::tests`.
+#[allow(dead_code)]
 pub const DEFAULT_WORDLIST_PATH: &str = args::DEFAULT_WORDLIST_PATH;
 pub use command::run;
