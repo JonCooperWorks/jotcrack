@@ -12,6 +12,42 @@ use super::stats::{
     rate_per_second,
 };
 
+// Holds the command buffer + batch for a currently executing GPU dispatch.
+// Defined at module scope so `handle_match` can reference it.
+struct InFlightBatch {
+    cmd_buf: metal::CommandBuffer,
+    batch: super::batch::WordBatch,
+    candidate_count: u64,
+}
+
+// Extract the matched secret from a completed GPU batch, print final stats,
+// and return `Ok(true)`. Called from both the main loop and the post-EOF drain.
+fn handle_match(
+    flight: &InFlightBatch,
+    local_match_index: u32,
+    candidates_tested: u64,
+    started_at: Instant,
+    timings: &RunTimings,
+) -> anyhow::Result<bool> {
+    let elapsed = started_at.elapsed();
+    let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
+    let rate_gpu_only = rate_per_second(candidates_tested, timings.gpu_wait);
+    print_final_stats(candidates_tested, elapsed, rate_end_to_end, rate_gpu_only, timings);
+    let _global_index = flight
+        .batch
+        .candidate_index_base
+        .checked_add(local_match_index as u64)
+        .ok_or_else(|| anyhow!("candidate index overflow while reconstructing result"))?;
+    let local_index = usize::try_from(local_match_index)
+        .context("GPU returned invalid result index")?;
+    let secret = flight
+        .batch
+        .word_string_lossy(local_index)
+        .ok_or_else(|| anyhow!("GPU returned invalid local candidate index"))?;
+    println!("HS256 key: {secret}");
+    Ok(true)
+}
+
 /// End-to-end HS256 cracking flow:
 /// 1) parse the JWT,
 /// 2) initialize Metal + reusable buffers,
@@ -75,11 +111,6 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
         // Double-buffered dispatch: receive batch N+1 while GPU executes batch N.
         // `in_flight` holds the command buffer + batch for the currently executing
         // GPU dispatch; the consumer loop overlaps recv with GPU execution.
-        struct InFlightBatch {
-            cmd_buf: metal::CommandBuffer,
-            batch: super::batch::WordBatch,
-            candidate_count: u64,
-        }
         let mut in_flight: Option<InFlightBatch> = None;
 
         loop {
@@ -101,32 +132,7 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
                     candidates_tested.saturating_add(flight.candidate_count);
 
                 if let Some(local_match_index) = maybe_match {
-                    let elapsed = started_at.elapsed();
-                    let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
-                    let rate_gpu_only =
-                        rate_per_second(candidates_tested, timings.gpu_wait);
-                    print_final_stats(
-                        candidates_tested,
-                        elapsed,
-                        rate_end_to_end,
-                        rate_gpu_only,
-                        &timings,
-                    );
-                    let _global_index = flight
-                        .batch
-                        .candidate_index_base
-                        .checked_add(local_match_index as u64)
-                        .ok_or_else(|| {
-                            anyhow!("candidate index overflow while reconstructing result")
-                        })?;
-                    let local_index = usize::try_from(local_match_index)
-                        .context("GPU returned invalid result index")?;
-                    let secret = flight
-                        .batch
-                        .word_string_lossy(local_index)
-                        .ok_or_else(|| anyhow!("GPU returned invalid local candidate index"))?;
-                    println!("HS256 key: {secret}");
-                    return Ok(true);
+                    return handle_match(&flight, local_match_index, candidates_tested, started_at, &timings);
                 }
 
                 // Periodic rate reporting after completing a GPU batch.
@@ -221,32 +227,7 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
                 candidates_tested.saturating_add(flight.candidate_count);
 
             if let Some(local_match_index) = maybe_match {
-                let elapsed = started_at.elapsed();
-                let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
-                let rate_gpu_only =
-                    rate_per_second(candidates_tested, timings.gpu_wait);
-                print_final_stats(
-                    candidates_tested,
-                    elapsed,
-                    rate_end_to_end,
-                    rate_gpu_only,
-                    &timings,
-                );
-                let _global_index = flight
-                    .batch
-                    .candidate_index_base
-                    .checked_add(local_match_index as u64)
-                    .ok_or_else(|| {
-                        anyhow!("candidate index overflow while reconstructing result")
-                    })?;
-                let local_index = usize::try_from(local_match_index)
-                    .context("GPU returned invalid result index")?;
-                let secret = flight
-                    .batch
-                    .word_string_lossy(local_index)
-                    .ok_or_else(|| anyhow!("GPU returned invalid local candidate index"))?;
-                println!("HS256 key: {secret}");
-                return Ok(true);
+                return handle_match(&flight, local_match_index, candidates_tested, started_at, &timings);
             }
 
             producer.recycle(flight.batch);

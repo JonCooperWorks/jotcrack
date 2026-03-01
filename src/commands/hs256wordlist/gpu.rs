@@ -31,17 +31,6 @@ struct Hs256BruteForceParams {
     // to infer it from buffers or rely on implicit buffer metadata.
     message_length: u32,
     candidate_count: u32,
-    // Reserved/padding field kept so the Rust and Metal structs stay the same
-    // size/alignment as before (4 x 32-bit fields after the 32-byte digest).
-    //
-    // We previously used this slot for `candidate_index_base` (absolute wordlist
-    // index of candidate #0 in the batch). That overflowed at `u32::MAX` on very
-    // large wordlists, so the GPU now reports a batch-local index and the host
-    // reconstructs the absolute index from `WordBatch::candidate_index_base`.
-    //
-    // Keeping the field avoids unnecessary ABI churn and makes future kernel-side
-    // metadata additions straightforward without changing buffer sizes today.
-    reserved0: u32,
 }
 
 // Owns Metal objects and the small persistent buffers reused across dispatches.
@@ -228,7 +217,6 @@ impl GpuHs256BruteForcer {
             target_signature,
             message_length: self.message_length,
             candidate_count,
-            reserved0: 0,
         };
 
         let prep_started = Instant::now();

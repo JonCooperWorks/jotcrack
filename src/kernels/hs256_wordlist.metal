@@ -8,10 +8,6 @@ struct Hs256BruteForceParams {
     uint8_t target_signature[32];      // Expected HS256 HMAC digest (32 bytes) we compare against.
     uint32_t message_length;           // Actual byte length of `message_bytes` (the JWT `header.payload` string).
     uint32_t candidate_count;          // Number of candidate secrets in this GPU batch.
-    uint32_t reserved0;                // Reserved/padding slot kept for ABI stability with the Rust-side params struct.
-                                      // Older versions used this as `candidate_index_base` (absolute wordlist index
-                                      // of candidate #0). The kernel now reports batch-local match indices (`gid`)
-                                      // so host-side absolute indexing can scale past `uint32_t`.
 };
 
 // Minimal SHA-256 streaming context used per GPU thread.
