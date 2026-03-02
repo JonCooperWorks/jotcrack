@@ -1,4 +1,4 @@
-//! HS256 JWT wordlist cracking command (Metal-backed).
+//! HS512 JWT wordlist cracking command (Metal-backed).
 //!
 //! Runtime pipeline:
 //! 1. Parse and validate JWT.
@@ -11,7 +11,7 @@ mod command;
 mod gpu;
 mod jwt;
 
-pub use args::Hs256WordlistArgs;
+pub use args::Hs512WordlistArgs;
 #[allow(dead_code)]
 pub const DEFAULT_WORDLIST_PATH: &str = crate::commands::common::args::DEFAULT_WORDLIST_PATH;
 pub use command::run;

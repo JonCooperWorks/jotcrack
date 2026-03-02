@@ -168,7 +168,7 @@ fn handle_packer_message(
     }
 }
 
-pub(super) enum ProducerMessage {
+pub(crate) enum ProducerMessage {
     Batch {
         batch: WordBatch,
         build_time: Duration,
@@ -184,7 +184,7 @@ pub(super) enum ProducerMessage {
 
 // Owns the producer thread and channel endpoints used to overlap wordlist
 // parsing with GPU dispatch.
-pub(super) struct WordlistProducer {
+pub(crate) struct WordlistProducer {
     rx: Option<Receiver<ProducerMessage>>,
     // Reverse direction channel used only for allocation reuse:
     // consumer -> producer returns fully-owned `WordBatch` values after dispatch.
@@ -196,7 +196,7 @@ pub(super) struct WordlistProducer {
 impl WordlistProducer {
     // Start the producer thread immediately so parsing can begin while the
     // consumer is initializing autotune / first dispatch state.
-    pub(super) fn spawn(
+    pub(crate) fn spawn(
         wordlist_path: PathBuf,
         device: Device,
         parser_config: ParserConfig,
@@ -237,13 +237,13 @@ impl WordlistProducer {
     }
 
     // Cooperative stop signal checked between batch builds.
-    pub(super) fn stop(&self) {
+    pub(crate) fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
 
     // Receive the next batch (or terminal message) from the producer. A closed
     // channel is treated as an error because the consumer expects a clean EOF.
-    pub(super) fn recv(&self) -> anyhow::Result<ProducerMessage> {
+    pub(crate) fn recv(&self) -> anyhow::Result<ProducerMessage> {
         let rx = self
             .rx
             .as_ref()
@@ -254,13 +254,13 @@ impl WordlistProducer {
 
     // Dropping the receiver is an important shutdown step when exiting early on
     // a match: it prevents the producer from blocking forever on a bounded send.
-    pub(super) fn close_receiver(&mut self) {
+    pub(crate) fn close_receiver(&mut self) {
         let _ = self.rx.take();
     }
 
     // Best-effort recycle path: do not block the consumer/GPU path if the
     // producer is busy or already shutting down.
-    pub(super) fn recycle(&self, batch: WordBatch) {
+    pub(crate) fn recycle(&self, batch: WordBatch) {
         // `try_send` is intentional: the consumer is on the critical path for
         // throughput, so we prefer dropping a recyclable allocation over
         // stalling GPU dispatch progress.
@@ -269,7 +269,7 @@ impl WordlistProducer {
 
     // Join the background thread so shutdown is deterministic and panics are
     // surfaced as regular errors.
-    pub(super) fn join(&mut self) -> anyhow::Result<()> {
+    pub(crate) fn join(&mut self) -> anyhow::Result<()> {
         if let Some(handle) = self.handle.take() {
             handle
                 .join()

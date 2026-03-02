@@ -2,11 +2,11 @@ use anyhow::{Context, bail};
 use metal::{Device, MTLResourceOptions};
 
 // Larger batches improve amortization of dispatch overhead and host work.
-pub(super) const MAX_CANDIDATES_PER_BATCH: usize = 6_182_240;
-pub(super) const MAX_WORD_BYTES_PER_BATCH: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_CANDIDATES_PER_BATCH: usize = 6_182_240;
+pub(crate) const MAX_WORD_BYTES_PER_BATCH: usize = 32 * 1024 * 1024;
 // Approximate shared-buffer bytes held by one `WordBatch` allocation. This is
 // the dominant memory cost when increasing producer/consumer pipeline depth.
-pub(super) const APPROX_WORD_BATCH_BUFFER_BYTES: usize = MAX_WORD_BYTES_PER_BATCH
+pub(crate) const APPROX_WORD_BATCH_BUFFER_BYTES: usize = MAX_WORD_BYTES_PER_BATCH
     + (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u32>())
     + (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u16>());
 
@@ -16,13 +16,13 @@ pub(super) const APPROX_WORD_BATCH_BUFFER_BYTES: usize = MAX_WORD_BYTES_PER_BATC
 // huge wordlists), we store one contiguous byte blob plus offset/length tables.
 // This minimizes host memory churn and matches the GPU kernel input format.
 #[derive(Debug)]
-pub(super) struct WordBatch {
+pub(crate) struct WordBatch {
     // Host-only absolute wordlist index of candidate #0 in this batch.
     //
     // This is intentionally `u64` so parsing/progress/result reconstruction can
     // exceed 4,294,967,295 non-empty candidates. It is not sent to the GPU
     // anymore; the kernel returns a batch-local match index (`u32`) instead.
-    pub(super) candidate_index_base: u64,
+    pub(crate) candidate_index_base: u64,
     // Buffers that are directly bound to the kernel at dispatch time.
     // The producer fills them; the consumer reuses the same allocations.
     word_bytes_buf: metal::Buffer,
@@ -41,7 +41,7 @@ pub(super) struct WordBatch {
 
 // Shared batch-capacity rule used by both the direct pack path and the new
 // planner stage so batch boundaries remain identical across implementations.
-pub(super) fn batch_shape_can_fit(
+pub(crate) fn batch_shape_can_fit(
     candidate_count: usize,
     word_bytes_len: usize,
     line_len: usize,
@@ -71,7 +71,7 @@ pub(super) fn batch_shape_can_fit(
 // candidate byte-cap exemption (allowing a single large candidate to
 // form its own batch) is handled by falling through to the per-line
 // path in the planner.
-pub(super) fn batch_shape_can_fit_block(
+pub(crate) fn batch_shape_can_fit_block(
     candidate_count: usize,
     word_bytes_len: usize,
     block_line_count: usize,
@@ -85,7 +85,7 @@ pub(super) fn batch_shape_can_fit_block(
 impl WordBatch {
     // Allocate fixed-capacity shared buffers sized to the batch caps so parser
     // writes can go straight into memory later bound to the kernel.
-    pub(super) fn new(device: &Device, candidate_index_base: u64) -> Self {
+    pub(crate) fn new(device: &Device, candidate_index_base: u64) -> Self {
         let options = MTLResourceOptions::StorageModeShared;
         let word_bytes_buf = device.new_buffer(MAX_WORD_BYTES_PER_BATCH as u64, options);
         let word_offsets_buf = device.new_buffer(
@@ -114,7 +114,7 @@ impl WordBatch {
 
     // Reuse batch allocations across producer iterations to reduce allocator
     // churn in the parsing hot path while preserving the same batch semantics.
-    pub(super) fn reset_for_reuse(&mut self, candidate_index_base: u64) {
+    pub(crate) fn reset_for_reuse(&mut self, candidate_index_base: u64) {
         // Rebinding the base is what preserves globally correct indexing across
         // batches even when the backing Metal buffers are recycled.
         self.candidate_index_base = candidate_index_base;
@@ -125,21 +125,21 @@ impl WordBatch {
 
     #[cfg(test)]
     // A batch is considered empty when it has no candidate metadata entries.
-    pub(super) fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.candidate_count == 0
     }
 
     // Number of candidates packaged for this dispatch.
-    pub(super) fn candidate_count(&self) -> usize {
+    pub(crate) fn candidate_count(&self) -> usize {
         self.candidate_count
     }
 
     // Number of packed candidate bytes for this dispatch.
-    pub(super) fn word_bytes_len(&self) -> usize {
+    pub(crate) fn word_bytes_len(&self) -> usize {
         self.word_bytes_len
     }
 
-    pub(super) fn max_word_len(&self) -> u16 {
+    pub(crate) fn max_word_len(&self) -> u16 {
         self.max_word_len
     }
 
@@ -155,7 +155,7 @@ impl WordBatch {
         &self.word_bytes_buf
     }
 
-    pub(super) fn offsets_slice(&self) -> &[u32] {
+    pub(crate) fn offsets_slice(&self) -> &[u32] {
         // SAFETY: `word_offsets_buf` stores `u32` entries; the first
         // `candidate_count` entries are initialized by `push_candidate`.
         unsafe {
@@ -163,7 +163,7 @@ impl WordBatch {
         }
     }
 
-    pub(super) fn lengths_slice(&self) -> &[u16] {
+    pub(crate) fn lengths_slice(&self) -> &[u16] {
         // SAFETY: `word_lengths_buf` stores `u16` entries; the first
         // `candidate_count` entries are initialized by `push_candidate`.
         unsafe {
@@ -171,19 +171,19 @@ impl WordBatch {
         }
     }
 
-    pub(super) fn word_bytes_slice(&self) -> &[u8] {
+    pub(crate) fn word_bytes_slice(&self) -> &[u8] {
         // SAFETY: the first `word_bytes_len` bytes are initialized by
         // `push_candidate`.
         unsafe { std::slice::from_raw_parts(self.word_bytes_ptr as *const u8, self.word_bytes_len) }
     }
 
     #[allow(dead_code)] // Used by MmapWordlistBatchReader (test-only sequential path)
-    pub(super) fn can_fit(&self, line_len: usize) -> bool {
+    pub(crate) fn can_fit(&self, line_len: usize) -> bool {
         batch_shape_can_fit(self.candidate_count, self.word_bytes_len, line_len)
     }
 
     #[allow(dead_code)] // Used by MmapWordlistBatchReader (test-only sequential path)
-    pub(super) fn push_candidate(&mut self, line: &[u8]) -> anyhow::Result<()> {
+    pub(crate) fn push_candidate(&mut self, line: &[u8]) -> anyhow::Result<()> {
         if line.len() > u16::MAX as usize {
             bail!("wordlist entry exceeds {} bytes", u16::MAX);
         }
@@ -226,7 +226,7 @@ impl WordBatch {
     // Reconstruct a candidate slice from the packed storage.
     // Offsets and lengths are guaranteed to have matching indices by the batch
     // builders, so any `None` here indicates a bug or invalid GPU result.
-    pub(super) fn word(&self, local_index: usize) -> Option<&[u8]> {
+    pub(crate) fn word(&self, local_index: usize) -> Option<&[u8]> {
         let start = *self.offsets_slice().get(local_index)? as usize;
         let len = *self.lengths_slice().get(local_index)? as usize;
         self.word_bytes_slice().get(start..start + len)
@@ -234,7 +234,7 @@ impl WordBatch {
 
     // Human-readable reconstruction for final reporting. We keep this lossy to
     // avoid crashing on non-UTF-8 wordlist entries while still printing a key.
-    pub(super) fn word_string_lossy(&self, local_index: usize) -> Option<String> {
+    pub(crate) fn word_string_lossy(&self, local_index: usize) -> Option<String> {
         Some(String::from_utf8_lossy(self.word(local_index)?).into_owned())
     }
 
@@ -249,7 +249,7 @@ impl WordBatch {
     /// - `chunk_offsets_rel[i] + chunk_start` and `chunk_lengths[i]` are valid
     ///   mmap byte ranges for all `i` in `line_start..line_end`
     /// - The total bytes fit in the batch (checked here via debug_assert)
-    pub(super) fn push_segment_bulk(
+    pub(crate) fn push_segment_bulk(
         &mut self,
         mmap: &[u8],
         chunk_start: usize,
@@ -302,7 +302,7 @@ impl WordBatch {
         self.word_bytes_len = wb_cursor;
     }
 
-    pub(super) fn as_dispatch_view(&self) -> DispatchBatchView<'_> {
+    pub(crate) fn as_dispatch_view(&self) -> DispatchBatchView<'_> {
         // Views let us dispatch or autotune against the same buffers without
         // cloning `WordBatch` or copying any payload bytes.
         DispatchBatchView {
@@ -314,7 +314,7 @@ impl WordBatch {
         }
     }
 
-    pub(super) fn prefix_dispatch_view(
+    pub(crate) fn prefix_dispatch_view(
         &self,
         sample_count: usize,
     ) -> Option<DispatchBatchView<'_>> {
@@ -337,14 +337,14 @@ impl WordBatch {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct DispatchBatchView<'a> {
+pub(crate) struct DispatchBatchView<'a> {
     // Minimal metadata + buffer references required to dispatch a full batch or
     // sampled prefix batch without owning the storage.
-    pub(super) candidate_count: usize,
-    pub(super) max_word_len: u16,
-    pub(super) word_bytes_buf: &'a metal::Buffer,
-    pub(super) word_offsets_buf: &'a metal::Buffer,
-    pub(super) word_lengths_buf: &'a metal::Buffer,
+    pub(crate) candidate_count: usize,
+    pub(crate) max_word_len: u16,
+    pub(crate) word_bytes_buf: &'a metal::Buffer,
+    pub(crate) word_offsets_buf: &'a metal::Buffer,
+    pub(crate) word_lengths_buf: &'a metal::Buffer,
 }
 
 #[cfg(test)]

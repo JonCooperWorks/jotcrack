@@ -5,35 +5,35 @@ use super::parser::ParserStats;
 // Per-dispatch timing buckets used to separate host prep/encode overhead from
 // time spent waiting for GPU completion.
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct BatchDispatchTimings {
-    pub(super) host_prep: Duration,
-    pub(super) command_encode: Duration,
-    pub(super) gpu_wait: Duration,
-    pub(super) result_readback: Duration,
-    pub(super) total: Duration,
+pub(crate) struct BatchDispatchTimings {
+    pub(crate) host_prep: Duration,
+    pub(crate) command_encode: Duration,
+    pub(crate) gpu_wait: Duration,
+    pub(crate) result_readback: Duration,
+    pub(crate) total: Duration,
 }
 
 // Aggregated run timings and batch stats printed in the final report.
 #[derive(Debug, Default)]
-pub(super) struct RunTimings {
-    pub(super) wordlist_batch_build: Duration,
-    pub(super) wordlist_batch_plan: Duration,
-    pub(super) wordlist_batch_pack: Duration,
-    pub(super) host_prep: Duration,
-    pub(super) command_encode: Duration,
-    pub(super) gpu_wait: Duration,
-    pub(super) result_readback: Duration,
-    pub(super) dispatch_total: Duration,
-    pub(super) consumer_idle_wait: Duration,
-    pub(super) batch_count: u64,
-    pub(super) total_batch_candidates: u64,
-    pub(super) total_batch_word_bytes: u64,
-    pub(super) pipeline_depth: usize,
-    pub(super) packer_threads: usize,
-    pub(super) parser_threads: usize,
-    pub(super) parser_chunk_bytes: usize,
-    pub(super) parser_chunks: u64,
-    pub(super) parser_skipped_oversize: u64,
+pub(crate) struct RunTimings {
+    pub(crate) wordlist_batch_build: Duration,
+    pub(crate) wordlist_batch_plan: Duration,
+    pub(crate) wordlist_batch_pack: Duration,
+    pub(crate) host_prep: Duration,
+    pub(crate) command_encode: Duration,
+    pub(crate) gpu_wait: Duration,
+    pub(crate) result_readback: Duration,
+    pub(crate) dispatch_total: Duration,
+    pub(crate) consumer_idle_wait: Duration,
+    pub(crate) batch_count: u64,
+    pub(crate) total_batch_candidates: u64,
+    pub(crate) total_batch_word_bytes: u64,
+    pub(crate) pipeline_depth: usize,
+    pub(crate) packer_threads: usize,
+    pub(crate) parser_threads: usize,
+    pub(crate) parser_chunk_bytes: usize,
+    pub(crate) parser_chunks: u64,
+    pub(crate) parser_skipped_oversize: u64,
 }
 
 impl RunTimings {
@@ -41,7 +41,7 @@ impl RunTimings {
     //
     // The producer includes this with each message so the consumer can print a
     // complete final report even if the run ends early (match found) or at EOF.
-    pub(super) fn apply_parser_stats(&mut self, parser_stats: ParserStats) {
+    pub(crate) fn apply_parser_stats(&mut self, parser_stats: ParserStats) {
         self.parser_threads = parser_stats.parser_threads;
         self.parser_chunk_bytes = parser_stats.parser_chunk_bytes;
         self.parser_chunks = parser_stats.parser_chunks;
@@ -52,25 +52,25 @@ impl RunTimings {
 // Snapshot of cumulative counters/timings at a periodic progress report.
 // Deltas between snapshots produce interval ("windowed") rates and wait times.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct RateReportSnapshot {
-    pub(super) reported_at: Instant,
-    pub(super) candidates_tested: u64,
-    pub(super) gpu_wait: Duration,
-    pub(super) wordlist_batch_build: Duration,
-    pub(super) consumer_idle_wait: Duration,
+pub(crate) struct RateReportSnapshot {
+    pub(crate) reported_at: Instant,
+    pub(crate) candidates_tested: u64,
+    pub(crate) gpu_wait: Duration,
+    pub(crate) wordlist_batch_build: Duration,
+    pub(crate) consumer_idle_wait: Duration,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub(super) struct RateReportDelta {
-    pub(super) wall_time: Duration,
-    pub(super) candidates_tested: u64,
-    pub(super) gpu_wait: Duration,
-    pub(super) wordlist_batch_build: Duration,
-    pub(super) consumer_idle_wait: Duration,
+pub(crate) struct RateReportDelta {
+    pub(crate) wall_time: Duration,
+    pub(crate) candidates_tested: u64,
+    pub(crate) gpu_wait: Duration,
+    pub(crate) wordlist_batch_build: Duration,
+    pub(crate) consumer_idle_wait: Duration,
 }
 
 impl RateReportSnapshot {
-    pub(super) fn capture(
+    pub(crate) fn capture(
         reported_at: Instant,
         candidates_tested: u64,
         timings: &RunTimings,
@@ -86,7 +86,7 @@ impl RateReportSnapshot {
         }
     }
 
-    pub(super) fn delta_since(self, previous: Self) -> RateReportDelta {
+    pub(crate) fn delta_since(self, previous: Self) -> RateReportDelta {
         // Subtractions are saturating/checked so clock regressions or future
         // refactors cannot panic the reporter path.
         RateReportDelta {
@@ -112,14 +112,14 @@ impl RateReportSnapshot {
 
 // Helper used by both periodic and final reporting. Returns 0 when no time has
 // elapsed yet to avoid division-by-zero during startup.
-pub(super) fn saturating_duration_sub(current: Duration, previous: Duration) -> Duration {
+pub(crate) fn saturating_duration_sub(current: Duration, previous: Duration) -> Duration {
     // Defensive helper for "delta from cumulative totals" math used by the
     // progress reporter. Underflow should not happen in normal execution, but
     // returning zero keeps tests and future refactors safe.
     current.checked_sub(previous).unwrap_or_default()
 }
 
-pub(super) fn rate_per_second(candidates_tested: u64, elapsed: Duration) -> f64 {
+pub(crate) fn rate_per_second(candidates_tested: u64, elapsed: Duration) -> f64 {
     // Used for both cumulative (`STATS`) and interval (`RATE`) throughput.
     if elapsed.is_zero() {
         0.0
@@ -128,7 +128,7 @@ pub(super) fn rate_per_second(candidates_tested: u64, elapsed: Duration) -> f64 
     }
 }
 
-pub(super) fn format_duration_millis(duration: Duration) -> String {
+pub(crate) fn format_duration_millis(duration: Duration) -> String {
     // Keep progress logs compact and stable: milliseconds are easy to compare
     // across runs when diagnosing host-side stalls.
     format!("{:.1}", duration.as_secs_f64() * 1_000.0)
@@ -136,7 +136,7 @@ pub(super) fn format_duration_millis(duration: Duration) -> String {
 
 // Render large counts/rates in a stable human-readable format so benchmark logs
 // remain easy to scan while still preserving approximate magnitude.
-pub(super) fn format_human_count(value: f64) -> String {
+pub(crate) fn format_human_count(value: f64) -> String {
     const UNITS: [(&str, f64); 4] = [
         ("trillion", 1_000_000_000_000.0),
         ("billion", 1_000_000_000.0),
@@ -164,7 +164,7 @@ pub(super) fn format_human_count(value: f64) -> String {
 // Print the final timing breakdown and batch statistics. This intentionally
 // separates end-to-end throughput from GPU-only throughput to highlight host
 // bottlenecks (parsing, prep, synchronization).
-pub(super) fn print_final_stats(
+pub(crate) fn print_final_stats(
     candidates_tested: u64,
     elapsed: Duration,
     rate_end_to_end: f64,

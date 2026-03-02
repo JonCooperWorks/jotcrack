@@ -6,11 +6,12 @@ use crate::commands::common::batch::{DispatchBatchView, WordBatch};
 use crate::commands::common::stats::{BatchDispatchTimings, format_human_count};
 
 // Embed the Metal source into the binary so release builds do not depend on a
-// runtime-relative source file path.
-const METAL_SOURCE_EMBEDDED: &str = include_str!("hs256_wordlist.metal");
+// runtime-relative source file path.  HS384 shares the HS512 Metal source
+// (which contains both hs384_* and hs512_* kernel entry points).
+const METAL_SOURCE_EMBEDDED: &str = include_str!("../common/hs512_wordlist.metal");
 // We keep both kernels loaded and choose per batch based on candidate lengths.
-const METAL_FUNCTION_NAME_MIXED: &str = "hs256_wordlist";
-const METAL_FUNCTION_NAME_SHORT_KEYS: &str = "hs256_wordlist_short_keys";
+const METAL_FUNCTION_NAME_MIXED: &str = "hs384_wordlist";
+const METAL_FUNCTION_NAME_SHORT_KEYS: &str = "hs384_wordlist_short_keys";
 // The GPU writes the first matching *batch-local* candidate index here (the
 // thread's `gid`, i.e. `0..candidate_count-1`), not an absolute wordlist index.
 //
@@ -23,13 +24,18 @@ const RESULT_NOT_FOUND_SENTINEL: u32 = u32::MAX;
 
 // Host -> Metal parameter block. `#[repr(C)]` is required because Rust and the
 // Metal kernel must agree on the exact field order and byte layout.
+//
+// HS384 and HS512 share the same param struct layout. For HS384 only the first
+// 6 words of `target_signature` carry the 48-byte (384-bit) digest; words 6-7
+// are zeroed.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-struct Hs256BruteForceParams {
-    // Optimization: stored as [u32; 8] big-endian words (converted from [u8; 32]
-    // at upload time in `encode_and_commit_view`) so the GPU kernel can compare
-    // the final HMAC state words directly without per-thread byte-to-word loads.
-    target_signature: [u32; 8],
+struct Hs512BruteForceParams {
+    // Stored as [u64; 8] big-endian words (converted from [u8; 48] at upload
+    // time in `encode_and_commit_view`) so the GPU kernel can compare the final
+    // HMAC state words directly without per-thread byte-to-word loads.
+    // For HS384: first 6 words from big-endian bytes, words 6-7 = 0.
+    target_signature: [u64; 8],
     // `message_length` is precomputed on the host so the kernel does not need
     // to infer it from buffers or rely on implicit buffer metadata.
     message_length: u32,
@@ -40,7 +46,7 @@ struct Hs256BruteForceParams {
 //
 // Large per-batch payload buffers now live in `WordBatch` and are recycled
 // producer<->consumer, which removes the old extra host copy before dispatch.
-pub(super) struct GpuHs256BruteForcer {
+pub(super) struct GpuHs384BruteForcer {
     pub(super) device: metal::Device,
     queue: metal::CommandQueue,
     pipeline_mixed: metal::ComputePipelineState,
@@ -71,7 +77,7 @@ fn copy_value_to_buffer<T>(buffer: &metal::Buffer, value: &T) {
     copy_bytes_to_buffer(buffer, bytes_of(value));
 }
 
-impl GpuHs256BruteForcer {
+impl GpuHs384BruteForcer {
     // Compile the Metal kernels, create the command queue, and allocate the
     // small persistent buffers shared by every dispatch (params/JWT/result).
     pub(super) fn new(signing_input: &[u8]) -> anyhow::Result<Self> {
@@ -114,7 +120,7 @@ impl GpuHs256BruteForcer {
         let options = MTLResourceOptions::StorageModeShared;
 
         let params_buf =
-            device.new_buffer(std::mem::size_of::<Hs256BruteForceParams>() as u64, options);
+            device.new_buffer(std::mem::size_of::<Hs512BruteForceParams>() as u64, options);
         let msg_buf = device.new_buffer(signing_input.len().max(1) as u64, options);
         // The JWT signing input is constant across the entire run, so upload it
         // once and reuse the same shared buffer for every dispatch.
@@ -137,13 +143,13 @@ impl GpuHs256BruteForcer {
     }
 
     // Select the specialized short-key kernel when every candidate in the
-    // dispatch view is <= 64 bytes; otherwise fall back to the mixed kernel.
+    // dispatch view is <= 128 bytes; otherwise fall back to the mixed kernel.
     // `DispatchBatchView` lets autotune reuse this logic on a sampled prefix.
     fn active_pipeline_for_view(
         &self,
         batch: DispatchBatchView<'_>,
     ) -> &metal::ComputePipelineState {
-        if batch.max_word_len <= 64 {
+        if batch.max_word_len <= 128 {
             &self.pipeline_short_keys
         } else {
             &self.pipeline_mixed
@@ -194,7 +200,7 @@ impl GpuHs256BruteForcer {
     // the next dispatch (params_buf/result_buf are shared across dispatches).
     pub(super) fn encode_and_commit(
         &self,
-        target_signature: [u8; 32],
+        target_signature: [u8; 48],
         batch: &WordBatch,
     ) -> anyhow::Result<(metal::CommandBuffer, Duration, Duration)> {
         self.encode_and_commit_view(
@@ -206,7 +212,7 @@ impl GpuHs256BruteForcer {
 
     fn encode_and_commit_view(
         &self,
-        target_signature: [u8; 32],
+        target_signature: [u8; 48],
         batch: DispatchBatchView<'_>,
         threadgroup_width: usize,
     ) -> anyhow::Result<(metal::CommandBuffer, Duration, Duration)> {
@@ -216,19 +222,24 @@ impl GpuHs256BruteForcer {
             bail!("cannot encode empty batch for async dispatch");
         }
 
-        // Optimization: convert [u8; 32] → [u32; 8] big-endian on the host so
-        // the kernel compares word-against-word without per-thread load_be_u32.
-        let mut target_words = [0u32; 8];
-        for i in 0..8 {
-            let off = i * 4;
-            target_words[i] = u32::from_be_bytes([
+        // Convert [u8; 48] -> [u64; 8] big-endian on the host so the kernel
+        // compares word-against-word without per-thread byte-to-u64 loads.
+        // HS384 produces 48 bytes (6 u64 words); words 6-7 are zeroed.
+        let mut target_words = [0u64; 8];
+        for i in 0..6 {
+            let off = i * 8;
+            target_words[i] = u64::from_be_bytes([
                 target_signature[off],
                 target_signature[off + 1],
                 target_signature[off + 2],
                 target_signature[off + 3],
+                target_signature[off + 4],
+                target_signature[off + 5],
+                target_signature[off + 6],
+                target_signature[off + 7],
             ]);
         }
-        let params = Hs256BruteForceParams {
+        let params = Hs512BruteForceParams {
             target_signature: target_words,
             message_length: self.message_length,
             candidate_count,
@@ -292,7 +303,7 @@ impl GpuHs256BruteForcer {
     // Used by autotune and test paths where pipelining is not needed.
     fn dispatch_batch_view(
         &self,
-        target_signature: [u8; 32],
+        target_signature: [u8; 48],
         batch: DispatchBatchView<'_>,
         threadgroup_width: usize,
     ) -> anyhow::Result<(Option<u32>, BatchDispatchTimings)> {
@@ -324,7 +335,7 @@ impl GpuHs256BruteForcer {
     // choosing a GPU execution parameter, not host parsing behavior.
     pub(super) fn autotune_threadgroup_width(
         &mut self,
-        target_signature: [u8; 32],
+        target_signature: [u8; 48],
         batch: &WordBatch,
     ) -> anyhow::Result<()> {
         let sample_count = batch.candidate_count().min(16_384);
@@ -404,9 +415,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hs256_params_round_trip_size_matches() {
-        let params = Hs256BruteForceParams::default();
+    fn hs512_params_round_trip_size_matches() {
+        let params = Hs512BruteForceParams::default();
         let bytes = bytes_of(&params);
-        assert_eq!(bytes.len(), std::mem::size_of::<Hs256BruteForceParams>());
+        assert_eq!(bytes.len(), std::mem::size_of::<Hs512BruteForceParams>());
     }
 }

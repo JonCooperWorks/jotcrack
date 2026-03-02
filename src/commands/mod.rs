@@ -1,7 +1,10 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
+pub(crate) mod common;
 pub mod hs256wordlist;
+pub mod hs384wordlist;
+pub mod hs512wordlist;
 
 // Top-level CLI parser. Clap derives the argument parsing implementation from
 // this type so the rest of the program can work with structured values.
@@ -19,6 +22,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     Hs256wordlist(hs256wordlist::Hs256WordlistArgs),
+    Hs384wordlist(hs384wordlist::Hs384WordlistArgs),
+    Hs512wordlist(hs512wordlist::Hs512WordlistArgs),
 }
 
 /// Parse CLI arguments, dispatch the selected subcommand, and map the command
@@ -30,6 +35,8 @@ pub fn run() -> ExitCode {
     // test without shelling out to the binary.
     let result = match cli.command {
         Commands::Hs256wordlist(args) => hs256wordlist::run(args),
+        Commands::Hs384wordlist(args) => hs384wordlist::run(args),
+        Commands::Hs512wordlist(args) => hs512wordlist::run(args),
     };
 
     match result {
@@ -56,7 +63,9 @@ mod tests {
     fn clap_cli_parses_hs256wordlist_with_default_wordlist() {
         let cli = Cli::try_parse_from(["jotcrack", "hs256wordlist", "abc.def.ghi"]).unwrap();
 
-        let Commands::Hs256wordlist(args) = cli.command;
+        let Commands::Hs256wordlist(args) = cli.command else {
+            panic!("expected Hs256wordlist");
+        };
         assert_eq!(args.jwt, "abc.def.ghi");
         assert_eq!(
             args.wordlist,
@@ -107,7 +116,9 @@ mod tests {
         ])
         .unwrap();
 
-        let Commands::Hs256wordlist(args) = cli.command;
+        let Commands::Hs256wordlist(args) = cli.command else {
+            panic!("expected Hs256wordlist");
+        };
         assert_eq!(args.wordlist, PathBuf::from("custom.txt"));
     }
 
@@ -125,7 +136,9 @@ mod tests {
         ])
         .unwrap();
 
-        let Commands::Hs256wordlist(args) = cli.command;
+        let Commands::Hs256wordlist(args) = cli.command else {
+            panic!("expected Hs256wordlist");
+        };
         assert_eq!(args.threads_per_group, Some(512));
         assert_eq!(args.parser_threads, Some(3));
         assert_eq!(args.pipeline_depth, None);
@@ -144,7 +157,9 @@ mod tests {
         ])
         .unwrap();
 
-        let Commands::Hs256wordlist(args) = cli.command;
+        let Commands::Hs256wordlist(args) = cli.command else {
+            panic!("expected Hs256wordlist");
+        };
         assert_eq!(args.pipeline_depth, Some(10));
     }
 
@@ -159,7 +174,9 @@ mod tests {
         ])
         .unwrap();
 
-        let Commands::Hs256wordlist(args) = cli.command;
+        let Commands::Hs256wordlist(args) = cli.command else {
+            panic!("expected Hs256wordlist");
+        };
         assert_eq!(args.packer_threads, Some(3));
     }
 

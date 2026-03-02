@@ -21,16 +21,16 @@ use std::io::BufRead;
 // This is copied into `ProducerMessage` so the consumer can print final `STATS`
 // without reaching into parser internals or sharing mutable state across
 // threads.
-pub(super) struct ParserStats {
-    pub(super) parser_threads: usize,
-    pub(super) parser_chunk_bytes: usize,
-    pub(super) parser_chunks: u64,
-    pub(super) parser_skipped_oversize: u64,
+pub(crate) struct ParserStats {
+    pub(crate) parser_threads: usize,
+    pub(crate) parser_chunk_bytes: usize,
+    pub(crate) parser_chunks: u64,
+    pub(crate) parser_skipped_oversize: u64,
 }
 
 // Shared helper used by parser tests to verify CRLF/LF parity.
 #[cfg(test)]
-pub(super) fn trim_line_endings(bytes: &[u8]) -> &[u8] {
+pub(crate) fn trim_line_endings(bytes: &[u8]) -> &[u8] {
     let mut end = bytes.len();
     while end > 0 && (bytes[end - 1] == b'\n' || bytes[end - 1] == b'\r') {
         end -= 1;
@@ -43,7 +43,7 @@ pub(super) fn trim_line_endings(bytes: &[u8]) -> &[u8] {
 // Keeping this path test-only lets us use `Cursor` for parser behavior tests
 // without carrying a slower runtime fallback that would skew performance tuning.
 #[cfg(test)]
-pub(super) struct BufferedWordlistBatchReader<R: BufRead> {
+pub(crate) struct BufferedWordlistBatchReader<R: BufRead> {
     device: Device,
     reader: R,
     line_buf: Vec<u8>,
@@ -57,7 +57,7 @@ pub(super) struct BufferedWordlistBatchReader<R: BufRead> {
 #[cfg(test)]
 impl<R: BufRead> BufferedWordlistBatchReader<R> {
     // Construct a buffered batch reader over any `BufRead` source.
-    pub(super) fn new(device: Device, reader: R) -> Self {
+    pub(crate) fn new(device: Device, reader: R) -> Self {
         Self {
             device,
             reader,
@@ -72,11 +72,11 @@ impl<R: BufRead> BufferedWordlistBatchReader<R> {
     // buffer plus offset/length tables. This is where most host-side parsing
     // time is spent, so allocation and copies are kept minimal.
     #[cfg(test)]
-    pub(super) fn next_batch(&mut self) -> anyhow::Result<Option<WordBatch>> {
+    pub(crate) fn next_batch(&mut self) -> anyhow::Result<Option<WordBatch>> {
         self.next_batch_reusing(None)
     }
 
-    pub(super) fn next_batch_reusing(
+    pub(crate) fn next_batch_reusing(
         &mut self,
         recycled: Option<WordBatch>,
     ) -> anyhow::Result<Option<WordBatch>> {
@@ -166,7 +166,7 @@ impl<R: BufRead> BufferedWordlistBatchReader<R> {
 // test-only reference implementation so parser behavior can be compared in
 // unit tests (especially ordering and line-trimming semantics).
 #[cfg(test)]
-pub(super) struct MmapWordlistBatchReader {
+pub(crate) struct MmapWordlistBatchReader {
     device: Device,
     mmap: Mmap,
     cursor: usize,
@@ -178,7 +178,7 @@ pub(super) struct MmapWordlistBatchReader {
 #[cfg(test)]
 impl MmapWordlistBatchReader {
     // Wrap a mapped wordlist file for sequential batch extraction.
-    pub(super) fn new(device: Device, mmap: Mmap) -> Self {
+    pub(crate) fn new(device: Device, mmap: Mmap) -> Self {
         Self {
             device,
             mmap,
@@ -189,7 +189,7 @@ impl MmapWordlistBatchReader {
 
     // Scan the mmap for newline-delimited candidates while preserving the same
     // batching semantics as the buffered reader.
-    pub(super) fn next_batch_reusing(
+    pub(crate) fn next_batch_reusing(
         &mut self,
         recycled: Option<WordBatch>,
     ) -> anyhow::Result<Option<WordBatch>> {
@@ -336,15 +336,15 @@ struct BatchPlanSegment {
 #[derive(Debug, Clone)]
 // Host-side batch plan produced by the ordered parser/planner stage and later
 // materialized into a `WordBatch` by a packer worker.
-pub(super) struct BatchPlan {
-    pub(super) seq_no: u64,
+pub(crate) struct BatchPlan {
+    pub(crate) seq_no: u64,
     candidate_index_base: u64,
     candidate_count: usize,
     word_bytes_len: usize,
     max_word_len: u16,
     segments: Vec<BatchPlanSegment>,
-    pub(super) parser_stats: ParserStats,
-    pub(super) plan_time: Duration,
+    pub(crate) parser_stats: ParserStats,
+    pub(crate) plan_time: Duration,
 }
 
 // Split the mapped file into newline-aligned chunks for parallel scanning.
@@ -487,7 +487,7 @@ fn parse_mmap_chunk(bytes: &[u8], job: ChunkJob) -> anyhow::Result<ParsedChunk> 
 //
 // This helper is used by both the direct reader path (tests/reference behavior)
 // and the producer packer workers so packing logic stays identical.
-pub(super) fn pack_batch_plan_into_batch(
+pub(crate) fn pack_batch_plan_into_batch(
     mmap: &Mmap,
     plan: &BatchPlan,
     batch: &mut WordBatch,
@@ -552,7 +552,7 @@ pub(super) fn pack_batch_plan_into_batch(
 //
 // This keeps concurrent code focused on pure parsing and preserves the existing
 // GPU dispatch contract (`WordBatch`) without parallel writes into Metal memory.
-pub(super) struct ParallelMmapWordlistBatchReader {
+pub(crate) struct ParallelMmapWordlistBatchReader {
     #[cfg(test)]
     device: Device,
     mmap: Arc<Mmap>,
@@ -598,7 +598,7 @@ impl ParallelMmapWordlistBatchReader {
     // 1) map+plan chunks (already done before this call)
     // 2) create bounded channels (backpressure)
     // 3) spawn worker threads that parse chunk metadata only
-    pub(super) fn new(device: Device, mmap: Mmap, config: ParserConfig) -> anyhow::Result<Self> {
+    pub(crate) fn new(device: Device, mmap: Mmap, config: ParserConfig) -> anyhow::Result<Self> {
         #[cfg(not(test))]
         let _ = device;
         let mmap = Arc::new(mmap);
@@ -668,11 +668,11 @@ impl ParallelMmapWordlistBatchReader {
 
     // Cheap snapshot consumed by the producer so progress/final reporting can
     // include parser counters without shared atomics or locks.
-    pub(super) fn parser_stats(&self) -> ParserStats {
+    pub(crate) fn parser_stats(&self) -> ParserStats {
         self.parser_stats
     }
 
-    pub(super) fn shared_mmap(&self) -> Arc<Mmap> {
+    pub(crate) fn shared_mmap(&self) -> Arc<Mmap> {
         Arc::clone(&self.mmap)
     }
 
@@ -790,7 +790,7 @@ impl ParallelMmapWordlistBatchReader {
     // Edge case: the first candidate in a batch is exempt from the byte cap
     // (allows a single oversized candidate to form its own batch).  We handle
     // this by entering Phase 1 only after candidate_count > 0.
-    pub(super) fn next_batch_plan(&mut self) -> anyhow::Result<Option<BatchPlan>> {
+    pub(crate) fn next_batch_plan(&mut self) -> anyhow::Result<Option<BatchPlan>> {
         let plan_started = Instant::now();
         let candidate_index_base = self.next_index;
         let mut segments = Vec::new();
@@ -922,7 +922,7 @@ impl ParallelMmapWordlistBatchReader {
     // Build the next GPU batch by first planning deterministic boundaries and
     // then materializing the planned payload into a `WordBatch`.
     #[cfg(test)]
-    pub(super) fn next_batch_reusing(
+    pub(crate) fn next_batch_reusing(
         &mut self,
         recycled: Option<WordBatch>,
     ) -> anyhow::Result<Option<WordBatch>> {
@@ -954,14 +954,14 @@ impl Drop for ParallelMmapWordlistBatchReader {
 
 // Small abstraction so the producer thread can remain agnostic to reader
 // details. Runtime currently has a single concrete path (parallel mmap parser).
-pub(super) enum AnyWordlistBatchReader {
+pub(crate) enum AnyWordlistBatchReader {
     ParallelMmap(ParallelMmapWordlistBatchReader),
 }
 
 impl AnyWordlistBatchReader {
     // Runtime path is mmap-only. If mapping fails, return an error instead of
     // silently switching to a slower path (which would hide perf regressions).
-    pub(super) fn new(
+    pub(crate) fn new(
         device: Device,
         path: &PathBuf,
         parser_config: ParserConfig,
@@ -981,19 +981,19 @@ impl AnyWordlistBatchReader {
         )?))
     }
 
-    pub(super) fn parser_stats(&self) -> ParserStats {
+    pub(crate) fn parser_stats(&self) -> ParserStats {
         match self {
             Self::ParallelMmap(reader) => reader.parser_stats(),
         }
     }
 
-    pub(super) fn shared_mmap(&self) -> Arc<Mmap> {
+    pub(crate) fn shared_mmap(&self) -> Arc<Mmap> {
         match self {
             Self::ParallelMmap(reader) => reader.shared_mmap(),
         }
     }
 
-    pub(super) fn next_batch_plan(&mut self) -> anyhow::Result<Option<BatchPlan>> {
+    pub(crate) fn next_batch_plan(&mut self) -> anyhow::Result<Option<BatchPlan>> {
         match self {
             Self::ParallelMmap(reader) => reader.next_batch_plan(),
         }

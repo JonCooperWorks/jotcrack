@@ -2,9 +2,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 
-use super::args::{DEFAULT_PIPELINE_DEPTH, Hs256WordlistArgs};
-use super::gpu::GpuHs256BruteForcer;
-use super::jwt::parse_hs256_jwt;
+use super::args::{DEFAULT_PIPELINE_DEPTH, Hs384WordlistArgs};
+use super::gpu::GpuHs384BruteForcer;
+use super::jwt::parse_hs384_jwt;
 use crate::commands::common::batch::APPROX_WORD_BATCH_BUFFER_BYTES;
 use crate::commands::common::producer::{ProducerMessage, WordlistProducer};
 use crate::commands::common::stats::{
@@ -44,18 +44,18 @@ fn handle_match(
         .batch
         .word_string_lossy(local_index)
         .ok_or_else(|| anyhow!("GPU returned invalid local candidate index"))?;
-    println!("HS256 key: {secret}");
+    println!("HS384 key: {secret}");
     Ok(true)
 }
 
-/// End-to-end HS256 cracking flow:
+/// End-to-end HS384 cracking flow:
 /// 1) parse the JWT,
 /// 2) initialize Metal + reusable buffers,
 /// 3) overlap wordlist parsing with GPU dispatch,
 /// 4) report the first matching secret (or NOT FOUND).
-pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
-    let (signing_input, target_signature) = parse_hs256_jwt(&args.jwt)?;
-    let mut gpu = GpuHs256BruteForcer::new(&signing_input)?;
+pub fn run(args: Hs384WordlistArgs) -> anyhow::Result<bool> {
+    let (signing_input, target_signature) = parse_hs384_jwt(&args.jwt)?;
+    let mut gpu = GpuHs384BruteForcer::new(&signing_input)?;
     let parser_config = args.parser_config();
     let pipeline_depth = args.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH);
     let packer_threads = args
@@ -259,5 +259,42 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
         (Err(err), _) => Err(err),
         (Ok(_), Err(err)) => Err(err),
         (Ok(found), Ok(())) => Ok(found),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::args::Hs384WordlistArgs;
+    use crate::commands::common::test_support::{make_test_jwt, write_temp_wordlist};
+    use std::path::PathBuf;
+
+    fn make_args(jwt: &str, wordlist: PathBuf) -> Hs384WordlistArgs {
+        Hs384WordlistArgs {
+            jwt: jwt.to_string(),
+            wordlist,
+            threads_per_group: None,
+            parser_threads: Some(1),
+            pipeline_depth: Some(2),
+            packer_threads: Some(1),
+            autotune: false,
+        }
+    }
+
+    #[test]
+    fn hs384_cracks_known_secret() {
+        let jwt = make_test_jwt("HS384", r#"{"sub":"test"}"#, b"password");
+        let path = write_temp_wordlist(b"wrong1\nwrong2\npassword\nwrong3\n");
+        let result = super::run(make_args(&jwt, path.clone())).unwrap();
+        assert!(result, "expected HS384 crack to find 'password'");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hs384_reports_not_found() {
+        let jwt = make_test_jwt("HS384", r#"{"sub":"test"}"#, b"43i358hsfksdbfffsdf");
+        let path = write_temp_wordlist(b"wrong1\nwrong2\nwrong3\n");
+        let result = super::run(make_args(&jwt, path.clone())).unwrap();
+        assert!(!result, "expected HS384 crack to report not found");
+        let _ = std::fs::remove_file(path);
     }
 }

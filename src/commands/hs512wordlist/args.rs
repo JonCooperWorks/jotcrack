@@ -10,8 +10,8 @@ pub(crate) const DEFAULT_PIPELINE_DEPTH: usize =
     crate::commands::common::args::DEFAULT_PIPELINE_DEPTH;
 
 #[derive(Debug, Clone, Args)]
-pub struct Hs256WordlistArgs {
-    /// JWT in compact form (`header.payload.signature`) with `alg=HS256`.
+pub struct Hs512WordlistArgs {
+    /// JWT in compact form (`header.payload.signature`) with `alg=HS512`.
     pub jwt: String,
     /// Wordlist file path (one candidate secret per line).
     #[arg(long, default_value = DEFAULT_WORDLIST_PATH)]
@@ -33,7 +33,7 @@ pub struct Hs256WordlistArgs {
     pub autotune: bool,
 }
 
-impl Hs256WordlistArgs {
+impl Hs512WordlistArgs {
     pub(super) fn parser_config(&self) -> ParserConfig {
         ParserConfig::resolve(self.parser_threads)
     }
