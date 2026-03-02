@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,7 +10,7 @@ use memmap2::{Advice, Mmap, MmapOptions};
 use metal::Device;
 
 use super::args::ParserConfig;
-use super::batch::{WordBatch, batch_shape_can_fit};
+use super::batch::{WordBatch, batch_shape_can_fit, batch_shape_can_fit_block};
 
 #[cfg(test)]
 use std::io::BufRead;
@@ -274,6 +273,33 @@ struct ChunkJob {
     end: usize,
 }
 
+// Optimization: block-summary planner
+//
+// The serial planner decides batch boundaries by checking whether each
+// candidate line fits into the current batch (count cap + byte cap).
+// With ~6.2M candidates per batch and ~70 batches/sec this was 434M
+// loop iterations/sec on a single thread — a measurable bottleneck.
+//
+// Block summaries let the planner skip 4096 lines at a time.  During
+// parsing we precompute (line_count, total_bytes, max_len) for every
+// 4096-line block.  The planner first tries to consume whole blocks in
+// O(1) each, falling back to per-line scanning only at the batch
+// boundary.  This reduces inner-loop iterations from ~6.2M to ~5,600
+// per batch (~1100× reduction).
+//
+// Correctness: the block check is conservative — if candidate_count +
+// block.line_count and word_bytes + block.total_bytes both fit, then
+// every intermediate state during line-by-line consumption also fits.
+// So batch boundaries are identical to the per-line-only path.
+const PLANNER_BLOCK_STRIDE: usize = 4096;
+
+#[derive(Debug, Clone, Copy)]
+struct BlockSummary {
+    line_count: u32,
+    total_bytes: u32,
+    max_len: u16,
+}
+
 #[derive(Debug)]
 // Parsed metadata for one chunk.
 //
@@ -285,6 +311,7 @@ struct ParsedChunk {
     offsets_rel: Vec<u32>,
     lengths: Vec<u16>,
     skipped_oversize: u64,
+    block_summaries: Vec<BlockSummary>,
 }
 
 #[derive(Debug)]
@@ -375,9 +402,19 @@ fn parse_mmap_chunk(bytes: &[u8], job: ChunkJob) -> anyhow::Result<ParsedChunk> 
         );
     }
 
+    // Optimization: pre-allocated metadata Vecs
+    //
+    // Without with_capacity, pushing ~3.2M entries into an empty Vec causes
+    // ~22 reallocations (doubling from 0 → 1 → 2 → 4 → ... → 4M), each
+    // copying the entire vec.  Estimating capacity up front (chunk_bytes / 6
+    // for ~5-byte avg candidates + newline) eliminates all growth copies.
+    // Over-estimating by 2× wastes some temporary memory; under-estimating
+    // by 2× causes a single extra reallocation — both are cheap compared to
+    // 22 cascading copies.
     let chunk = &bytes[job.start..job.end];
-    let mut offsets_rel = Vec::new();
-    let mut lengths = Vec::new();
+    let estimated_lines = chunk.len() / 6;
+    let mut offsets_rel = Vec::with_capacity(estimated_lines);
+    let mut lengths: Vec<u16> = Vec::with_capacity(estimated_lines);
     let mut skipped_oversize = 0u64;
     let mut cursor = 0usize;
 
@@ -417,12 +454,32 @@ fn parse_mmap_chunk(bytes: &[u8], job: ChunkJob) -> anyhow::Result<ParsedChunk> 
         cursor = next_cursor;
     }
 
+    // Build block summaries for the fast planner (see "Optimization: block-
+    // summary planner" above).  This is an O(n) pass over the lengths vec,
+    // running on parallel parser worker threads, so it adds negligible cost
+    // relative to the memchr-based line scanning that precedes it.
+    let num_blocks = (lengths.len() + PLANNER_BLOCK_STRIDE - 1) / PLANNER_BLOCK_STRIDE;
+    let mut block_summaries = Vec::with_capacity(num_blocks);
+    for block_start in (0..lengths.len()).step_by(PLANNER_BLOCK_STRIDE) {
+        let block_end = (block_start + PLANNER_BLOCK_STRIDE).min(lengths.len());
+        let slice = &lengths[block_start..block_end];
+        let line_count = slice.len() as u32;
+        let total_bytes: u32 = slice.iter().map(|&l| l as u32).sum();
+        let max_len: u16 = slice.iter().copied().max().unwrap_or(0);
+        block_summaries.push(BlockSummary {
+            line_count,
+            total_bytes,
+            max_len,
+        });
+    }
+
     Ok(ParsedChunk {
         chunk_id: job.chunk_id,
         chunk_start: job.start,
         offsets_rel,
         lengths,
         skipped_oversize,
+        block_summaries,
     })
 }
 
@@ -510,8 +567,23 @@ pub(super) struct ParallelMmapWordlistBatchReader {
     job_tx: Option<crossbeam_channel::Sender<ChunkJob>>,
     result_rx: crossbeam_channel::Receiver<ParserWorkerMessage>,
     worker_handles: Vec<JoinHandle<()>>,
-    // Out-of-order worker results buffered until `next_chunk_to_emit` arrives.
-    pending_results: BTreeMap<u64, Arc<ParsedChunk>>,
+    // Optimization: pending ring for chunk reordering
+    //
+    // Parser workers return chunks out of order but we must emit them in
+    // file order.  The old BTreeMap<u64, Arc<ParsedChunk>> had O(log n)
+    // insert/remove and allocated a tree node per entry.  Because chunk
+    // IDs are monotonically increasing and at most `max_in_flight_jobs`
+    // can be in-flight simultaneously, we can use a fixed-size ring
+    // indexed by `chunk_id % capacity`.  This gives O(1) insert/lookup,
+    // zero heap allocations, and better cache locality for the small
+    // window sizes used in practice (typically 8–60 entries).
+    //
+    // Safety: no two in-flight chunks map to the same slot because
+    // capacity ≥ max_in_flight_jobs and chunk IDs are unique and
+    // consumed in order, so the slot is always empty when a new chunk
+    // arrives.
+    pending_ring: Vec<Option<Arc<ParsedChunk>>>,
+    pending_ring_capacity: usize,
     // Current parsed chunk being drained into a `WordBatch`.
     active_chunk: Option<Arc<ParsedChunk>>,
     active_chunk_line_cursor: usize,
@@ -581,7 +653,8 @@ impl ParallelMmapWordlistBatchReader {
             job_tx: Some(job_tx),
             result_rx,
             worker_handles,
-            pending_results: BTreeMap::new(),
+            pending_ring: (0..config.queue_capacity.max(1)).map(|_| None).collect(),
+            pending_ring_capacity: config.queue_capacity.max(1),
             active_chunk: None,
             active_chunk_line_cursor: 0,
             next_index: 0,
@@ -640,13 +713,11 @@ impl ParallelMmapWordlistBatchReader {
                     .parser_skipped_oversize
                     .saturating_add(chunk.skipped_oversize);
                 let chunk_id = chunk.chunk_id;
-                if self
-                    .pending_results
-                    .insert(chunk_id, Arc::new(chunk))
-                    .is_some()
-                {
+                let ring_idx = (chunk_id as usize) % self.pending_ring_capacity;
+                if self.pending_ring[ring_idx].is_some() {
                     bail!("duplicate parsed chunk id received from parser workers");
                 }
+                self.pending_ring[ring_idx] = Some(Arc::new(chunk));
                 Ok(())
             }
             ParserWorkerMessage::Error { chunk_id, message } => {
@@ -661,7 +732,8 @@ impl ParallelMmapWordlistBatchReader {
         if self.active_chunk.is_some() {
             return true;
         }
-        if let Some(chunk) = self.pending_results.remove(&self.next_chunk_to_emit) {
+        let ring_idx = (self.next_chunk_to_emit as usize) % self.pending_ring_capacity;
+        if let Some(chunk) = self.pending_ring[ring_idx].take() {
             self.active_chunk = Some(chunk);
             self.active_chunk_line_cursor = 0;
             return true;
@@ -702,9 +774,22 @@ impl ParallelMmapWordlistBatchReader {
 
     // Build the next GPU batch by draining parsed chunk metadata in file order.
     //
-    // Batch boundaries remain governed by the same `WordBatch::can_fit` rules as
-    // before; the redesign changes *how* we discover lines, not the
-    // deterministic batch boundaries.
+    // Two-phase approach (see "Optimization: block-summary planner"):
+    //
+    //   Phase 1 — coarse:  Walk the block_summaries array.  For each block,
+    //   check whether the entire block (line_count candidates, total_bytes
+    //   bytes) fits in the remaining batch capacity.  If yes, advance the
+    //   cursor by 4096 lines in one step.  If not, stop — the batch boundary
+    //   falls somewhere inside this block.
+    //
+    //   Phase 2 — fine:  Scan the remaining lines one at a time using the
+    //   original per-line capacity check until the batch is full or the chunk
+    //   is exhausted.  At most PLANNER_BLOCK_STRIDE (4096) lines are scanned
+    //   here, compared to ~6.2M in the old all-fine path.
+    //
+    // Edge case: the first candidate in a batch is exempt from the byte cap
+    // (allows a single oversized candidate to form its own batch).  We handle
+    // this by entering Phase 1 only after candidate_count > 0.
     pub(super) fn next_batch_plan(&mut self) -> anyhow::Result<Option<BatchPlan>> {
         let plan_started = Instant::now();
         let candidate_index_base = self.next_index;
@@ -726,14 +811,64 @@ impl ParallelMmapWordlistBatchReader {
             let segment_start = self.active_chunk_line_cursor;
             let mut line_cursor = segment_start;
 
-            // Drain as many lines from the current parsed chunk as will fit in
-            // this planned batch, leaving the cursor parked if the batch fills.
+            // Phase 1 (coarse): Skip entire blocks using precomputed summaries.
+            // Only applies when the batch already has at least one candidate
+            // (the first-candidate byte-cap exemption requires the fine path).
+            if candidate_count > 0 {
+                let mut block_idx = line_cursor / PLANNER_BLOCK_STRIDE;
+                // Start from the first full block boundary at or after line_cursor.
+                let mut block_line_start = block_idx * PLANNER_BLOCK_STRIDE;
+                // If line_cursor is mid-block, skip to the next full block.
+                if block_line_start < line_cursor {
+                    block_idx += 1;
+                    block_line_start = block_idx * PLANNER_BLOCK_STRIDE;
+                }
+                // Scan ahead with per-line checks to reach the next block boundary.
+                while line_cursor < block_line_start && line_cursor < chunk.lengths.len() {
+                    let line_len = chunk.lengths[line_cursor] as usize;
+                    if !batch_shape_can_fit(candidate_count, word_bytes_len, line_len) {
+                        break;
+                    }
+                    candidate_count += 1;
+                    word_bytes_len += line_len;
+                    max_word_len = max_word_len.max(line_len as u16);
+                    line_cursor += 1;
+                    self.next_index = self
+                        .next_index
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("candidate index overflow"))?;
+                }
+                // Now consume whole blocks.
+                if line_cursor == block_line_start {
+                    while block_idx < chunk.block_summaries.len() {
+                        let summary = chunk.block_summaries[block_idx];
+                        if !batch_shape_can_fit_block(
+                            candidate_count,
+                            word_bytes_len,
+                            summary.line_count as usize,
+                            summary.total_bytes as usize,
+                        ) {
+                            break;
+                        }
+                        candidate_count += summary.line_count as usize;
+                        word_bytes_len += summary.total_bytes as usize;
+                        max_word_len = max_word_len.max(summary.max_len);
+                        line_cursor += summary.line_count as usize;
+                        self.next_index = self
+                            .next_index
+                            .checked_add(summary.line_count as u64)
+                            .ok_or_else(|| anyhow!("candidate index overflow"))?;
+                        block_idx += 1;
+                    }
+                }
+            }
+
+            // Phase 2 (fine): Per-line scan for the remainder / boundary block.
             while line_cursor < chunk.lengths.len() {
                 let line_len = chunk.lengths[line_cursor] as usize;
                 if !batch_shape_can_fit(candidate_count, word_bytes_len, line_len) {
                     break;
                 }
-
                 candidate_count += 1;
                 word_bytes_len += line_len;
                 max_word_len = max_word_len.max(line_len as u16);

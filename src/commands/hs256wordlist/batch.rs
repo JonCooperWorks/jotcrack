@@ -55,6 +55,33 @@ pub(super) fn batch_shape_can_fit(
     !(would_exceed_count || would_exceed_bytes)
 }
 
+// Optimization: block-level batch capacity check
+//
+// Companion to batch_shape_can_fit() for the block-summary planner.
+// Instead of checking one candidate at a time, this checks whether an
+// entire block of `block_line_count` candidates totalling
+// `block_total_bytes` fits in the remaining batch capacity.
+//
+// The check is conservative: if the whole block fits, then every
+// intermediate state during line-by-line consumption also fits, so the
+// planner can skip 4096 lines in one step without altering batch
+// boundaries.
+//
+// Caller must ensure `candidate_count > 0` before calling — the first-
+// candidate byte-cap exemption (allowing a single large candidate to
+// form its own batch) is handled by falling through to the per-line
+// path in the planner.
+pub(super) fn batch_shape_can_fit_block(
+    candidate_count: usize,
+    word_bytes_len: usize,
+    block_line_count: usize,
+    block_total_bytes: usize,
+) -> bool {
+    let would_exceed_count = candidate_count + block_line_count > MAX_CANDIDATES_PER_BATCH;
+    let would_exceed_bytes = word_bytes_len + block_total_bytes > MAX_WORD_BYTES_PER_BATCH;
+    !(would_exceed_count || would_exceed_bytes)
+}
+
 impl WordBatch {
     // Allocate fixed-capacity shared buffers sized to the batch caps so parser
     // writes can go straight into memory later bound to the kernel.
