@@ -26,7 +26,7 @@ const RESULT_NOT_FOUND_SENTINEL: u32 = u32::MAX;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct Hs256BruteForceParams {
-    target_signature: [u8; 32],
+    target_signature: [u32; 8],
     // `message_length` is precomputed on the host so the kernel does not need
     // to infer it from buffers or rely on implicit buffer metadata.
     message_length: u32,
@@ -213,8 +213,18 @@ impl GpuHs256BruteForcer {
             bail!("cannot encode empty batch for async dispatch");
         }
 
+        let mut target_words = [0u32; 8];
+        for i in 0..8 {
+            let off = i * 4;
+            target_words[i] = u32::from_be_bytes([
+                target_signature[off],
+                target_signature[off + 1],
+                target_signature[off + 2],
+                target_signature[off + 3],
+            ]);
+        }
         let params = Hs256BruteForceParams {
-            target_signature,
+            target_signature: target_words,
             message_length: self.message_length,
             candidate_count,
         };

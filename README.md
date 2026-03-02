@@ -122,7 +122,7 @@ Benchmarking guidance:
 - Keep the machine in a similar thermal/power state.
 - Record candidate count and elapsed time along with the reported rate.
 
-## Documented tuned run (2026-02-27)
+## Documented tuned run (2026-03-02)
 
 Exact command used (112GB wordlist):
 
@@ -144,9 +144,9 @@ cargo run --release -- hs256wordlist --threads-per-group 256 --wordlist wordlist
 ```text
 STATS
   tested: 16.4 billion
-  elapsed: 40.66s
-  rate_end_to_end: 404 million/s
-  rate_gpu_only: 408 million/s
+  elapsed: 37.91s
+  rate_end_to_end: 434 million/s
+  rate_gpu_only: 441 million/s
   batches: 2720
   avg_candidates_per_batch: 6.05 million
   avg_word_bytes_per_batch: 31.0 million bytes
@@ -154,19 +154,40 @@ STATS
   packer_threads: 6
   parser_threads: 15
   parser_chunk_bytes: 16.8 million bytes
-  parser_chunks: 6961
+  parser_chunks: 6958
   parser_skipped_oversize: 0
-  timing.wordlist_batch_build: 137.189s
-  timing.wordlist_batch_plan: 32.340s
-  timing.wordlist_batch_pack: 104.849s
-  timing.consumer_idle_wait: 0.141s
-  timing.host_prep: 0.000s
-  timing.command_encode: 0.087s
-  timing.gpu_wait: 40.303s
+  timing.wordlist_batch_build: 141.025s
+  timing.wordlist_batch_plan: 33.673s
+  timing.wordlist_batch_pack: 107.351s
+  timing.consumer_idle_wait: 0.499s
+  timing.host_prep: 0.001s
+  timing.command_encode: 0.090s
+  timing.gpu_wait: 37.275s
   timing.result_readback: 0.003s
-  timing.dispatch_total: 40.394s
+  timing.dispatch_total: 37.369s
 NOT FOUND
 ```
+
+### Previous run (2026-02-27, pre-optimization baseline)
+
+```text
+STATS
+  tested: 16.4 billion
+  elapsed: 40.66s
+  rate_end_to_end: 404 million/s
+  rate_gpu_only: 408 million/s
+  timing.gpu_wait: 40.303s
+```
+
+### Kernel optimizations (2026-03-02)
+
+Three GPU kernel changes reduced per-thread register pressure:
+
+1. **Rolling 16-word message schedule**: `w[16]` replaces `w[64]` in SHA-256 compression, saving ~192 bytes register pressure per call. Rounds 16-63 update `w[i&15]` in-place.
+2. **Flat specialized HMAC**: Bare `uint32_t state[8]` arrays replace `Sha256Ctx` (76 bytes: `block[64]` + `block_len` + `total_len`), eliminating the streaming context from the hot path. Message blocks are processed directly from constant memory with manual finalization.
+3. **Precomputed target signature**: Host converts `[u8; 32]` to `[u32; 8]` big-endian words, eliminating per-thread `load_be_u32` calls in the comparison loop.
+
+**Result**: GPU compute time dropped from 40.3s to 37.3s for the same 16.4B candidates (8% improvement, GPU-bound). Peak GPU throughput reaches 530M+/s when the host can feed fast enough (at `--threads-per-group 1024`, the GPU outpaces the host parser).
 
 ### Interpretation
 

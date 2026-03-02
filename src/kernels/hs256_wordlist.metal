@@ -5,7 +5,7 @@ using namespace metal;
 
 // Host-to-kernel parameter block. Rust uploads this as `buffer(0)` with the exact same field order/layout.
 struct Hs256BruteForceParams {
-    uint8_t target_signature[32];      // Expected HS256 HMAC digest (32 bytes) we compare against.
+    uint32_t target_signature[8];      // Expected HS256 HMAC digest as 8 big-endian uint32_t words (precomputed on host).
     uint32_t message_length;           // Actual byte length of `message_bytes` (the JWT `header.payload` string).
     uint32_t candidate_count;          // Number of candidate secrets in this GPU batch.
 };
@@ -117,100 +117,103 @@ static inline void sha256_init(thread Sha256Ctx& ctx) {
     ctx.total_len = 0;          // No bytes processed yet.
 }
 
-// Compress exactly one 64-byte SHA-256 block into the running state.
-#define SHA256_EXPAND(i) \
-    w[(i)] = ssig1(w[(i) - 2]) + w[(i) - 7] + ssig0(w[(i) - 15]) + w[(i) - 16]
+// Rolling 16-word message schedule: w[16] replaces w[64], saving ~192 bytes
+// of register pressure per compression. Rounds 0-15 use w[i] directly;
+// rounds 16-63 update w[i&15] in-place before each round.
 
-#define SHA256_EXPAND_16(base) \
-    SHA256_EXPAND((base) + 0);  \
-    SHA256_EXPAND((base) + 1);  \
-    SHA256_EXPAND((base) + 2);  \
-    SHA256_EXPAND((base) + 3);  \
-    SHA256_EXPAND((base) + 4);  \
-    SHA256_EXPAND((base) + 5);  \
-    SHA256_EXPAND((base) + 6);  \
-    SHA256_EXPAND((base) + 7);  \
-    SHA256_EXPAND((base) + 8);  \
-    SHA256_EXPAND((base) + 9);  \
-    SHA256_EXPAND((base) + 10); \
-    SHA256_EXPAND((base) + 11); \
-    SHA256_EXPAND((base) + 12); \
-    SHA256_EXPAND((base) + 13); \
-    SHA256_EXPAND((base) + 14); \
-    SHA256_EXPAND((base) + 15)
-
-#define SHA256_ROUND(i, a, b, c, d, e, f, g, h) do { \
-    uint32_t t1_ = (h) + bsig1((e)) + ch32((e), (f), (g)) + SHA256_K[(i)] + w[(i)]; \
+// SHA-256 round using rolling w[i & 15] indexing.
+#define SHA256_ROUND_R(i, a, b, c, d, e, f, g, h) do { \
+    uint32_t t1_ = (h) + bsig1((e)) + ch32((e), (f), (g)) + SHA256_K[(i)] + w[(i) & 15]; \
     uint32_t t2_ = bsig0((a)) + maj32((a), (b), (c)); \
     (d) += t1_; \
     (h) = t1_ + t2_; \
 } while (0)
 
-#define SHA256_ROUND_8(base, a, b, c, d, e, f, g, h) \
-    SHA256_ROUND((base) + 0, a, b, c, d, e, f, g, h); \
-    SHA256_ROUND((base) + 1, h, a, b, c, d, e, f, g); \
-    SHA256_ROUND((base) + 2, g, h, a, b, c, d, e, f); \
-    SHA256_ROUND((base) + 3, f, g, h, a, b, c, d, e); \
-    SHA256_ROUND((base) + 4, e, f, g, h, a, b, c, d); \
-    SHA256_ROUND((base) + 5, d, e, f, g, h, a, b, c); \
-    SHA256_ROUND((base) + 6, c, d, e, f, g, h, a, b); \
-    SHA256_ROUND((base) + 7, b, c, d, e, f, g, h, a)
+// Rolling expand + round: update w[i&15] in-place from the recurrence, then compress.
+// w[(i-16)&15] == w[i&15] still holds the value from 16 rounds ago.
+#define SHA256_EXPAND_ROUND(i, a, b, c, d, e, f, g, h) do { \
+    w[(i) & 15] = ssig1(w[((i) - 2) & 15]) + w[((i) - 7) & 15] + ssig0(w[((i) - 15) & 15]) + w[(i) & 15]; \
+    SHA256_ROUND_R(i, a, b, c, d, e, f, g, h); \
+} while (0)
 
-static inline void sha256_compress_words(thread Sha256Ctx& ctx, thread uint32_t w[64]) {
-    SHA256_EXPAND_16(16);
-    SHA256_EXPAND_16(32);
-    SHA256_EXPAND_16(48);
+// 8 consecutive rounds for the first 16 rounds (no expansion needed).
+#define SHA256_ROUND_8_INIT(base, a, b, c, d, e, f, g, h) \
+    SHA256_ROUND_R((base) + 0, a, b, c, d, e, f, g, h); \
+    SHA256_ROUND_R((base) + 1, h, a, b, c, d, e, f, g); \
+    SHA256_ROUND_R((base) + 2, g, h, a, b, c, d, e, f); \
+    SHA256_ROUND_R((base) + 3, f, g, h, a, b, c, d, e); \
+    SHA256_ROUND_R((base) + 4, e, f, g, h, a, b, c, d); \
+    SHA256_ROUND_R((base) + 5, d, e, f, g, h, a, b, c); \
+    SHA256_ROUND_R((base) + 6, c, d, e, f, g, h, a, b); \
+    SHA256_ROUND_R((base) + 7, b, c, d, e, f, g, h, a)
 
-    uint32_t a = ctx.state[0]; // Working variable a starts from current hash state.
-    uint32_t b = ctx.state[1]; // Working variable b.
-    uint32_t c = ctx.state[2]; // Working variable c.
-    uint32_t d = ctx.state[3]; // Working variable d.
-    uint32_t e = ctx.state[4]; // Working variable e.
-    uint32_t f = ctx.state[5]; // Working variable f.
-    uint32_t g = ctx.state[6]; // Working variable g.
-    uint32_t h = ctx.state[7]; // Working variable h.
+// 8 consecutive rounds with rolling expansion (rounds 16-63).
+#define SHA256_ROUND_8_ROLLING(base, a, b, c, d, e, f, g, h) \
+    SHA256_EXPAND_ROUND((base) + 0, a, b, c, d, e, f, g, h); \
+    SHA256_EXPAND_ROUND((base) + 1, h, a, b, c, d, e, f, g); \
+    SHA256_EXPAND_ROUND((base) + 2, g, h, a, b, c, d, e, f); \
+    SHA256_EXPAND_ROUND((base) + 3, f, g, h, a, b, c, d, e); \
+    SHA256_EXPAND_ROUND((base) + 4, e, f, g, h, a, b, c, d); \
+    SHA256_EXPAND_ROUND((base) + 5, d, e, f, g, h, a, b, c); \
+    SHA256_EXPAND_ROUND((base) + 6, c, d, e, f, g, h, a, b); \
+    SHA256_EXPAND_ROUND((base) + 7, b, c, d, e, f, g, h, a)
 
-    SHA256_ROUND_8(0,  a, b, c, d, e, f, g, h);
-    SHA256_ROUND_8(8,  a, b, c, d, e, f, g, h);
-    SHA256_ROUND_8(16, a, b, c, d, e, f, g, h);
-    SHA256_ROUND_8(24, a, b, c, d, e, f, g, h);
-    SHA256_ROUND_8(32, a, b, c, d, e, f, g, h);
-    SHA256_ROUND_8(40, a, b, c, d, e, f, g, h);
-    SHA256_ROUND_8(48, a, b, c, d, e, f, g, h);
-    SHA256_ROUND_8(56, a, b, c, d, e, f, g, h);
+// Compress one 512-bit block using a rolling 16-word message schedule.
+// Takes bare state[8] and w[16] (caller loads the first 16 message words).
+// NOTE: w[16] is modified in-place by the rolling expansion (rounds 16-63).
+static inline void sha256_compress_rolling(thread uint32_t state[8], thread uint32_t w[16]) {
+    uint32_t a = state[0];
+    uint32_t b = state[1];
+    uint32_t c = state[2];
+    uint32_t d = state[3];
+    uint32_t e = state[4];
+    uint32_t f = state[5];
+    uint32_t g = state[6];
+    uint32_t h = state[7];
 
-    ctx.state[0] += a; // Feed-forward: add working variables back into the hash state.
-    ctx.state[1] += b; // Feed-forward for state word 1.
-    ctx.state[2] += c; // Feed-forward for state word 2.
-    ctx.state[3] += d; // Feed-forward for state word 3.
-    ctx.state[4] += e; // Feed-forward for state word 4.
-    ctx.state[5] += f; // Feed-forward for state word 5.
-    ctx.state[6] += g; // Feed-forward for state word 6.
-    ctx.state[7] += h; // Feed-forward for state word 7.
+    // Rounds 0-15: use w[i] directly (no expansion needed).
+    SHA256_ROUND_8_INIT(0,  a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8_INIT(8,  a, b, c, d, e, f, g, h);
+    // Rounds 16-63: expand w[i&15] in-place before each round.
+    SHA256_ROUND_8_ROLLING(16, a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8_ROLLING(24, a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8_ROLLING(32, a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8_ROLLING(40, a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8_ROLLING(48, a, b, c, d, e, f, g, h);
+    SHA256_ROUND_8_ROLLING(56, a, b, c, d, e, f, g, h);
+
+    state[0] += a;
+    state[1] += b;
+    state[2] += c;
+    state[3] += d;
+    state[4] += e;
+    state[5] += f;
+    state[6] += g;
+    state[7] += h;
 }
 
 static inline void sha256_compress(thread Sha256Ctx& ctx, thread const uint8_t* block) {
-    uint32_t w[64]; // Message schedule array for this block.
-    for (uint i = 0; i < 16; ++i) { // First 16 words come directly from the 64-byte input block.
-        w[i] = load_be_u32(block + (i * 4u)); // Convert each 4-byte chunk to a 32-bit word.
+    uint32_t w[16];
+    for (uint i = 0; i < 16; ++i) {
+        w[i] = load_be_u32(block + (i * 4u));
     }
-    sha256_compress_words(ctx, w);
+    sha256_compress_rolling(ctx.state, w);
 }
 
 static inline void sha256_compress_device(thread Sha256Ctx& ctx, device const uint8_t* block) {
-    uint32_t w[64];
+    uint32_t w[16];
     for (uint i = 0; i < 16; ++i) {
         w[i] = load_be_u32(block + (i * 4u));
     }
-    sha256_compress_words(ctx, w);
+    sha256_compress_rolling(ctx.state, w);
 }
 
 static inline void sha256_compress_constant(thread Sha256Ctx& ctx, constant const uint8_t* block) {
-    uint32_t w[64];
+    uint32_t w[16];
     for (uint i = 0; i < 16; ++i) {
         w[i] = load_be_u32(block + (i * 4u));
     }
-    sha256_compress_words(ctx, w);
+    sha256_compress_rolling(ctx.state, w);
 }
 
 // Update SHA-256 state from thread-local memory (`thread` address space).
@@ -371,61 +374,107 @@ static inline void load_key_words(device const uint8_t* key, uint32_t key_len, t
 }
 
 // Core word-level HMAC-SHA256 computation from pre-loaded key words.
-// Eliminates key_block[64], ipad[64], opad[64], inner_digest[32], and digest[32]
-// byte arrays. Works entirely with uint32_t words and compares ctx.state directly.
-// Returns true if the HMAC matches `target`.
+// Flat implementation: uses bare uint32_t state[8] arrays instead of Sha256Ctx,
+// eliminating the 76-byte streaming context (block[64] + block_len + total_len)
+// from the hot path. Returns true if the HMAC matches `target`.
 static inline bool hmac_sha256_from_key_words(
     thread const uint32_t kw[16],
     constant const uint8_t* message,
     uint32_t message_len,
-    constant const uint8_t target[32]
+    constant const uint32_t target[8]
 ) {
-    // Inner hash: compress (kw XOR 0x36363636) as the ipad block, then message.
-    Sha256Ctx inner;
-    sha256_init(inner);
+    // --- Inner hash (flat, no Sha256Ctx) ---
+    uint32_t istate[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    };
+
+    // Compress ipad block: kw XOR 0x36363636.
     {
-        uint32_t w[64];
+        uint32_t w[16];
         #pragma unroll
         for (uint i = 0; i < 16; ++i) w[i] = kw[i] ^ 0x36363636u;
-        sha256_compress_words(inner, w);
+        sha256_compress_rolling(istate, w);
     }
-    inner.total_len = 64ull;
-    inner.block_len = 0u;
-    sha256_update_constant(inner, message, message_len);
-    sha256_finalize(inner);
-    // inner.state[0..7] now holds the inner digest as words.
 
-    // Outer hash: compress (kw XOR 0x5c5c5c5c) as the opad block,
-    // then finalize with inner digest as a 32-byte tail.
-    Sha256Ctx outer;
-    sha256_init(outer);
+    // Process full 64-byte message blocks directly from constant memory.
+    uint32_t offset = 0u;
+    while ((message_len - offset) >= 64u) {
+        uint32_t w[16];
+        for (uint i = 0; i < 16; ++i) {
+            w[i] = load_be_u32(message + offset + i * 4u);
+        }
+        sha256_compress_rolling(istate, w);
+        offset += 64u;
+    }
+
+    // Finalize inner hash: remaining bytes + 0x80 padding + bit length.
+    const uint32_t rem = message_len - offset;
+    const uint64_t inner_bit_len = (64ull + uint64_t(message_len)) * 8ull;
     {
-        uint32_t w[64];
+        uint32_t w[16];
+        #pragma unroll
+        for (uint i = 0; i < 16; ++i) w[i] = 0u;
+
+        // Load remaining full words from message.
+        const uint32_t full_words = rem >> 2;
+        for (uint32_t i = 0; i < full_words; ++i) {
+            w[i] = load_be_u32(message + offset + i * 4u);
+        }
+
+        // Load partial trailing bytes and append 0x80 padding byte.
+        const uint32_t tail = rem & 3u;
+        uint32_t pad_word = 0u;
+        constant const uint8_t* tail_ptr = message + offset + (full_words * 4u);
+        for (uint32_t i = 0; i < tail; ++i) {
+            pad_word |= uint32_t(tail_ptr[i]) << (24u - 8u * i);
+        }
+        pad_word |= 0x80u << (24u - 8u * tail);
+        w[full_words] = pad_word;
+
+        if (rem > 55u) {
+            // Two-block finalization: data+0x80 don't fit with the length field.
+            sha256_compress_rolling(istate, w);
+            #pragma unroll
+            for (uint i = 0; i < 16; ++i) w[i] = 0u;
+        }
+        w[14] = uint32_t((inner_bit_len >> 32u) & 0xffffffffull);
+        w[15] = uint32_t(inner_bit_len & 0xffffffffull);
+        sha256_compress_rolling(istate, w);
+    }
+    // istate[0..7] now holds the inner digest as words.
+
+    // --- Outer hash (flat, no Sha256Ctx) ---
+    uint32_t ostate[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    };
+
+    // Compress opad block: kw XOR 0x5c5c5c5c.
+    {
+        uint32_t w[16];
         #pragma unroll
         for (uint i = 0; i < 16; ++i) w[i] = kw[i] ^ 0x5c5c5c5cu;
-        sha256_compress_words(outer, w);
+        sha256_compress_rolling(ostate, w);
     }
-    outer.total_len = 64ull;
-    outer.block_len = 0u;
 
-    // Build the final outer block directly from inner digest words.
-    // Block layout: [inner_digest(32 bytes)][0x80][zeros][bit_length(8 bytes)]
+    // Compress final outer block: inner digest + padding.
+    // Outer message = 64 (opad) + 32 (inner digest) = 96 bytes total.
     {
-        uint32_t w[64];
-        for (uint i = 0; i < 8; ++i) w[i] = inner.state[i];
+        uint32_t w[16];
+        for (uint i = 0; i < 8; ++i) w[i] = istate[i];
         w[8] = 0x80000000u;
         w[9] = 0u; w[10] = 0u; w[11] = 0u; w[12] = 0u; w[13] = 0u;
-        const uint64_t bit_len = (64ull + 32ull) * 8ull;
-        w[14] = uint32_t((bit_len >> 32u) & 0xffffffffull);
-        w[15] = uint32_t(bit_len & 0xffffffffull);
-        sha256_compress_words(outer, w);
+        const uint64_t outer_bit_len = (64ull + 32ull) * 8ull;
+        w[14] = uint32_t((outer_bit_len >> 32u) & 0xffffffffull);
+        w[15] = uint32_t(outer_bit_len & 0xffffffffull);
+        sha256_compress_rolling(ostate, w);
     }
 
-    // Compare outer hash state words directly against the target signature.
-    // No digest serialization needed — saves 8x store_be_u32 + 8x load_be_u32.
+    // Compare against precomputed target words.
     #pragma unroll
     for (uint i = 0; i < 8; ++i) {
-        if (outer.state[i] != load_be_u32(target + i * 4u)) return false;
+        if (ostate[i] != target[i]) return false;
     }
     return true;
 }
@@ -437,7 +486,7 @@ static inline bool hmac_sha256_matches(
     uint32_t key_len,
     constant const uint8_t* message,
     uint32_t message_len,
-    constant const uint8_t target[32]
+    constant const uint32_t target[8]
 ) {
     uint32_t kw[16];
 
@@ -464,7 +513,7 @@ static inline bool hmac_sha256_short_key_matches(
     uint32_t key_len,
     constant const uint8_t* message,
     uint32_t message_len,
-    constant const uint8_t target[32]
+    constant const uint32_t target[8]
 ) {
     uint32_t kw[16];
     load_key_words(key, key_len, kw);
