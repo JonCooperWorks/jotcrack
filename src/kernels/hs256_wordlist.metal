@@ -5,7 +5,10 @@ using namespace metal;
 
 // Host-to-kernel parameter block. Rust uploads this as `buffer(0)` with the exact same field order/layout.
 struct Hs256BruteForceParams {
-    uint32_t target_signature[8];      // Expected HS256 HMAC digest as 8 big-endian uint32_t words (precomputed on host).
+    // Optimization: target stored as uint32_t[8] (precomputed on host) instead of
+    // uint8_t[32].  Eliminates per-thread load_be_u32 calls in the comparison loop
+    // — the final check becomes a straight word-level `ostate[i] != target[i]`.
+    uint32_t target_signature[8];
     uint32_t message_length;           // Actual byte length of `message_bytes` (the JWT `header.payload` string).
     uint32_t candidate_count;          // Number of candidate secrets in this GPU batch.
 };
@@ -117,9 +120,19 @@ static inline void sha256_init(thread Sha256Ctx& ctx) {
     ctx.total_len = 0;          // No bytes processed yet.
 }
 
-// Rolling 16-word message schedule: w[16] replaces w[64], saving ~192 bytes
-// of register pressure per compression. Rounds 0-15 use w[i] directly;
-// rounds 16-63 update w[i&15] in-place before each round.
+// ---------------------------------------------------------------------------
+// Optimization: rolling 16-word message schedule.
+//
+// Standard SHA-256 pre-expands all 64 message words into w[64] (256 bytes)
+// before compression.  The rolling schedule keeps only w[16] (64 bytes) and
+// updates w[i & 15] in-place during rounds 16-63, saving ~192 bytes of
+// register pressure per sha256_compress call.  On Apple GPUs this directly
+// improves occupancy (more threads in flight per SIMD group).
+//
+// Rounds 0-15:  use the caller-loaded w[i] directly (SHA256_ROUND_R).
+// Rounds 16-63: recurrence w[i&15] = σ1(w[i-2]) + w[i-7] + σ0(w[i-15])
+//               + w[i-16], then round (SHA256_EXPAND_ROUND).
+// ---------------------------------------------------------------------------
 
 // SHA-256 round using rolling w[i & 15] indexing.
 #define SHA256_ROUND_R(i, a, b, c, d, e, f, g, h) do { \
@@ -373,10 +386,20 @@ static inline void load_key_words(device const uint8_t* key, uint32_t key_len, t
     }
 }
 
-// Core word-level HMAC-SHA256 computation from pre-loaded key words.
-// Flat implementation: uses bare uint32_t state[8] arrays instead of Sha256Ctx,
-// eliminating the 76-byte streaming context (block[64] + block_len + total_len)
-// from the hot path. Returns true if the HMAC matches `target`.
+// ---------------------------------------------------------------------------
+// Optimization: flat specialized HMAC (no Sha256Ctx on the hot path).
+//
+// The generic streaming Sha256Ctx carries 76 bytes of per-thread state
+// (block[64] + block_len + total_len) that the HMAC hot path never needs:
+// ipad/opad blocks are always exactly 64 bytes, message length is known, and
+// finalization layout is deterministic.  This flat version uses bare
+// uint32_t istate[8] / ostate[8] (32 bytes each) and constructs each 512-bit
+// block in a local w[16] directly from constant memory with manual padding,
+// eliminating ~152 bytes of register pressure across the inner+outer hashes.
+//
+// Sha256Ctx + the streaming update/finalize API are kept for the long-key
+// fallback path (key_len > 64 → hash-then-HMAC per RFC 2104).
+// ---------------------------------------------------------------------------
 static inline bool hmac_sha256_from_key_words(
     thread const uint32_t kw[16],
     constant const uint8_t* message,

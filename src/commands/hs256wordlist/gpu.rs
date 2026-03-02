@@ -26,6 +26,9 @@ const RESULT_NOT_FOUND_SENTINEL: u32 = u32::MAX;
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct Hs256BruteForceParams {
+    // Optimization: stored as [u32; 8] big-endian words (converted from [u8; 32]
+    // at upload time in `encode_and_commit_view`) so the GPU kernel can compare
+    // the final HMAC state words directly without per-thread byte-to-word loads.
     target_signature: [u32; 8],
     // `message_length` is precomputed on the host so the kernel does not need
     // to infer it from buffers or rely on implicit buffer metadata.
@@ -213,6 +216,8 @@ impl GpuHs256BruteForcer {
             bail!("cannot encode empty batch for async dispatch");
         }
 
+        // Optimization: convert [u8; 32] → [u32; 8] big-endian on the host so
+        // the kernel compares word-against-word without per-thread load_be_u32.
         let mut target_words = [0u32; 8];
         for i in 0..8 {
             let off = i * 4;
