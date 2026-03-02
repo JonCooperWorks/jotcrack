@@ -1,3 +1,17 @@
+//! CLI argument definitions for the `hs512-wordlist` subcommand.
+//!
+//! # Learning note: structural repetition across subcommands
+//!
+//! This file is nearly identical to `hs384wordlist/args.rs` and
+//! `hs256wordlist/args.rs`.  Each subcommand gets its own args struct so
+//! that clap can generate distinct help text and the type system prevents
+//! accidentally passing HS256 args to the HS512 runner.
+//!
+//! The `value_parser = parse_positive_usize` attribute tells clap to reject
+//! zero or negative values at parse time, before our code ever sees them.
+//! This is a good pattern: push validation as close to the input boundary
+//! as possible so inner code can assume valid data.
+
 use std::path::PathBuf;
 
 use clap::Args;
@@ -9,6 +23,9 @@ use crate::commands::common::args::{
 pub(crate) const DEFAULT_PIPELINE_DEPTH: usize =
     crate::commands::common::args::DEFAULT_PIPELINE_DEPTH;
 
+/// Command-line arguments for the HS512 wordlist attack.
+///
+/// Same structure as the HS384 variant; only the JWT algorithm name differs.
 #[derive(Debug, Clone, Args)]
 pub struct Hs512WordlistArgs {
     /// JWT in compact form (`header.payload.signature`) with `alg=HS512`.

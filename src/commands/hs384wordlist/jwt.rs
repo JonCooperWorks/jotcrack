@@ -1,16 +1,41 @@
+//! JWT parsing and validation for the HS384 subcommand.
+//!
+//! # Learning note: SHA-384 specifics
+//!
+//! SHA-384 is defined in FIPS 180-4 as a **truncated variant of SHA-512**.
+//! It uses the exact same compression function and 80-round schedule as
+//! SHA-512, but with two differences:
+//!
+//!   1. **Different initial values (IV).**  SHA-512 and SHA-384 start from
+//!      different 8-word constants so that their outputs are domain-separated
+//!      -- you cannot recover one from the other.
+//!
+//!   2. **Truncated output.**  SHA-512 produces a 64-byte (512-bit) digest
+//!      from all 8 state words.  SHA-384 takes only the first 6 state words,
+//!      yielding a 48-byte (384-bit) digest.
+//!
+//! For HMAC-SHA384 (HS384 in JWT parlance), the signature in the JWT is
+//! therefore 48 bytes after base64url decoding, compared to 32 bytes for
+//! HS256 and 64 bytes for HS512.
+
 use anyhow::{Context, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 
+/// Minimal deserialization target for the JWT header.
+/// We only need the `alg` field to verify the token uses HS384.
 #[derive(Debug, Deserialize)]
 struct JwtHeader {
     alg: String,
 }
 
-// Parse and validate an HS384 JWT, returning:
-// - the signing input bytes (`base64url(header) + "." + base64url(payload)`)
-// - the decoded 48-byte target signature to compare against GPU results
+/// Parse and validate an HS384 JWT, returning:
+/// - the signing input bytes (`base64url(header) + "." + base64url(payload)`)
+/// - the decoded 48-byte target signature to compare against GPU results
+///
+/// The 48-byte signature length is the key HS384-specific detail here.
+/// SHA-384 output = first 6 of 8 SHA-512 state words = 6 * 8 = 48 bytes.
 pub(super) fn parse_hs384_jwt(jwt: &str) -> anyhow::Result<(Vec<u8>, [u8; 48])> {
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() != 3 {

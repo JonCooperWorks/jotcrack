@@ -1,16 +1,33 @@
+//! JWT parsing and validation for the HS512 subcommand.
+//!
+//! # Learning note: SHA-512 signature size
+//!
+//! SHA-512 produces a 64-byte (512-bit) digest using all 8 of its internal
+//! 64-bit state words.  Compare this to SHA-384, which truncates to 48 bytes
+//! (6 words), and SHA-256, which produces 32 bytes (8 x 32-bit words).
+//!
+//! The HMAC-SHA512 (HS512) signature in a JWT is therefore 64 bytes after
+//! base64url decoding.  On the GPU side, the host converts these 64 bytes
+//! into 8 big-endian u64 words so the kernel can compare them directly
+//! against the final SHA-512 state without per-thread byte shuffling.
+
 use anyhow::{Context, bail};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 
+/// Minimal deserialization target for the JWT header.
+/// We only need the `alg` field to verify the token uses HS512.
 #[derive(Debug, Deserialize)]
 struct JwtHeader {
     alg: String,
 }
 
-// Parse and validate an HS512 JWT, returning:
-// - the signing input bytes (`base64url(header) + "." + base64url(payload)`)
-// - the decoded 64-byte target signature to compare against GPU results
+/// Parse and validate an HS512 JWT, returning:
+/// - the signing input bytes (`base64url(header) + "." + base64url(payload)`)
+/// - the decoded 64-byte target signature to compare against GPU results
+///
+/// The 64-byte length reflects the full SHA-512 output: 8 state words * 8 bytes each.
 pub(super) fn parse_hs512_jwt(jwt: &str) -> anyhow::Result<(Vec<u8>, [u8; 64])> {
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() != 3 {

@@ -1,4 +1,37 @@
+// ===========================================================================
 // Metal compute kernel for HMAC-SHA384 and HMAC-SHA512 JWT cracking (wordlist mode).
+//
+// LEARNING OVERVIEW: SHA-512 vs SHA-256
+//
+// This kernel implements the same HMAC-then-compare pattern as the HS256
+// kernel but using SHA-512 family hashing.  Key differences from SHA-256:
+//
+//   SHA-256                          SHA-512
+//   -------                          -------
+//   32-bit words (uint32_t)          64-bit words (uint64_t)
+//   64-byte (512-bit) blocks         128-byte (1024-bit) blocks
+//   64 compression rounds            80 compression rounds
+//   8 x uint32_t state (32 bytes)    8 x uint64_t state (64 bytes)
+//   64 round constants               80 round constants
+//   HMAC block size: 64 bytes        HMAC block size: 128 bytes
+//   Short-key threshold: 64 bytes    Short-key threshold: 128 bytes
+//
+// SHA-384 is NOT a separate algorithm.  It is SHA-512 with:
+//   1. Different initial values (IV) -- defined in FIPS 180-4 section 5.3.4.
+//   2. Output truncated to 48 bytes (first 6 of 8 state words).
+//
+// This single .metal file contains kernel entry points for BOTH HS384 and HS512.
+// The Rust host code in hs384wordlist/gpu.rs and hs512wordlist/gpu.rs both
+// `include_str!()` this file and select the appropriate kernel function names.
+//
+// ROLLING MESSAGE SCHEDULE
+//   Like the SHA-256 kernel, we use a rolling 16-word schedule (w[16]) instead
+//   of pre-expanding all 80 words (w[80]).  This saves 80*8 - 16*8 = 512 bytes
+//   of register pressure per thread -- critical for GPU occupancy.
+//   The recurrence is: w[i] = sigma1(w[i-2]) + w[i-7] + sigma0(w[i-15]) + w[i-16]
+//   which only needs the last 16 values, so w[i & 15] is updated in-place.
+// ===========================================================================
+
 // Follows the same flat, rolling-schedule design as the HS256 kernel but with 64-bit
 // arithmetic, 128-byte HMAC block size, and 80 compression rounds.
 #include <metal_stdlib>
@@ -7,6 +40,11 @@ using namespace metal;
 // Host-to-kernel parameter block. Rust uploads this as `buffer(0)`.
 // target_signature holds the expected HMAC output as big-endian uint64_t words:
 //   HS384: first 6 words used (48 bytes), HS512: all 8 words used (64 bytes).
+//
+// Learning note: the host pre-converts target bytes to uint64_t words so that
+// each GPU thread can do a simple word-level comparison (ostate[i] != target[i])
+// instead of reconstructing words from bytes.  This is the same optimization
+// used in the HS256 kernel with uint32_t words.
 struct Hs512BruteForceParams {
     uint64_t target_signature[8];
     uint32_t message_length;
@@ -15,6 +53,10 @@ struct Hs512BruteForceParams {
 
 // ---------------------------------------------------------------------------
 // SHA-512 round constants (FIPS 180-4, section 4.2.3).
+// 80 constants (vs. 64 for SHA-256), each 64 bits wide.
+// These are the first 64 bits of the fractional parts of the cube roots of
+// the first 80 prime numbers.  Placed in `constant` address space so every
+// GPU thread shares a single cached copy.
 // ---------------------------------------------------------------------------
 constant uint64_t SHA512_K[80] = {
     0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL, 0xe9b5dba58189dbbcULL, // 0..3
@@ -41,8 +83,13 @@ constant uint64_t SHA512_K[80] = {
 
 // ---------------------------------------------------------------------------
 // 64-bit helper functions for SHA-384 / SHA-512.
+//
+// Learning note: these are the exact same logical operations as SHA-256's
+// helpers (rotr, ch, maj, big/small sigma) but operating on 64-bit words
+// with different rotation amounts specified in FIPS 180-4 section 4.1.3.
 // ---------------------------------------------------------------------------
 
+// Rotate-right for 64-bit values.  Same concept as rotr32 but for uint64_t.
 static inline uint64_t rotr64(uint64_t x, uint64_t n) {
     return (x >> n) | (x << (64ULL - n));
 }
@@ -156,6 +203,24 @@ static inline void store_be_u64(thread uint8_t* p, uint64_t v) {
 
 // Compress one 1024-bit block using a rolling 16-word schedule (80 rounds).
 // w[16] is modified in-place by the rolling expansion (rounds 16-79).
+//
+// Learning note: SHA-512 compression vs SHA-256
+//
+// The structure is identical to sha256_compress_rolling:
+//   1. Copy state into working variables a..h.
+//   2. Rounds 0-15: use the 16 message words directly.
+//   3. Rounds 16-79: expand w[i&15] via the recurrence, then apply round function.
+//   4. Add working variables back to state.
+//
+// The differences are:
+//   - 80 rounds instead of 64 (so rounds 16-79 = 64 expansion rounds, vs 48).
+//   - All arithmetic is 64-bit (uint64_t instead of uint32_t).
+//   - Different rotation amounts in the sigma functions.
+//   - 1024-bit (128-byte) blocks instead of 512-bit (64-byte).
+//
+// The extra 16 rounds plus doubled word size make SHA-512 roughly 2x slower
+// per byte than SHA-256 on 32-bit hardware, but on 64-bit hardware (like
+// Apple Silicon GPUs) the gap is smaller since the ALU natively handles u64.
 static inline void sha512_compress_rolling(thread uint64_t state[8], thread uint64_t w[16]) {
     uint64_t a = state[0];
     uint64_t b = state[1];
@@ -191,6 +256,12 @@ static inline void sha512_compress_rolling(thread uint64_t state[8], thread uint
 
 // ---------------------------------------------------------------------------
 // Streaming SHA-512 context (used only for the long-key fallback path).
+//
+// Learning note: this struct is much larger than its SHA-256 counterpart:
+//   - block[128] vs block[64]  (128-byte blocks for SHA-512)
+//   - state[8] as uint64_t vs uint32_t  (64 bytes vs 32 bytes)
+// Total: ~200 bytes per thread.  This is why we avoid it on the hot path
+// and use bare uint64_t arrays instead (the "flat" HMAC implementation).
 // ---------------------------------------------------------------------------
 
 struct Sha512Ctx {
@@ -200,6 +271,8 @@ struct Sha512Ctx {
     uint64_t total_len;
 };
 
+// SHA-512 initial values: first 64 bits of fractional parts of square roots
+// of the first 8 primes.  Note these are DIFFERENT from SHA-384's IVs.
 static inline void sha512_init(thread Sha512Ctx& ctx) {
     ctx.state[0] = 0x6a09e667f3bcc908ULL;
     ctx.state[1] = 0xbb67ae8584caa73bULL;
@@ -213,6 +286,11 @@ static inline void sha512_init(thread Sha512Ctx& ctx) {
     ctx.total_len = 0;
 }
 
+// SHA-384 initial values: first 64 bits of fractional parts of square roots
+// of the 9th through 16th primes (23, 29, 31, 37, 41, 43, 47, 53).
+// These are deliberately different from SHA-512's IVs so that SHA-384 and
+// SHA-512 produce completely different digests for the same input, even though
+// they use the same compression function.
 static inline void sha384_init(thread Sha512Ctx& ctx) {
     ctx.state[0] = 0xcbbb9d5dc1059ed8ULL;
     ctx.state[1] = 0x629a292a367cd507ULL;
@@ -295,6 +373,11 @@ static inline void sha512_finalize(thread Sha512Ctx& ctx) {
 
 // ---------------------------------------------------------------------------
 // Key loading: 128-byte HMAC block as 16 x uint64_t words, zero-padded.
+//
+// Learning note: HMAC-SHA512 block size = 128 bytes = 16 x uint64_t words.
+// This is double the 64-byte block size of HMAC-SHA256 (16 x uint32_t).
+// Keys shorter than 128 bytes are zero-padded to fill one block.
+// Keys longer than 128 bytes are hashed first (handled by the caller).
 // ---------------------------------------------------------------------------
 
 static inline void load_key_words_64(device const uint8_t* key, uint32_t key_len, thread uint64_t kw[16]) {
@@ -318,6 +401,22 @@ static inline void load_key_words_64(device const uint8_t* key, uint32_t key_len
 // ---------------------------------------------------------------------------
 // Flat HMAC-SHA384: no Sha512Ctx on the hot path.
 //
+// Learning note: HMAC-SHA384 step by step
+//
+// 1. INNER HASH:  SHA-384( (key XOR ipad_128) || message )
+//    - ipad is 0x36 repeated to 128 bytes (= 16 x 0x3636363636363636 as u64 words).
+//    - Compress the ipad block, then process message blocks, then finalize.
+//    - SHA-384 output = first 6 of 8 state words = 48 bytes.
+//
+// 2. OUTER HASH:  SHA-384( (key XOR opad_128) || inner_digest )
+//    - opad is 0x5c repeated to 128 bytes.
+//    - Compress the opad block, then compress one block containing the
+//      48-byte inner digest + padding + bit-length.
+//    - SHA-384 output = first 6 state words = 48 bytes.
+//
+// 3. COMPARE:  check the first 6 words against the target.
+//    (Words 6-7 of target are zeroed by the host; the kernel ignores them.)
+//
 // Block size = 128 bytes.  ipad/opad XOR = 0x3636363636363636 / 0x5c5c5c5c5c5c5c5c.
 // Inner digest = 48 bytes (first 6 state words of SHA-384).
 // Outer message = 128 (opad) + 48 (digest) = 176 bytes  ->  bit_len = 1408.
@@ -330,6 +429,8 @@ static inline bool hmac_sha384_from_key_words(
     constant const uint64_t target[8]
 ) {
     // --- Inner hash: SHA-384(ipad || message) ---
+    // Learning note: these are the SHA-384 IVs (different from SHA-512 IVs).
+    // Using SHA-384 IVs here is what makes this HMAC-SHA384 and not HMAC-SHA512.
     uint64_t istate[8] = {
         0xcbbb9d5dc1059ed8ULL, 0x629a292a367cd507ULL,
         0x9159015a3070dd17ULL, 0x152fecd8f70e5939ULL,
@@ -338,6 +439,9 @@ static inline bool hmac_sha384_from_key_words(
     };
 
     // Compress ipad block: kw XOR 0x3636363636363636.
+    // Learning note: the ipad XOR constant is 0x36 repeated for each byte,
+    // which becomes 0x3636363636363636 as a uint64_t word.  This is the
+    // HMAC inner padding step from RFC 2104.
     {
         uint64_t w[16];
         #pragma unroll
@@ -346,6 +450,7 @@ static inline bool hmac_sha384_from_key_words(
     }
 
     // Process full 128-byte message blocks from constant memory.
+    // Learning note: message blocks are 128 bytes for SHA-512 (vs 64 for SHA-256).
     uint32_t offset = 0u;
     while ((message_len - offset) >= 128u) {
         uint64_t w[16];
@@ -435,6 +540,9 @@ static inline bool hmac_sha384_from_key_words(
     }
 
     // Compare first 6 words (48 bytes) against target.
+    // Learning note: SHA-384 truncates to 6 words.  The target's words 6-7
+    // are zeroed by the host, and we simply don't compare them.  This is
+    // the key difference from HS512, which compares all 8 words below.
     #pragma unroll
     for (uint i = 0; i < 6; ++i) {
         if (ostate[i] != target[i]) return false;
@@ -445,19 +553,22 @@ static inline bool hmac_sha384_from_key_words(
 // ---------------------------------------------------------------------------
 // Flat HMAC-SHA512: no Sha512Ctx on the hot path.
 //
+// Learning note: HMAC-SHA512 step by step
+//
+// Same structure as HMAC-SHA384 above, but with two differences:
+//   1. Uses SHA-512 IVs (not SHA-384 IVs).
+//   2. Inner digest = 64 bytes (all 8 state words, not just 6).
+//   3. Comparison checks all 8 words (not 6).
+//
+// Outer hash layout:
+//   Block 1: opad (128 bytes = one full block).
+//   Block 2: 64-byte inner digest + 0x80 + zero padding + 16-byte bit-length.
+//            = 64 + 1 + 47 + 16 = 128 bytes -> fits in one block.
+//   Total outer message = 128 + 64 = 192 bytes -> 1536 bits.
+//
 // Block size = 128 bytes.  ipad/opad XOR = 0x3636363636363636 / 0x5c5c5c5c5c5c5c5c.
 // Inner digest = 64 bytes (all 8 state words of SHA-512).
 // Outer message = 128 (opad) + 64 (digest) = 192 bytes  ->  bit_len = 1536.
-// 192 bytes = one 128-byte opad block + one 64-byte digest block.
-// The digest (64 bytes) does NOT fit with padding in one block (need 64 + 1 + padding + 16 = 81+ bytes > 128),
-// so the outer hash after the opad compress needs TWO more blocks:
-//   Block 2: w[0..7] = inner state words (64 bytes of digest fills entire block... NO:
-//   64 bytes = 8 words, which leaves 8 words for padding+length in the same 128-byte block).
-//   Actually 64 bytes + 1 (0x80) + padding + 16 (length) = 81 minimum bytes, fits in 128.
-//   So: w[0..7] = inner digest, w[8] = 0x80..., w[9..13] = 0, w[14..15] = bit_len.
-// Wait -- 64 bytes of digest. After opad (128 bytes), next data is the 64-byte digest.
-// A single 128-byte block can hold 128 bytes. 64 bytes of digest + 1 byte padding = 65 bytes,
-// plus 16 bytes for length = 81 bytes. 81 <= 128. So it fits in one block.
 // ---------------------------------------------------------------------------
 
 static inline bool hmac_sha512_from_key_words(
@@ -467,6 +578,7 @@ static inline bool hmac_sha512_from_key_words(
     constant const uint64_t target[8]
 ) {
     // --- Inner hash: SHA-512(ipad || message) ---
+    // Learning note: these are the SHA-512 IVs (different from SHA-384 IVs above).
     uint64_t istate[8] = {
         0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL,
         0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
@@ -571,6 +683,8 @@ static inline bool hmac_sha512_from_key_words(
     }
 
     // Compare all 8 words (64 bytes) against target.
+    // Learning note: this is the key difference from HS384 above, which only
+    // compares 6 words.  HS512 uses the full SHA-512 output (all 8 state words).
     #pragma unroll
     for (uint i = 0; i < 8; ++i) {
         if (ostate[i] != target[i]) return false;
@@ -580,6 +694,13 @@ static inline bool hmac_sha512_from_key_words(
 
 // ---------------------------------------------------------------------------
 // Full HMAC wrappers with long-key fallback (key > 128 bytes -> hash first).
+//
+// Learning note: per RFC 2104, if the key is longer than the hash block size
+// (128 bytes for SHA-512 family), it must be hashed first to reduce it.
+// For HMAC-SHA384, long keys are hashed with SHA-384 (48-byte result).
+// For HMAC-SHA512, long keys are hashed with SHA-512 (64-byte result).
+// The "short key" specializations below skip this branch entirely when the
+// host guarantees all candidates in the batch are <= 128 bytes.
 // ---------------------------------------------------------------------------
 
 // HMAC-SHA384: any key length.
@@ -664,6 +785,19 @@ static inline bool hmac_sha512_short_key_matches(
 
 // ---------------------------------------------------------------------------
 // Kernel entry points.
+//
+// Learning note: this single .metal file provides FOUR kernel entry points:
+//   - hs384_wordlist          (any key length, compares 6 words)
+//   - hs384_wordlist_short_keys  (keys <= 128 bytes, compares 6 words)
+//   - hs512_wordlist          (any key length, compares 8 words)
+//   - hs512_wordlist_short_keys  (keys <= 128 bytes, compares 8 words)
+//
+// The Rust host selects which kernel to dispatch:
+//   - hs384wordlist/gpu.rs uses the hs384_* entry points.
+//   - hs512wordlist/gpu.rs uses the hs512_* entry points.
+//   - Within each, the "short_keys" variant is chosen when the batch's
+//     max_word_len <= 128, eliminating the long-key hash-first branch.
+//
 // Buffer bindings match the HS256 kernel:
 //   buffer(0) = params
 //   buffer(1) = message (JWT header.payload)

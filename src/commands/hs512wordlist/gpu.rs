@@ -1,3 +1,30 @@
+//! GPU (Metal) dispatch layer for HS512 wordlist cracking.
+//!
+//! # Learning note: HS512 uses the full 8-word SHA-512 comparison
+//!
+//! This file is structurally identical to `hs384wordlist/gpu.rs`, with two
+//! key differences:
+//!
+//!   1. **All 8 u64 words are populated.**  The host converts the 64-byte
+//!      JWT signature into `[u64; 8]` and the GPU compares all 8 words
+//!      against the computed HMAC-SHA512 output.  (HS384 only fills 6.)
+//!
+//!   2. **Different kernel function names.**  We select `hs512_wordlist` and
+//!      `hs512_wordlist_short_keys` from the shared Metal source, instead of
+//!      the `hs384_*` variants.
+//!
+//! Everything else -- the `Hs512BruteForceParams` struct layout, the
+//! `include_str!()` embedding pattern, the short-key threshold of 128 bytes,
+//! and the autotune/dispatch/readback pipeline -- is identical.
+//!
+//! # Learning note: the shared `Hs512BruteForceParams` struct
+//!
+//! Both the HS384 and HS512 Rust modules define their own local copy of
+//! `Hs512BruteForceParams`.  This is intentional: each module is
+//! self-contained, and the struct is trivially small.  The name says "Hs512"
+//! because it was sized for 8 u64 words (the HS512 maximum); HS384 simply
+//! leaves the last 2 words zeroed.
+
 use anyhow::{Context, anyhow, bail};
 use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
 use std::time::{Duration, Instant};
@@ -7,6 +34,11 @@ use crate::commands::common::stats::{BatchDispatchTimings, format_human_count};
 
 // Embed the Metal source into the binary so release builds do not depend on a
 // runtime-relative source file path.
+//
+// Learning note: the same `.metal` file is also `include_str!`'d by the HS384
+// gpu.rs.  Each binary only needs one copy because the linker deduplicates
+// identical string constants, but conceptually both modules reference the
+// same shared kernel source.
 const METAL_SOURCE_EMBEDDED: &str = include_str!("../common/hs512_wordlist.metal");
 // We keep both kernels loaded and choose per batch based on candidate lengths.
 const METAL_FUNCTION_NAME_MIXED: &str = "hs512_wordlist";
@@ -23,12 +55,19 @@ const RESULT_NOT_FOUND_SENTINEL: u32 = u32::MAX;
 
 // Host -> Metal parameter block. `#[repr(C)]` is required because Rust and the
 // Metal kernel must agree on the exact field order and byte layout.
+//
+// Learning note: this is the same struct used by HS384.  For HS512, all 8
+// target_signature words are filled with real data (the full 64-byte digest).
+// The GPU hs512_* kernels compare all 8 words; the hs384_* kernels compare
+// only the first 6.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct Hs512BruteForceParams {
     // Optimization: stored as [u64; 8] big-endian words (converted from [u8; 64]
     // at upload time in `encode_and_commit_view`) so the GPU kernel can compare
     // the final HMAC state words directly without per-thread byte-to-word loads.
+    //
+    // For HS512: all 8 words are populated (8 * 8 = 64 bytes = full SHA-512 digest).
     target_signature: [u64; 8],
     // `message_length` is precomputed on the host so the kernel does not need
     // to infer it from buffers or rely on implicit buffer metadata.
@@ -139,6 +178,10 @@ impl GpuHs512BruteForcer {
     // Select the specialized short-key kernel when every candidate in the
     // dispatch view is <= 128 bytes; otherwise fall back to the mixed kernel.
     // `DispatchBatchView` lets autotune reuse this logic on a sampled prefix.
+    //
+    // Learning note: the 128-byte threshold matches the HMAC-SHA512 block size.
+    // Keys <= 128 bytes skip the hash-the-key-first branch in the kernel,
+    // saving an entire SHA-512 computation per candidate.
     fn active_pipeline_for_view(
         &self,
         batch: DispatchBatchView<'_>,
@@ -218,6 +261,11 @@ impl GpuHs512BruteForcer {
 
         // Optimization: convert [u8; 64] -> [u64; 8] big-endian on the host so
         // the kernel compares word-against-word without per-thread load_be_u64.
+        //
+        // Learning note: for HS512 we fill all 8 words (the full 64-byte digest).
+        // Compare with HS384, which fills only 6 words and zeroes the rest.
+        // The loop range (0..8 vs 0..6) is the only substantive difference
+        // between the HS384 and HS512 versions of this function.
         let mut target_words = [0u64; 8];
         for i in 0..8 {
             let off = i * 8;

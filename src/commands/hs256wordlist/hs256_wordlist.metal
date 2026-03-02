@@ -1,9 +1,56 @@
+// ===========================================================================
+// Metal compute kernel for HMAC-SHA256 JWT cracking (wordlist mode).
+//
+// LEARNING OVERVIEW -- read this first if you're new to GPU programming.
+//
+// What this file does:
+//   Each GPU thread receives one candidate secret from a wordlist and computes
+//   HMAC-SHA256(secret, JWT_signing_input).  If the result matches the target
+//   signature, the thread writes its index to an atomic result slot.
+//
+// Key concepts for understanding this kernel:
+//
+//   1. KERNEL DISPATCH MODEL
+//      Metal dispatches a "grid" of threads.  Each thread gets a unique
+//      `gid` (global thread ID) via `[[thread_position_in_grid]]`.  The host
+//      sets grid size = number of candidates and threadgroup size = a tunable
+//      width (e.g. 256).  Metal's scheduler maps threadgroups onto the GPU's
+//      SIMD units (Apple calls them "execution width" groups of 32 threads).
+//
+//   2. SHA-256 COMPRESSION
+//      SHA-256 processes data in 512-bit (64-byte) blocks.  Each block goes
+//      through 64 "rounds" of mixing using bitwise rotations, XORs, additions
+//      mod 2^32, and a set of round constants (SHA256_K[64]).  The internal
+//      state is eight 32-bit words (a..h) that accumulate the hash.
+//
+//   3. HMAC CONSTRUCTION (RFC 2104)
+//      HMAC wraps a hash function with a key:
+//        HMAC(K, M) = H((K ^ opad) || H((K ^ ipad) || M))
+//      where ipad = 0x36 repeated, opad = 0x5c repeated, and K is zero-padded
+//      to one block (64 bytes for SHA-256).  This requires two full SHA-256
+//      computations: an "inner hash" and an "outer hash".
+//
+//   4. ADDRESS SPACES
+//      Metal has distinct pointer types: `thread` (per-thread registers/stack),
+//      `device` (GPU VRAM, read-write), `constant` (read-only, cached, shared
+//      by all threads).  The JWT message uses `constant` because every thread
+//      reads the same data; candidate secrets use `device` because each thread
+//      reads a different slice.
+//
+//   5. ATOMIC RESULT REPORTING
+//      When a thread finds a match, it uses `atomic_fetch_min_explicit` to
+//      write its `gid` to the result slot.  The `min` ensures that if
+//      multiple threads match (shouldn't happen with correct JWTs), the
+//      lowest-indexed match wins deterministically.
+// ===========================================================================
+
 // Import Metal's standard library (types like `uint32_t`, kernel attributes, atomics, etc.).
 #include <metal_stdlib>
 // Pull `metal::` names into the local namespace so code can use `kernel`, `device`, `thread`, etc. directly.
 using namespace metal;
 
 // Host-to-kernel parameter block. Rust uploads this as `buffer(0)` with the exact same field order/layout.
+// The struct must match the Rust-side `#[repr(C)]` struct field-for-field, byte-for-byte.
 struct Hs256BruteForceParams {
     // Optimization: target stored as uint32_t[8] (precomputed on host) instead of
     // uint8_t[32].  Eliminates per-thread load_be_u32 calls in the comparison loop
@@ -14,6 +61,13 @@ struct Hs256BruteForceParams {
 };
 
 // Minimal SHA-256 streaming context used per GPU thread.
+//
+// Learning note: why is this so large?
+// Each GPU thread needs its own copy of this struct (76+ bytes) because
+// threads execute independently.  The "flat" HMAC path below avoids this
+// struct entirely on the hot path, using bare uint32_t arrays instead,
+// which dramatically reduces register pressure and improves GPU occupancy
+// (= more threads can be in flight simultaneously).
 struct Sha256Ctx {
     uint32_t state[8];                 // Current SHA-256 state words (a..h / hash state).
     uint8_t block[64];                 // Current 512-bit block buffer being filled before compression.
@@ -21,7 +75,10 @@ struct Sha256Ctx {
     uint64_t total_len;                // Total message length processed so far, in bytes (needed for final padding length).
 };
 
-// SHA-256 round constants from the specification (FIPS 180-4).
+// SHA-256 round constants from the specification (FIPS 180-4, section 4.2.2).
+// These are the first 32 bits of the fractional parts of the cube roots of
+// the first 64 prime numbers.  They are placed in `constant` address space
+// so every thread shares one cached copy (saves VRAM bandwidth vs. `device`).
 constant uint32_t SHA256_K[64] = {
     0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, // Rounds 0..3
     0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u, // Rounds 4..7
@@ -107,6 +164,8 @@ static inline void store_be_u32(thread uint8_t* p, uint32_t v) {
 }
 
 // Initialize a SHA-256 context to the algorithm's fixed IV (initial hash values).
+// These constants are the first 32 bits of the fractional parts of the square
+// roots of the first 8 primes (2, 3, 5, 7, 11, 13, 17, 19).
 static inline void sha256_init(thread Sha256Ctx& ctx) {
     ctx.state[0] = 0x6a09e667u; // H0
     ctx.state[1] = 0xbb67ae85u; // H1
@@ -174,6 +233,19 @@ static inline void sha256_init(thread Sha256Ctx& ctx) {
 // Compress one 512-bit block using a rolling 16-word message schedule.
 // Takes bare state[8] and w[16] (caller loads the first 16 message words).
 // NOTE: w[16] is modified in-place by the rolling expansion (rounds 16-63).
+//
+// Learning note: SHA-256 compression step by step
+//
+// 1. Copy current state into working variables a..h.
+// 2. Rounds 0-15:  use the 16 message words directly with the round function.
+//    Each round updates one working variable using: rotations of e (bsig1),
+//    a choice function on e,f,g, the round constant K[i], and the message word w[i].
+// 3. Rounds 16-63: first expand w[i&15] using a recurrence relation:
+//      w[i] = sigma1(w[i-2]) + w[i-7] + sigma0(w[i-15]) + w[i-16]
+//    then apply the same round function.
+// 4. Add the working variables back to the state (this is the "Davies-Meyer" pattern).
+//
+// After processing all blocks, state[0..7] holds the final hash digest.
 static inline void sha256_compress_rolling(thread uint32_t state[8], thread uint32_t w[16]) {
     uint32_t a = state[0];
     uint32_t b = state[1];
@@ -329,6 +401,13 @@ static inline void sha256_update_constant(thread Sha256Ctx& ctx, constant const 
 }
 
 // Finalize SHA-256: add padding + length, compress final block(s), and write 32-byte digest.
+//
+// Learning note: SHA-256 padding rules
+// 1. Append a single 0x80 byte (a 1-bit followed by zeros).
+// 2. Pad with zero bytes until the block is 56 bytes long (leaving room for 8 bytes of length).
+//    If appending 0x80 already pushed past byte 56, finish this block and start a new one.
+// 3. Append the total message length in bits as a 64-bit big-endian integer in the last 8 bytes.
+// 4. Compress the final block.  state[0..7] is the digest.
 static inline void sha256_final(thread Sha256Ctx& ctx, thread uint8_t out[32]) {
     const uint64_t bit_len = ctx.total_len * 8ull;
 
@@ -389,6 +468,8 @@ static inline void load_key_words(device const uint8_t* key, uint32_t key_len, t
 // ---------------------------------------------------------------------------
 // Optimization: flat specialized HMAC (no Sha256Ctx on the hot path).
 //
+// Learning note: why two HMAC implementations?
+//
 // The generic streaming Sha256Ctx carries 76 bytes of per-thread state
 // (block[64] + block_len + total_len) that the HMAC hot path never needs:
 // ipad/opad blocks are always exactly 64 bytes, message length is known, and
@@ -397,8 +478,17 @@ static inline void load_key_words(device const uint8_t* key, uint32_t key_len, t
 // block in a local w[16] directly from constant memory with manual padding,
 // eliminating ~152 bytes of register pressure across the inner+outer hashes.
 //
+// On GPUs, register pressure is the primary bottleneck for occupancy.  Fewer
+// registers per thread = more threads can execute simultaneously = higher
+// throughput.  This optimization alone can yield a 1.5-2x speedup.
+//
 // Sha256Ctx + the streaming update/finalize API are kept for the long-key
-// fallback path (key_len > 64 → hash-then-HMAC per RFC 2104).
+// fallback path (key_len > 64 -> hash-then-HMAC per RFC 2104).
+//
+// HMAC-SHA256 conceptually:
+//   inner = SHA256( (key XOR ipad) || message )
+//   outer = SHA256( (key XOR opad) || inner_digest )
+// where ipad = 0x36 repeated to block size, opad = 0x5c repeated to block size.
 // ---------------------------------------------------------------------------
 static inline bool hmac_sha256_from_key_words(
     thread const uint32_t kw[16],
@@ -543,6 +633,29 @@ static inline bool hmac_sha256_short_key_matches(
     return hmac_sha256_from_key_words(kw, message, message_len, target);
 }
 
+// ===========================================================================
+// KERNEL ENTRY POINTS
+//
+// Learning note: Metal kernel dispatch model
+//
+// The host (Rust code) calls `dispatch_threads(grid_size, threadgroup_size)`.
+// Metal creates `grid_size` threads total, organized into groups of
+// `threadgroup_size`.  Each thread receives `gid` = its global index.
+//
+// For this kernel:
+//   grid_size      = number of candidate secrets in the batch
+//   threadgroup_size = tunable (e.g. 256), chosen by autotune
+//   gid            = which candidate this thread should test
+//
+// Buffer bindings (set by the Rust encoder):
+//   buffer(0) = params     (target signature, message length, candidate count)
+//   buffer(1) = message    (JWT header.payload bytes, shared by all threads)
+//   buffer(2) = word_bytes (concatenated candidate secret bytes)
+//   buffer(3) = word_offsets (byte offset of each candidate in word_bytes)
+//   buffer(4) = word_lengths (byte length of each candidate)
+//   buffer(5) = result_index (atomic: lowest matching gid, or 0xFFFFFFFF)
+// ===========================================================================
+
 // Main compute kernel: one GPU thread tests exactly one candidate secret.
 kernel void hs256_wordlist(
     constant Hs256BruteForceParams& params [[buffer(0)]],
@@ -567,6 +680,11 @@ kernel void hs256_wordlist(
 }
 
 // Short-key specialization. Host dispatches this when every key in the batch is <= 64 bytes.
+// Learning note: by guaranteeing key_len <= 64, this kernel eliminates the
+// hash-the-long-key branch, saving one conditional and one full SHA-256
+// computation per thread.  The host checks max_word_len at batch level and
+// selects this kernel when safe.  This is a common GPU optimization: branch
+// elimination via kernel specialization.
 kernel void hs256_wordlist_short_keys(
     constant Hs256BruteForceParams& params [[buffer(0)]],
     constant const uint8_t* message_bytes [[buffer(1)]],

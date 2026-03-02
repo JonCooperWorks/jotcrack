@@ -1,3 +1,25 @@
+//! End-to-end orchestration for the HS384 wordlist cracking command.
+//!
+//! # Learning note: the pipeline pattern
+//!
+//! This module follows the same producer-consumer pipeline pattern used by
+//! every cracking subcommand (HS256, HS384, HS512):
+//!
+//!   1. **Parse the JWT** -- validate the algorithm and extract the signing
+//!      input and target signature.
+//!   2. **Initialize the GPU** -- compile the Metal kernel, allocate buffers.
+//!   3. **Spawn a wordlist producer** -- background threads mmap the file,
+//!      split it into chunks, parse lines, and pack GPU batches.
+//!   4. **Double-buffered dispatch loop** -- while the GPU executes batch N,
+//!      the host receives batch N+1 from the producer.  This overlap hides
+//!      most of the host-side latency behind GPU execution time.
+//!   5. **Report results** -- print the cracked secret or "NOT FOUND", plus
+//!      detailed timing statistics.
+//!
+//! The only HS384-specific parts are the JWT parser (48-byte signature) and
+//! the GPU wrapper (6-word comparison, `hs384_*` kernel names).  Everything
+//! else is generic infrastructure shared via `crate::commands::common`.
+
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
@@ -12,8 +34,10 @@ use crate::commands::common::stats::{
     rate_per_second,
 };
 
-// Holds the command buffer + batch for a currently executing GPU dispatch.
-// Defined at module scope so `handle_match` can reference it.
+/// Holds the command buffer + batch for a currently executing GPU dispatch.
+/// Defined at module scope so `handle_match` can reference it.
+///
+/// This is the same pattern used in the HS256 and HS512 command modules.
 struct InFlightBatch {
     cmd_buf: metal::CommandBuffer,
     batch: crate::commands::common::batch::WordBatch,

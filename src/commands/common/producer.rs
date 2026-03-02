@@ -1,3 +1,67 @@
+//! # Multi-threaded producer pipeline for GPU batch dispatch
+//!
+//! This module implements the **producer/consumer pattern** that keeps the GPU
+//! fed with batches of password candidates while the CPU parses the wordlist
+//! in parallel.
+//!
+//! ## The core problem: CPU and GPU are independent processors
+//!
+//! Without pipelining, the workflow would be:
+//!
+//! ```text
+//! CPU: [parse batch 1]                  [parse batch 2]                  [parse batch 3]
+//! GPU:                 [hash batch 1]                  [hash batch 2]                  ...
+//!                      ↑ GPU idle here                 ↑ GPU idle here
+//! ```
+//!
+//! Each processor waits for the other. With pipelining:
+//!
+//! ```text
+//! CPU: [parse batch 1][parse batch 2][parse batch 3][parse batch 4]...
+//! GPU:                [hash batch 1][hash batch 2][hash batch 3]...
+//!                     ↑ overlapped! No idle time (ideally)
+//! ```
+//!
+//! The producer thread parses batches ahead of what the GPU is currently
+//! processing. A bounded channel (`sync_channel`) connects them, with a
+//! configurable depth (how many batches can be "in flight" between producer
+//! and consumer). Deeper pipelines tolerate more variance in batch processing
+//! time, at the cost of more memory (each in-flight batch holds ~67 MiB of
+//! Metal buffers).
+//!
+//! ## Three-stage pipeline: Planner -> Packers -> Coordinator
+//!
+//! The producer itself is internally pipelined into three stages:
+//!
+//! 1. **Planner thread** — Scans the memory-mapped wordlist and determines
+//!    batch boundaries (which lines go in which batch) without copying data.
+//!    Produces `BatchPlan` objects.
+//!
+//! 2. **Packer worker threads** — Take a `BatchPlan` + empty `WordBatch` and
+//!    copy the actual candidate bytes into the Metal shared buffers. Multiple
+//!    packer threads can work in parallel on different batches.
+//!
+//! 3. **Coordinator** (runs on the producer thread) — Orchestrates the planner
+//!    and packers, manages the batch pool, and sends filled batches to the
+//!    consumer (GPU dispatch thread) via the output channel.
+//!
+//! ## WordBatch recycling (object pool pattern)
+//!
+//! Allocating Metal shared buffers is expensive (Objective-C FFI + kernel VM
+//! operations). Instead of allocating a new `WordBatch` for each batch, we
+//! recycle them:
+//!
+//! ```text
+//! Producer ──[filled batch]──> Consumer (GPU dispatch)
+//!    ↑                              │
+//!    └───[empty batch]──────────────┘  (recycle channel)
+//! ```
+//!
+//! After the GPU finishes with a batch, the consumer sends it back via a
+//! separate "recycle" channel. The producer calls `reset_for_reuse()` and
+//! fills it with new data. This keeps the steady-state allocation count
+//! equal to `pipeline_depth` — no garbage collection, no allocator churn.
+
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,11 +78,19 @@ use super::args::ParserConfig;
 use super::batch::WordBatch;
 use super::parser::{AnyWordlistBatchReader, BatchPlan, ParserStats, pack_batch_plan_into_batch};
 
+/// A unit of work sent to a packer worker thread: "fill this batch using this plan."
+///
+/// The `plan` describes which lines from the wordlist go into this batch (byte
+/// ranges, line counts). The `batch` is an empty (or recycled) `WordBatch` with
+/// pre-allocated Metal buffers ready to be filled.
 struct PackerJob {
     plan: BatchPlan,
     batch: WordBatch,
 }
 
+/// The result of a packer worker completing a job.
+///
+/// Contains the now-filled `WordBatch` plus timing data for performance monitoring.
 #[derive(Debug)]
 struct PackerResult {
     batch: WordBatch,
@@ -27,12 +99,24 @@ struct PackerResult {
     parser_stats: ParserStats,
 }
 
+/// Messages sent from packer workers back to the coordinator.
+///
+/// This is a simple enum-based protocol: either the packing succeeded
+/// (`Packed`) or it failed (`Error`). Using an enum here instead of
+/// `Result<PackerResult, String>` makes pattern matching more explicit
+/// and lets us include additional context like `seq_no` in the error case.
 #[derive(Debug)]
 enum PackerWorkerMessage {
     Packed(PackerResult),
     Error { seq_no: u64, message: String },
 }
 
+/// Messages sent from the planner thread to the coordinator.
+///
+/// Three variants model the planner's lifecycle:
+/// - `Plan` — "here's the next batch of work"
+/// - `Eof` — "I've reached the end of the wordlist" (with final stats)
+/// - `Error` — "something went wrong during parsing"
 #[derive(Debug)]
 enum PlannerWorkerMessage {
     Plan(BatchPlan),
@@ -40,6 +124,17 @@ enum PlannerWorkerMessage {
     Error(String),
 }
 
+/// Main loop for a packer worker thread.
+///
+/// Each packer worker runs this loop: receive a job, pack the candidates from
+/// the mmap into the Metal batch buffers, send the result back. Workers are
+/// stateless — they share an `Arc<Mmap>` for read-only access to the wordlist
+/// file and communicate exclusively through channels.
+///
+/// The `crossbeam_channel` crate is used here (instead of `std::sync::mpsc`)
+/// because crossbeam channels support multiple consumers (`Receiver` is
+/// `Clone`), which lets us fan out work to multiple packer threads from a
+/// single job queue. `std::sync::mpsc::Receiver` is NOT `Clone`.
 fn packer_worker_main(
     mmap: Arc<Mmap>,
     job_rx: crossbeam_channel::Receiver<PackerJob>,
@@ -70,6 +165,26 @@ fn packer_worker_main(
     }
 }
 
+/// Main loop for the planner thread.
+///
+/// The planner scans the memory-mapped wordlist and determines batch boundaries
+/// (which ranges of lines form each batch) without copying any candidate data.
+/// This is a lightweight operation compared to packing — it just tracks counts
+/// and byte totals.
+///
+/// ## Why separate planning from packing?
+///
+/// Planning is sequential (it must scan the wordlist in order to determine
+/// where batches begin and end), but packing is embarrassingly parallel (each
+/// batch can be filled independently). By separating the two, we let the
+/// planner run ahead while multiple packer threads fill batches concurrently.
+///
+/// ## Cooperative shutdown via `AtomicBool`
+///
+/// The `stop` flag is checked between batches. `Ordering::Relaxed` is sufficient
+/// here because we don't need happens-before guarantees — we just need the
+/// planner to eventually see the flag. A few extra batches planned after the
+/// stop signal are harmless (they'll be discarded by the coordinator).
 fn planner_worker_main(
     mut reader: AnyWordlistBatchReader,
     stop: Arc<AtomicBool>,
@@ -113,6 +228,15 @@ fn planner_worker_main(
     }
 }
 
+/// Process a single message from the planner thread.
+///
+/// Extracted as a helper so the coordinator loop stays readable. Each planner
+/// message is handled exactly once — `Plan` is queued for packing, `Eof` sets
+/// a flag, and `Error` short-circuits the coordinator.
+///
+/// Note that `latest_parser_stats` is replaced (not accumulated) on each
+/// message. This works because `ParserStats` is a cumulative snapshot — each
+/// later snapshot includes all work from earlier ones.
 fn handle_planner_message(
     message: PlannerWorkerMessage,
     pending_plans: &mut VecDeque<BatchPlan>,
@@ -138,6 +262,13 @@ fn handle_planner_message(
     }
 }
 
+/// Process a single message from a packer worker.
+///
+/// Returns `Some(ProducerMessage::Batch{..})` when a batch is ready to be
+/// sent to the consumer, or `None` if the message was handled internally.
+/// The `in_flight_pack_jobs` counter is decremented here to track how many
+/// packer jobs are still outstanding — this is used by the coordinator to
+/// know when all work is done.
 fn handle_packer_message(
     message: PackerWorkerMessage,
     in_flight_pack_jobs: &mut usize,
@@ -168,6 +299,22 @@ fn handle_packer_message(
     }
 }
 
+/// Messages sent from the producer pipeline to the consumer (GPU dispatch thread).
+///
+/// This enum defines the public protocol between the producer and consumer.
+/// The consumer calls `producer.recv()` in a loop and pattern-matches on these
+/// variants:
+///
+/// - **`Batch`** — A filled `WordBatch` ready for GPU dispatch. Includes timing
+///   metadata so the consumer can report performance statistics (e.g., "batch
+///   build took X ms, GPU hashing took Y ms"). The consumer should call
+///   `producer.recycle(batch)` after the GPU finishes to return the allocation.
+///
+/// - **`Eof`** — End of the wordlist. All candidates have been dispatched.
+///   Includes final cumulative parser statistics.
+///
+/// - **`Error`** — An unrecoverable error occurred in the producer pipeline.
+///   The consumer should report the error and shut down.
 pub(crate) enum ProducerMessage {
     Batch {
         batch: WordBatch,
@@ -182,8 +329,30 @@ pub(crate) enum ProducerMessage {
     Error(String),
 }
 
-// Owns the producer thread and channel endpoints used to overlap wordlist
-// parsing with GPU dispatch.
+/// Owns the producer thread and channel endpoints used to overlap wordlist
+/// parsing with GPU dispatch.
+///
+/// ## Struct fields — a channel topology
+///
+/// ```text
+///                    ┌──────────────────────────────┐
+///                    │   Producer thread (internal)  │
+///                    │                               │
+///   recycle_tx ─────>│  recycle_rx ──> batch pool    │
+///   (consumer side)  │                    │          │
+///                    │              fill batches     │
+///                    │                    │          │
+///                    │                    v          │
+///                    │  tx ──────────────────────────┼──> rx (consumer side)
+///                    └──────────────────────────────┘
+///                              ↑
+///                         stop (AtomicBool)
+/// ```
+///
+/// - `rx` — Consumer reads filled batches from here (`Option` so we can `take()` it during shutdown)
+/// - `recycle_tx` — Consumer sends empty batches back for reuse
+/// - `stop` — Cooperative shutdown flag (shared with the producer thread)
+/// - `handle` — `JoinHandle` for the background thread (`Option` so we can `take()` it in `join()`)
 pub(crate) struct WordlistProducer {
     rx: Option<Receiver<ProducerMessage>>,
     // Reverse direction channel used only for allocation reuse:
@@ -194,8 +363,31 @@ pub(crate) struct WordlistProducer {
 }
 
 impl WordlistProducer {
-    // Start the producer thread immediately so parsing can begin while the
-    // consumer is initializing autotune / first dispatch state.
+    /// Start the producer pipeline immediately so parsing can begin while the
+    /// consumer is initializing autotune / first dispatch state.
+    ///
+    /// ## Bounded channels (`sync_channel`)
+    ///
+    /// We use `std::sync::mpsc::sync_channel(pipeline_depth)` rather than an
+    /// unbounded channel. This is critical for memory control:
+    ///
+    /// - **Unbounded channel**: Producer could parse the entire 10 GB wordlist
+    ///   into memory before the GPU processes a single batch. Memory usage: unbounded.
+    /// - **Bounded channel**: Producer blocks when `pipeline_depth` batches are
+    ///   already queued, creating natural backpressure. Memory usage: bounded to
+    ///   `pipeline_depth * ~67 MiB`.
+    ///
+    /// The `pipeline_depth` parameter controls the tradeoff:
+    /// - Depth 1: minimal memory, but GPU may stall waiting for the next batch
+    /// - Depth 4-8: good overlap, the producer stays ahead of the GPU
+    /// - Depth 16+: diminishing returns, just wastes memory
+    ///
+    /// ## Why `thread::spawn` instead of `async`
+    ///
+    /// The producer does blocking I/O (mmap reads) and CPU-bound work (parsing).
+    /// OS threads are the right abstraction here — `async` would just add
+    /// complexity with no benefit since we're not doing network I/O or managing
+    /// thousands of concurrent tasks.
     pub(crate) fn spawn(
         wordlist_path: PathBuf,
         device: Device,
@@ -236,11 +428,40 @@ impl WordlistProducer {
         }
     }
 
+    /// Signal the producer to stop after finishing the current batch.
+    ///
+    /// ## The shutdown protocol (3 steps)
+    ///
+    /// Shutting down a multi-threaded pipeline cleanly is one of the trickiest
+    /// parts of concurrent programming. Here's the protocol:
+    ///
+    /// 1. **`stop()`** — Sets the `AtomicBool` flag. The producer checks this
+    ///    between batches and will stop producing new ones. This is cooperative:
+    ///    the producer may finish its current batch before noticing.
+    ///
+    /// 2. **`close_receiver()`** — Drops the receiving end of the channel.
+    ///    This is crucial: if the producer is blocked on `tx.send()` (because
+    ///    the bounded channel is full), dropping the receiver unblocks it with
+    ///    a `SendError`, which the producer interprets as "consumer is gone,
+    ///    time to exit."
+    ///
+    /// 3. **`join()`** — Waits for the background thread to actually finish.
+    ///    This ensures deterministic shutdown and surfaces any thread panics
+    ///    as a regular `anyhow::Error`.
+    ///
+    /// Calling these in the wrong order can cause deadlocks! For example, if
+    /// you call `join()` without `close_receiver()`, and the producer is
+    /// blocked on a full channel, you'll wait forever.
     // Cooperative stop signal checked between batch builds.
     pub(crate) fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
 
+    /// Receive the next batch (or terminal message) from the producer.
+    ///
+    /// This is a blocking call — the consumer thread will sleep here until
+    /// the producer sends a batch. A closed channel is treated as an error
+    /// because the consumer expects a clean `ProducerMessage::Eof`.
     // Receive the next batch (or terminal message) from the producer. A closed
     // channel is treated as an error because the consumer expects a clean EOF.
     pub(crate) fn recv(&self) -> anyhow::Result<ProducerMessage> {
@@ -252,12 +473,32 @@ impl WordlistProducer {
             .map_err(|_| anyhow!("wordlist producer terminated unexpectedly"))
     }
 
+    /// Drop the receiving end of the channel to unblock a potentially stuck producer.
+    ///
+    /// `rx` is wrapped in `Option` specifically so we can `take()` it here.
+    /// Dropping the `Receiver` causes any `tx.send()` call on the producer side
+    /// to return `Err(SendError)`, which the producer interprets as a signal
+    /// to exit its loop.
     // Dropping the receiver is an important shutdown step when exiting early on
     // a match: it prevents the producer from blocking forever on a bounded send.
     pub(crate) fn close_receiver(&mut self) {
         let _ = self.rx.take();
     }
 
+    /// Return a used batch to the producer for recycling (best-effort).
+    ///
+    /// ## Why `try_send` instead of `send`?
+    ///
+    /// `send()` would block if the recycle channel is full. That would stall
+    /// the GPU dispatch thread — the most latency-sensitive thread in the
+    /// pipeline. `try_send()` returns immediately; if the channel is full,
+    /// the batch is simply dropped (its Metal buffers are freed). The producer
+    /// will allocate a new one when needed.
+    ///
+    /// In practice, the recycle channel is rarely full because the producer
+    /// consumes recycled batches as fast as the consumer returns them. But
+    /// under bursty workloads, this non-blocking behavior prevents a
+    /// priority inversion where the GPU stalls waiting on the CPU.
     // Best-effort recycle path: do not block the consumer/GPU path if the
     // producer is busy or already shutting down.
     pub(crate) fn recycle(&self, batch: WordBatch) {
@@ -267,6 +508,16 @@ impl WordlistProducer {
         let _ = self.recycle_tx.try_send(batch);
     }
 
+    /// Wait for the background thread to finish and propagate any panics.
+    ///
+    /// `JoinHandle::join()` returns `Err` if the thread panicked. We convert
+    /// this to an `anyhow::Error` so the caller gets a clean error message
+    /// instead of an unwinding panic propagating to the main thread.
+    ///
+    /// The `handle` is wrapped in `Option` so we can `take()` it — Rust
+    /// requires ownership of the `JoinHandle` to call `join()`, but we only
+    /// have `&mut self`. `take()` moves the handle out of `self` and replaces
+    /// it with `None`, transferring ownership.
     // Join the background thread so shutdown is deterministic and panics are
     // surfaced as regular errors.
     pub(crate) fn join(&mut self) -> anyhow::Result<()> {
@@ -279,6 +530,33 @@ impl WordlistProducer {
     }
 }
 
+/// Producer-thread main loop: orchestrates planning, packing, and batch emission.
+///
+/// This is the most complex function in the module. It sets up the internal
+/// three-stage pipeline (planner -> packers -> coordinator) and runs the
+/// coordinator loop that ties everything together.
+///
+/// ## Memory strategy: preallocate, then recycle
+///
+/// We allocate `pipeline_depth` `WordBatch` objects up front. This means:
+/// - The initial pipeline fill is fast (no allocation in the hot loop)
+/// - Steady-state memory usage is predictable and bounded
+/// - If recycling fails occasionally (consumer too slow), we fall back to
+///   allocating a fresh batch, but this should be rare
+///
+/// ## Channel topology inside this function
+///
+/// ```text
+///  planner_thread ──[PlannerWorkerMessage]──> coordinator
+///                                                │
+///                        ┌───────────────────────┤
+///                        │                       │
+///                        v                       v
+///  packer_thread_1 <──[PackerJob]──> coordinator ──[ProducerMessage]──> consumer
+///  packer_thread_2 <──┘              ^
+///                                    │
+///              [PackerWorkerMessage]──┘
+/// ```
 // Producer-thread main loop: parse batches and send them to the consumer until
 // EOF, stop requested, or the receiver is dropped.
 fn run_wordlist_producer(
@@ -327,6 +605,12 @@ fn run_wordlist_producer(
     drop(pack_job_rx);
     drop(pack_result_tx);
 
+    // The coordinator loop is wrapped in a closure so we can use `?` for
+    // error propagation while still guaranteeing cleanup (channel drops and
+    // thread joins) runs afterward regardless of success or failure.
+    //
+    // This is a common Rust pattern: wrap fallible logic in a closure that
+    // returns `Result`, call it, then do cleanup unconditionally after.
     let coordinator_result = (|| -> anyhow::Result<()> {
         // Coordinator owns all mutable pipeline state so workers can stay
         // "pure" (parse or pack) and communicate only via channels.
@@ -477,6 +761,22 @@ fn run_wordlist_producer(
         }
     })();
 
+    // --- Cleanup: channel drops + thread joins ---
+    //
+    // This section runs regardless of whether the coordinator loop succeeded
+    // or failed. The order matters:
+    //
+    // 1. Drop the SENDER sides of channels first. This causes workers' `recv()`
+    //    calls to return `Err(RecvError)`, which they interpret as "time to exit."
+    //    If we joined threads first without dropping channels, workers blocked on
+    //    `recv()` would never wake up → deadlock.
+    //
+    // 2. Join all threads to ensure they've fully exited. This surfaces panics
+    //    and ensures no dangling threads outlive this function.
+    //
+    // 3. Combine coordinator errors with join errors. The coordinator error
+    //    takes priority (it's the root cause), but if the coordinator succeeded
+    //    and a thread panicked, we still report that.
     // Closing sender sides first guarantees worker `recv()` loops can observe
     // channel closure and exit before we join them.
     drop(pack_job_tx);

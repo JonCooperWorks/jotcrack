@@ -1,3 +1,19 @@
+//! End-to-end orchestration for the HS512 wordlist cracking command.
+//!
+//! # Learning note: same pipeline, different types
+//!
+//! This module is structurally identical to `hs384wordlist/command.rs`.
+//! The only differences are:
+//!   - It calls `parse_hs512_jwt` (expects 64-byte signature, not 48).
+//!   - It uses `GpuHs512BruteForcer` (selects `hs512_*` kernel entry points).
+//!   - The `target_signature` is `[u8; 64]` instead of `[u8; 48]`.
+//!
+//! The producer-consumer pipeline, double-buffered dispatch, autotune, rate
+//! reporting, and shutdown logic are all the same.  In a larger codebase you
+//! might extract this into a generic function parameterized over signature
+//! size and GPU type, but the current approach keeps each subcommand easy to
+//! read and modify independently.
+
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
@@ -12,8 +28,8 @@ use crate::commands::common::stats::{
     rate_per_second,
 };
 
-// Holds the command buffer + batch for a currently executing GPU dispatch.
-// Defined at module scope so `handle_match` can reference it.
+/// Holds the command buffer + batch for a currently executing GPU dispatch.
+/// Same pattern as HS256 and HS384 command modules.
 struct InFlightBatch {
     cmd_buf: metal::CommandBuffer,
     batch: crate::commands::common::batch::WordBatch,

@@ -1,3 +1,43 @@
+//! GPU (Metal) dispatch layer for HS384 wordlist cracking.
+//!
+//! # Learning note: how HS384 shares the SHA-512 kernel
+//!
+//! SHA-384 and SHA-512 use the same compression function -- they differ only
+//! in their initial state values and output length.  Rather than maintaining
+//! two nearly-identical `.metal` files, we keep one shared kernel source at
+//! `src/commands/common/hs512_wordlist.metal` that contains entry points for
+//! **both** algorithms: `hs384_wordlist`, `hs384_wordlist_short_keys`,
+//! `hs512_wordlist`, and `hs512_wordlist_short_keys`.
+//!
+//! The Rust-side `include_str!()` macro embeds that `.metal` source into the
+//! binary at compile time.  At runtime we compile it once and pick the
+//! `hs384_*` function names.
+//!
+//! # Learning note: `Hs512BruteForceParams` is shared
+//!
+//! Both HS384 and HS512 use the same `Hs512BruteForceParams` struct to pass
+//! data from host to GPU.  The struct has room for 8 u64 words (64 bytes) in
+//! `target_signature`.  For HS384, only the first 6 words carry real data
+//! (the 48-byte SHA-384 digest); words 6 and 7 are zeroed.  For HS512, all
+//! 8 words are populated.  The GPU kernel knows which comparison to use
+//! because HS384 kernels compare 6 words and HS512 kernels compare 8.
+//!
+//! # Learning note: the 128-byte short-key threshold
+//!
+//! HMAC-SHA512 uses 128-byte blocks (vs. 64 for HMAC-SHA256).  Per RFC 2104,
+//! keys shorter than the block size are zero-padded to fill one block; keys
+//! longer than the block size are first hashed down.  So the threshold that
+//! separates the "short key" fast path from the general path is 128 bytes,
+//! not 64 as in the HS256 variant.
+//!
+//! # Learning note: u64 parameters
+//!
+//! SHA-512 works with 64-bit words throughout.  The target signature, state
+//! arrays, and message schedule all use `u64` / `uint64_t` instead of the
+//! `u32` / `uint32_t` used by SHA-256.  This doubles the register pressure
+//! per GPU thread, which is one reason SHA-512 throughput is lower than
+//! SHA-256 on the same hardware.
+
 use anyhow::{Context, anyhow, bail};
 use metal::{CompileOptions, Device, MTLResourceOptions, MTLSize};
 use std::time::{Duration, Instant};
@@ -8,6 +48,11 @@ use crate::commands::common::stats::{BatchDispatchTimings, format_human_count};
 // Embed the Metal source into the binary so release builds do not depend on a
 // runtime-relative source file path.  HS384 shares the HS512 Metal source
 // (which contains both hs384_* and hs512_* kernel entry points).
+//
+// Learning note: `include_str!()` is a compile-time macro that reads a file
+// relative to the current source file and bakes its contents into the binary
+// as a `&'static str`.  This means the final executable is self-contained --
+// no external `.metal` file is needed at runtime.
 const METAL_SOURCE_EMBEDDED: &str = include_str!("../common/hs512_wordlist.metal");
 // We keep both kernels loaded and choose per batch based on candidate lengths.
 const METAL_FUNCTION_NAME_MIXED: &str = "hs384_wordlist";
@@ -25,15 +70,29 @@ const RESULT_NOT_FOUND_SENTINEL: u32 = u32::MAX;
 // Host -> Metal parameter block. `#[repr(C)]` is required because Rust and the
 // Metal kernel must agree on the exact field order and byte layout.
 //
+// Learning note: `#[repr(C)]` tells the Rust compiler to lay out fields in
+// declaration order with C-compatible alignment, instead of Rust's default
+// (which may reorder fields for space efficiency).  Without this, the GPU
+// would read garbage because the byte offsets would not match.
+//
 // HS384 and HS512 share the same param struct layout. For HS384 only the first
 // 6 words of `target_signature` carry the 48-byte (384-bit) digest; words 6-7
-// are zeroed.
+// are zeroed.  The GPU's HS384 kernel only compares the first 6 words, so the
+// zeroed tail is harmless.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 struct Hs512BruteForceParams {
     // Stored as [u64; 8] big-endian words (converted from [u8; 48] at upload
     // time in `encode_and_commit_view`) so the GPU kernel can compare the final
     // HMAC state words directly without per-thread byte-to-word loads.
+    //
+    // Learning note: why [u64; 8] instead of [u8; 48]?
+    // SHA-512's internal state is eight 64-bit words.  After compression, the
+    // result is already in word form.  By converting the target to words on the
+    // host once, we avoid every GPU thread having to do 6-8 byte-to-u64
+    // conversions.  This is a classic GPU optimization: do work once on the
+    // host rather than N times on N threads.
+    //
     // For HS384: first 6 words from big-endian bytes, words 6-7 = 0.
     target_signature: [u64; 8],
     // `message_length` is precomputed on the host so the kernel does not need
@@ -145,6 +204,13 @@ impl GpuHs384BruteForcer {
     // Select the specialized short-key kernel when every candidate in the
     // dispatch view is <= 128 bytes; otherwise fall back to the mixed kernel.
     // `DispatchBatchView` lets autotune reuse this logic on a sampled prefix.
+    //
+    // Learning note: 128-byte threshold (not 64 like HS256)
+    // HMAC-SHA384/512 uses 128-byte blocks.  Per RFC 2104, keys that fit
+    // within one block are zero-padded directly (the fast path).  Keys longer
+    // than 128 bytes must be hashed first, which is the slow "mixed" path.
+    // In practice, nearly all real-world secrets are under 128 bytes, so the
+    // short-key kernel runs for almost every batch.
     fn active_pipeline_for_view(
         &self,
         batch: DispatchBatchView<'_>,
@@ -225,6 +291,13 @@ impl GpuHs384BruteForcer {
         // Convert [u8; 48] -> [u64; 8] big-endian on the host so the kernel
         // compares word-against-word without per-thread byte-to-u64 loads.
         // HS384 produces 48 bytes (6 u64 words); words 6-7 are zeroed.
+        //
+        // Learning note: why only 6 words for HS384?
+        // SHA-384 output = first 6 of SHA-512's 8 state words = 48 bytes.
+        // We leave target_words[6] and target_words[7] as zero (from the
+        // array initializer).  The GPU kernel's comparison loop for HS384
+        // only checks words 0..5, so the zeroed tail is never compared.
+        // This is why HS384 and HS512 can share the same param struct.
         let mut target_words = [0u64; 8];
         for i in 0..6 {
             let off = i * 8;
