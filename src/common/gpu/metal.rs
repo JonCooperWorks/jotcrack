@@ -12,17 +12,26 @@ use super::{GpuCommandHandle, GpuDevice, default_device};
 // Embedded shader sources
 // ---------------------------------------------------------------------------
 
-const METAL_SOURCE_HS256: &str =
-    include_str!("../../commands/hs256wordlist/hs256_wordlist.metal");
+const METAL_SOURCE_HS256: &str = include_str!("kernels/hs256_wordlist.metal");
 
-const METAL_SOURCE_HS512: &str =
-    include_str!("../../commands/hs512wordlist/hs512_wordlist.metal");
+const METAL_SOURCE_HS512: &str = include_str!("kernels/hs512_wordlist.metal");
 
 // ---------------------------------------------------------------------------
 // Sentinel value for "no match in this batch"
 // ---------------------------------------------------------------------------
 
 const RESULT_NOT_FOUND_SENTINEL: u32 = u32::MAX;
+
+// ---------------------------------------------------------------------------
+// Metal buffer binding indices — match [[buffer(N)]] slots in the .metal shaders.
+// ---------------------------------------------------------------------------
+
+const BUF_PARAMS: u64 = 0;
+const BUF_MESSAGE: u64 = 1;
+const BUF_WORD_BYTES: u64 = 2;
+const BUF_WORD_OFFSETS: u64 = 3;
+const BUF_WORD_LENGTHS: u64 = 4;
+const BUF_RESULT: u64 = 5;
 
 // ---------------------------------------------------------------------------
 // Host -> GPU parameter blocks (#[repr(C)] for Metal struct layout parity)
@@ -190,23 +199,23 @@ impl MetalBruteForcer {
     // -----------------------------------------------------------------------
 
     fn write_params(&self, target_signature: &[u8], candidate_count: u32) -> anyhow::Result<()> {
+        let expected_len = self.variant.signature_len();
+        if target_signature.len() != expected_len {
+            bail!(
+                "{} signature must be {} bytes, got {}",
+                self.variant.label(),
+                expected_len,
+                target_signature.len()
+            );
+        }
+
         match self.variant {
             HmacVariant::Hs256 => {
-                if target_signature.len() != 32 {
-                    bail!(
-                        "HS256 signature must be 32 bytes, got {}",
-                        target_signature.len()
-                    );
-                }
                 let mut target_words = [0u32; 8];
                 for i in 0..8 {
                     let off = i * 4;
-                    target_words[i] = u32::from_be_bytes([
-                        target_signature[off],
-                        target_signature[off + 1],
-                        target_signature[off + 2],
-                        target_signature[off + 3],
-                    ]);
+                    target_words[i] =
+                        u32::from_be_bytes(target_signature[off..off + 4].try_into().unwrap());
                 }
                 let params = Hs256BruteForceParams {
                     target_signature: target_words,
@@ -215,54 +224,13 @@ impl MetalBruteForcer {
                 };
                 copy_value_to_buffer(&self.params_buf, &params);
             }
-            HmacVariant::Hs384 => {
-                if target_signature.len() != 48 {
-                    bail!(
-                        "HS384 signature must be 48 bytes, got {}",
-                        target_signature.len()
-                    );
-                }
+            HmacVariant::Hs384 | HmacVariant::Hs512 => {
+                let word_count = expected_len / 8;
                 let mut target_words = [0u64; 8];
-                for i in 0..6 {
+                for i in 0..word_count {
                     let off = i * 8;
-                    target_words[i] = u64::from_be_bytes([
-                        target_signature[off],
-                        target_signature[off + 1],
-                        target_signature[off + 2],
-                        target_signature[off + 3],
-                        target_signature[off + 4],
-                        target_signature[off + 5],
-                        target_signature[off + 6],
-                        target_signature[off + 7],
-                    ]);
-                }
-                let params = Hs512BruteForceParams {
-                    target_signature: target_words,
-                    message_length: self.message_length,
-                    candidate_count,
-                };
-                copy_value_to_buffer(&self.params_buf, &params);
-            }
-            HmacVariant::Hs512 => {
-                if target_signature.len() != 64 {
-                    bail!(
-                        "HS512 signature must be 64 bytes, got {}",
-                        target_signature.len()
-                    );
-                }
-                let mut target_words = [0u64; 8];
-                for i in 0..8 {
-                    let off = i * 8;
-                    target_words[i] = u64::from_be_bytes([
-                        target_signature[off],
-                        target_signature[off + 1],
-                        target_signature[off + 2],
-                        target_signature[off + 3],
-                        target_signature[off + 4],
-                        target_signature[off + 5],
-                        target_signature[off + 6],
-                        target_signature[off + 7],
-                    ]);
+                    target_words[i] =
+                        u64::from_be_bytes(target_signature[off..off + 8].try_into().unwrap());
                 }
                 let params = Hs512BruteForceParams {
                     target_signature: target_words,
@@ -301,12 +269,12 @@ impl MetalBruteForcer {
         let encoder = command_buffer.new_compute_command_encoder();
         let pipeline = self.active_pipeline_for_view(batch);
         encoder.set_compute_pipeline_state(pipeline);
-        encoder.set_buffer(0, Some(&self.params_buf), 0);
-        encoder.set_buffer(1, Some(&self.msg_buf), 0);
-        encoder.set_buffer(2, Some(batch.word_bytes_buf), 0);
-        encoder.set_buffer(3, Some(batch.word_offsets_buf), 0);
-        encoder.set_buffer(4, Some(batch.word_lengths_buf), 0);
-        encoder.set_buffer(5, Some(&self.result_buf), 0);
+        encoder.set_buffer(BUF_PARAMS, Some(&self.params_buf), 0);
+        encoder.set_buffer(BUF_MESSAGE, Some(&self.msg_buf), 0);
+        encoder.set_buffer(BUF_WORD_BYTES, Some(batch.word_bytes_buf), 0);
+        encoder.set_buffer(BUF_WORD_OFFSETS, Some(batch.word_offsets_buf), 0);
+        encoder.set_buffer(BUF_WORD_LENGTHS, Some(batch.word_lengths_buf), 0);
+        encoder.set_buffer(BUF_RESULT, Some(&self.result_buf), 0);
 
         let threads_per_group = MTLSize::new(threadgroup_width as u64, 1, 1);
         let threads_per_grid = MTLSize::new(candidate_count as u64, 1, 1);

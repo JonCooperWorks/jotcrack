@@ -33,6 +33,15 @@ impl HmacVariant {
             Self::Hs512 => "HS512",
         }
     }
+
+    /// The JWT `alg` header string for this variant.
+    pub(crate) fn alg_string(self) -> &'static str {
+        match self {
+            Self::Hs256 => "HS256",
+            Self::Hs384 => "HS384",
+            Self::Hs512 => "HS512",
+        }
+    }
 }
 
 /// Platform-agnostic interface for GPU brute-force dispatch.

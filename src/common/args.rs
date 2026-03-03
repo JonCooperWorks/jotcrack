@@ -1,25 +1,40 @@
-//! # CLI argument defaults and configuration resolution
-//!
-//! This module bridges the gap between "what the user typed on the command line"
-//! and "what the pipeline actually needs." CLI flags are often optional —
-//! [`ParserConfig::resolve()`] fills in sensible defaults (like auto-detecting
-//! CPU core count) so every downstream consumer gets a complete, validated config.
-//!
-//! ## Why separate "args" from "commands"?
-//!
-//! Each subcommand defines its own clap struct (e.g., `Hs256WordlistArgs`), but
-//! they all share the same resolution logic for parser threads, chunk sizes, and
-//! queue depths. Centralizing that logic here avoids duplication and ensures
-//! consistent defaults across all subcommands.
+use std::path::PathBuf;
+use clap::Args;
 
-/// Default wordlist file path used when `--wordlist` is not specified.
-/// `pub` (not `pub(crate)`) because the CLI contract tests in `commands/mod.rs`
-/// reference this constant to verify the default is wired correctly.
 pub const DEFAULT_WORDLIST_PATH: &str = "breach.txt";
 
-/// How many batches the producer can get ahead of the GPU consumer.
-/// Higher values smooth out I/O stalls but use more memory.
 pub(crate) const DEFAULT_PIPELINE_DEPTH: usize = 10;
+
+/// Shared CLI arguments for all wordlist cracking subcommands.
+#[derive(Debug, Clone, Args)]
+pub struct WordlistArgs {
+    /// JWT in compact form (`header.payload.signature`).
+    pub jwt: String,
+    /// Wordlist file path (one candidate secret per line).
+    #[arg(long, default_value = DEFAULT_WORDLIST_PATH)]
+    pub wordlist: PathBuf,
+    /// Fixed Metal threadgroup width override (default picks a safe value).
+    #[arg(long)]
+    pub threads_per_group: Option<usize>,
+    /// Number of parser worker threads for mmap chunk scanning.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub parser_threads: Option<usize>,
+    /// Max number of in-flight batches queued between parser and GPU consumer.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub pipeline_depth: Option<usize>,
+    /// Number of host packer workers that materialize planned batches.
+    #[arg(long, value_parser = parse_positive_usize)]
+    pub packer_threads: Option<usize>,
+    /// Benchmark several threadgroup widths on the first batch before steady-state dispatch.
+    #[arg(long)]
+    pub autotune: bool,
+}
+
+impl WordlistArgs {
+    pub(crate) fn parser_config(&self) -> ParserConfig {
+        ParserConfig::resolve(self.parser_threads)
+    }
+}
 
 /// Size of each chunk the parallel parser reads from the mmap'd wordlist.
 /// 16 MiB is large enough to amortize per-chunk overhead but small enough
