@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::common::batch::WordBatch;
+use crate::batch::WordBatch;
 
 use super::{GpuCommandHandle, GpuDevice};
 

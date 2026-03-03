@@ -15,11 +15,18 @@
 
 use std::process::ExitCode;
 
-// `mod commands;` declares the `commands` module as a child of the crate root.
-// Rust looks for either `commands.rs` or `commands/mod.rs`. Because we have
-// multiple subcommand files, we use the directory form (`commands/mod.rs`).
+mod args;
+mod batch;
 mod commands;
-mod common;
+mod gpu;
+mod jwt;
+mod parser;
+mod producer;
+mod runner;
+mod stats;
+
+#[cfg(test)]
+mod test_support;
 
 // Keep `main` intentionally thin: argument parsing, subcommand dispatch, and
 // exit-code policy live in `commands::run()` so they can be tested separately.

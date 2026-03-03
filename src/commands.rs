@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
-use crate::common::args::WordlistArgs;
-use crate::common::gpu::HmacVariant;
+use crate::args::WordlistArgs;
+use crate::gpu::HmacVariant;
 
 #[derive(Debug, Parser)]
 #[command(name = "jotcrack", about = "GPU-assisted JWT cracking with Metal")]
@@ -30,18 +30,18 @@ pub fn run() -> ExitCode {
 
     let result = match cli.command {
         Commands::Hs256wordlist(args) => {
-            crate::common::runner::run_wordlist_crack(HmacVariant::Hs256, args)
+            crate::runner::run_wordlist_crack(HmacVariant::Hs256, args)
         }
         Commands::Hs384wordlist(args) => {
-            crate::common::runner::run_wordlist_crack(HmacVariant::Hs384, args)
+            crate::runner::run_wordlist_crack(HmacVariant::Hs384, args)
         }
         Commands::Hs512wordlist(args) => {
-            crate::common::runner::run_wordlist_crack(HmacVariant::Hs512, args)
+            crate::runner::run_wordlist_crack(HmacVariant::Hs512, args)
         }
-        Commands::Autocrack(args) => match crate::common::jwt::detect_variant(&args.jwt) {
+        Commands::Autocrack(args) => match crate::jwt::detect_variant(&args.jwt) {
             Ok(variant) => {
                 eprintln!("AUTODETECT: JWT algorithm is {}", variant.label());
-                crate::common::runner::run_wordlist_crack(variant, args)
+                crate::runner::run_wordlist_crack(variant, args)
             }
             Err(e) => Err(e),
         },
@@ -60,7 +60,7 @@ pub fn run() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::args::DEFAULT_WORDLIST_PATH;
+    use crate::args::DEFAULT_WORDLIST_PATH;
     use clap::error::ErrorKind;
     use std::path::PathBuf;
 
