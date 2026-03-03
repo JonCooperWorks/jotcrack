@@ -18,18 +18,18 @@
 //!
 //! The only HS384-specific parts are the JWT parser (48-byte signature) and
 //! the GPU wrapper (6-word comparison, `hs384_*` kernel names).  Everything
-//! else is generic infrastructure shared via `crate::commands::common`.
+//! else is generic infrastructure shared via `crate::common`.
 
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 
 use super::args::{DEFAULT_PIPELINE_DEPTH, Hs384WordlistArgs};
-use super::gpu::GpuHs384BruteForcer;
+use crate::common::gpu::{GpuBruteForcer, GpuCommandHandle, HmacVariant, metal::MetalBruteForcer};
 use super::jwt::parse_hs384_jwt;
-use crate::commands::common::batch::APPROX_WORD_BATCH_BUFFER_BYTES;
-use crate::commands::common::producer::{ProducerMessage, WordlistProducer};
-use crate::commands::common::stats::{
+use crate::common::batch::APPROX_WORD_BATCH_BUFFER_BYTES;
+use crate::common::producer::{ProducerMessage, WordlistProducer};
+use crate::common::stats::{
     RateReportSnapshot, RunTimings, format_duration_millis, format_human_count, print_final_stats,
     rate_per_second,
 };
@@ -39,8 +39,8 @@ use crate::commands::common::stats::{
 ///
 /// This is the same pattern used in the HS256 and HS512 command modules.
 struct InFlightBatch {
-    cmd_buf: metal::CommandBuffer,
-    batch: crate::commands::common::batch::WordBatch,
+    cmd_buf: GpuCommandHandle,
+    batch: crate::common::batch::WordBatch,
     candidate_count: u64,
 }
 
@@ -79,7 +79,7 @@ fn handle_match(
 /// 4) report the first matching secret (or NOT FOUND).
 pub fn run(args: Hs384WordlistArgs) -> anyhow::Result<bool> {
     let (signing_input, target_signature) = parse_hs384_jwt(&args.jwt)?;
-    let mut gpu = GpuHs384BruteForcer::new(&signing_input)?;
+    let mut gpu = MetalBruteForcer::new(HmacVariant::Hs384, &signing_input)?;
     let parser_config = args.parser_config();
     let pipeline_depth = args.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH);
     let packer_threads = args
@@ -113,7 +113,7 @@ pub fn run(args: Hs384WordlistArgs) -> anyhow::Result<bool> {
     // construction can overlap with GPU setup and dispatch wait time.
     let mut producer = WordlistProducer::spawn(
         args.wordlist.clone(),
-        gpu.device.clone(),
+        gpu.device().clone(),
         parser_config,
         pipeline_depth,
         packer_threads,
@@ -213,7 +213,7 @@ pub fn run(args: Hs384WordlistArgs) -> anyhow::Result<bool> {
 
             timings.wordlist_batch_build += build_time;
             if !autotune_done {
-                gpu.autotune_threadgroup_width(target_signature, &batch)?;
+                gpu.autotune_threadgroup_width(&target_signature, &batch)?;
                 autotune_done = true;
             }
 
@@ -229,7 +229,7 @@ pub fn run(args: Hs384WordlistArgs) -> anyhow::Result<bool> {
             // Encode and commit immediately (non-blocking). The GPU starts
             // executing while we loop back to recv the next batch.
             let (cmd_buf, host_prep, command_encode) =
-                gpu.encode_and_commit(target_signature, &batch)?;
+                gpu.encode_and_commit(&target_signature, &batch)?;
             timings.host_prep += host_prep;
             timings.command_encode += command_encode;
             timings.dispatch_total += host_prep + command_encode;
@@ -289,7 +289,7 @@ pub fn run(args: Hs384WordlistArgs) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::super::args::Hs384WordlistArgs;
-    use crate::commands::common::test_support::{make_test_jwt, write_temp_wordlist};
+    use crate::common::test_support::{make_test_jwt, write_temp_wordlist};
     use std::path::PathBuf;
 
     fn make_args(jwt: &str, wordlist: PathBuf) -> Hs384WordlistArgs {

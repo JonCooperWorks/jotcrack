@@ -33,8 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // a file as a byte slice without reading it all into a `Vec<u8>`, which is
 // important for large wordlists (hundreds of MBs).
 use memmap2::MmapOptions;
-// `metal::Device` is the Rust binding to Apple's Metal GPU API.
-use metal::Device;
+use super::gpu::GpuDevice;
 
 use super::args::ParserConfig;
 use super::parser::{MmapWordlistBatchReader, ParallelMmapWordlistBatchReader};
@@ -54,8 +53,8 @@ static TEMP_WORDLIST_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// panic message — much better than `unwrap()` which would just say "None".
 /// In CI environments without a GPU, these tests will fail fast with an
 /// understandable message.
-pub(crate) fn test_device() -> Device {
-    Device::system_default().expect("Metal device is required for hs256wordlist tests")
+pub(crate) fn test_device() -> GpuDevice {
+    super::gpu::default_device().expect("GPU device is required for tests")
 }
 
 /// Write raw bytes to a uniquely-named temporary file and return its path.

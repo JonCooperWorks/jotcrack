@@ -72,7 +72,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail};
 use memmap2::Mmap;
-use metal::Device;
+
+use super::gpu::GpuDevice;
 
 use super::args::ParserConfig;
 use super::batch::WordBatch;
@@ -390,7 +391,7 @@ impl WordlistProducer {
     /// thousands of concurrent tasks.
     pub(crate) fn spawn(
         wordlist_path: PathBuf,
-        device: Device,
+        device: GpuDevice,
         parser_config: ParserConfig,
         pipeline_depth: usize,
         packer_threads: usize,
@@ -561,7 +562,7 @@ impl WordlistProducer {
 // EOF, stop requested, or the receiver is dropped.
 fn run_wordlist_producer(
     wordlist_path: PathBuf,
-    device: Device,
+    device: GpuDevice,
     parser_config: ParserConfig,
     pipeline_depth: usize,
     packer_threads: usize,

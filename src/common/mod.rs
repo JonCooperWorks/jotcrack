@@ -34,6 +34,7 @@ pub(crate) mod args;
 pub(crate) mod batch;
 pub(crate) mod parser;
 pub(crate) mod producer;
+pub(crate) mod gpu;
 pub(crate) mod stats;
 
 // `#[cfg(test)]` means this module only exists in test builds. It provides

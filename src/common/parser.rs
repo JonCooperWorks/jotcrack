@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow, bail};
 use memchr::memchr;
 use memmap2::{Advice, Mmap, MmapOptions};
-use metal::Device;
+use super::gpu::GpuDevice;
 
 use super::args::ParserConfig;
 use super::batch::{WordBatch, batch_shape_can_fit, batch_shape_can_fit_block};
@@ -44,7 +44,7 @@ pub(crate) fn trim_line_endings(bytes: &[u8]) -> &[u8] {
 // without carrying a slower runtime fallback that would skew performance tuning.
 #[cfg(test)]
 pub(crate) struct BufferedWordlistBatchReader<R: BufRead> {
-    device: Device,
+    device: GpuDevice,
     reader: R,
     line_buf: Vec<u8>,
     pending_line: Option<Vec<u8>>,
@@ -57,7 +57,7 @@ pub(crate) struct BufferedWordlistBatchReader<R: BufRead> {
 #[cfg(test)]
 impl<R: BufRead> BufferedWordlistBatchReader<R> {
     // Construct a buffered batch reader over any `BufRead` source.
-    pub(crate) fn new(device: Device, reader: R) -> Self {
+    pub(crate) fn new(device: GpuDevice, reader: R) -> Self {
         Self {
             device,
             reader,
@@ -167,7 +167,7 @@ impl<R: BufRead> BufferedWordlistBatchReader<R> {
 // unit tests (especially ordering and line-trimming semantics).
 #[cfg(test)]
 pub(crate) struct MmapWordlistBatchReader {
-    device: Device,
+    device: GpuDevice,
     mmap: Mmap,
     cursor: usize,
     // Same semantic as the test-only buffered reader: absolute index of the next
@@ -178,7 +178,7 @@ pub(crate) struct MmapWordlistBatchReader {
 #[cfg(test)]
 impl MmapWordlistBatchReader {
     // Wrap a mapped wordlist file for sequential batch extraction.
-    pub(crate) fn new(device: Device, mmap: Mmap) -> Self {
+    pub(crate) fn new(device: GpuDevice, mmap: Mmap) -> Self {
         Self {
             device,
             mmap,
@@ -554,7 +554,7 @@ pub(crate) fn pack_batch_plan_into_batch(
 // GPU dispatch contract (`WordBatch`) without parallel writes into Metal memory.
 pub(crate) struct ParallelMmapWordlistBatchReader {
     #[cfg(test)]
-    device: Device,
+    device: GpuDevice,
     mmap: Arc<Mmap>,
     // Precomputed newline-aligned chunk plan for the whole file.
     chunks: Vec<ChunkJob>,
@@ -598,7 +598,7 @@ impl ParallelMmapWordlistBatchReader {
     // 1) map+plan chunks (already done before this call)
     // 2) create bounded channels (backpressure)
     // 3) spawn worker threads that parse chunk metadata only
-    pub(crate) fn new(device: Device, mmap: Mmap, config: ParserConfig) -> anyhow::Result<Self> {
+    pub(crate) fn new(device: GpuDevice, mmap: Mmap, config: ParserConfig) -> anyhow::Result<Self> {
         #[cfg(not(test))]
         let _ = device;
         let mmap = Arc::new(mmap);
@@ -962,7 +962,7 @@ impl AnyWordlistBatchReader {
     // Runtime path is mmap-only. If mapping fails, return an error instead of
     // silently switching to a slower path (which would hide perf regressions).
     pub(crate) fn new(
-        device: Device,
+        device: GpuDevice,
         path: &PathBuf,
         parser_config: ParserConfig,
     ) -> anyhow::Result<Self> {

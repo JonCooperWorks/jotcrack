@@ -50,7 +50,8 @@
 //! an explicit DMA transfer.
 
 use anyhow::{Context, bail};
-use metal::{Device, MTLResourceOptions};
+
+use super::gpu::{GpuBuffer, GpuDevice, alloc_shared_buffer, buffer_host_ptr};
 
 // Larger batches improve amortization of dispatch overhead and host work.
 //
@@ -118,7 +119,7 @@ pub(crate) struct WordBatch {
     // anymore; the kernel returns a batch-local match index (`u32`) instead.
     pub(crate) candidate_index_base: u64,
 
-    // --- Metal shared buffers ---
+    // --- GPU shared buffers ---
     //
     // These are the actual GPU-visible allocations. On Apple Silicon, "shared"
     // means the same physical memory page is mapped into both CPU and GPU address
@@ -127,9 +128,9 @@ pub(crate) struct WordBatch {
     //
     // Buffers that are directly bound to the kernel at dispatch time.
     // The producer fills them; the consumer reuses the same allocations.
-    word_bytes_buf: metal::Buffer,
-    word_offsets_buf: metal::Buffer,
-    word_lengths_buf: metal::Buffer,
+    word_bytes_buf: GpuBuffer,
+    word_offsets_buf: GpuBuffer,
+    word_lengths_buf: GpuBuffer,
 
     // --- Cached raw pointers (performance optimization) ---
     //
@@ -290,24 +291,19 @@ impl WordBatch {
     /// FFI overhead.
     // Allocate fixed-capacity shared buffers sized to the batch caps so parser
     // writes can go straight into memory later bound to the kernel.
-    pub(crate) fn new(device: &Device, candidate_index_base: u64) -> Self {
-        let options = MTLResourceOptions::StorageModeShared;
-        let word_bytes_buf = device.new_buffer(MAX_WORD_BYTES_PER_BATCH as u64, options);
-        let word_offsets_buf = device.new_buffer(
-            (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u32>()) as u64,
-            options,
-        );
-        let word_lengths_buf = device.new_buffer(
-            (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u16>()) as u64,
-            options,
-        );
-        // `contents()` is stable for the lifetime of each buffer allocation, so
-        // we cache the pointers once and use raw pointer math in `push_candidate`.
+    pub(crate) fn new(device: &GpuDevice, candidate_index_base: u64) -> Self {
+        let word_bytes_buf = alloc_shared_buffer(device, MAX_WORD_BYTES_PER_BATCH);
+        let word_offsets_buf =
+            alloc_shared_buffer(device, MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u32>());
+        let word_lengths_buf =
+            alloc_shared_buffer(device, MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u16>());
+        // The host pointer is stable for the lifetime of each buffer allocation,
+        // so we cache it once and use raw pointer math in `push_candidate`.
         Self {
             candidate_index_base,
-            word_bytes_ptr: word_bytes_buf.contents() as usize,
-            word_offsets_ptr: word_offsets_buf.contents() as usize,
-            word_lengths_ptr: word_lengths_buf.contents() as usize,
+            word_bytes_ptr: buffer_host_ptr(&word_bytes_buf) as usize,
+            word_offsets_ptr: buffer_host_ptr(&word_offsets_buf) as usize,
+            word_lengths_ptr: buffer_host_ptr(&word_lengths_buf) as usize,
             word_bytes_buf,
             word_offsets_buf,
             word_lengths_buf,
@@ -358,15 +354,15 @@ impl WordBatch {
         self.max_word_len
     }
 
-    fn offsets_buffer(&self) -> &metal::Buffer {
+    fn offsets_buffer(&self) -> &GpuBuffer {
         &self.word_offsets_buf
     }
 
-    fn lengths_buffer(&self) -> &metal::Buffer {
+    fn lengths_buffer(&self) -> &GpuBuffer {
         &self.word_lengths_buf
     }
 
-    fn word_bytes_buffer(&self) -> &metal::Buffer {
+    fn word_bytes_buffer(&self) -> &GpuBuffer {
         &self.word_bytes_buf
     }
 
@@ -677,9 +673,9 @@ pub(crate) struct DispatchBatchView<'a> {
     // sampled prefix batch without owning the storage.
     pub(crate) candidate_count: usize,
     pub(crate) max_word_len: u16,
-    pub(crate) word_bytes_buf: &'a metal::Buffer,
-    pub(crate) word_offsets_buf: &'a metal::Buffer,
-    pub(crate) word_lengths_buf: &'a metal::Buffer,
+    pub(crate) word_bytes_buf: &'a GpuBuffer,
+    pub(crate) word_offsets_buf: &'a GpuBuffer,
+    pub(crate) word_lengths_buf: &'a GpuBuffer,
 }
 
 #[cfg(test)]

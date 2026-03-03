@@ -31,8 +31,6 @@ use std::process::ExitCode;
 // `pub(crate)` means "public within this crate but invisible to external users."
 // `common` holds shared infrastructure (args, stats, parsers) that every
 // subcommand needs but that we do not want to expose as a public API.
-pub(crate) mod common;
-
 // These are `pub` (not `pub(crate)`) because integration tests or benchmarks
 // in `tests/` may need to reference their argument types. If you only ever
 // access them from within the crate, `pub(crate)` would be more appropriate.

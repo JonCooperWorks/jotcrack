@@ -113,7 +113,7 @@ pub fn run(args: AutocrackArgs) -> anyhow::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::super::args::AutocrackArgs;
-    use crate::commands::common::test_support::{make_test_jwt, write_temp_wordlist};
+    use crate::common::test_support::{make_test_jwt, write_temp_wordlist};
     use std::path::PathBuf;
 
     /// Helper to construct `AutocrackArgs` with minimal config for testing.

@@ -19,6 +19,7 @@ use std::process::ExitCode;
 // Rust looks for either `commands.rs` or `commands/mod.rs`. Because we have
 // multiple subcommand files, we use the directory form (`commands/mod.rs`).
 mod commands;
+mod common;
 
 // Keep `main` intentionally thin: argument parsing, subcommand dispatch, and
 // exit-code policy live in `commands::run()` so they can be tested separately.

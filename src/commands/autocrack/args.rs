@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use crate::commands::common::args::{DEFAULT_WORDLIST_PATH, parse_positive_usize};
+use crate::common::args::{DEFAULT_WORDLIST_PATH, parse_positive_usize};
 
 /// Automatically detect the HMAC-SHA algorithm from the JWT header and crack it.
 ///

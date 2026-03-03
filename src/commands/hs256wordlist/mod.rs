@@ -36,10 +36,9 @@
 
 mod args;
 mod command;
-mod gpu;
 mod jwt;
 
 pub use args::Hs256WordlistArgs;
 #[allow(dead_code)]
-pub const DEFAULT_WORDLIST_PATH: &str = crate::commands::common::args::DEFAULT_WORDLIST_PATH;
+pub const DEFAULT_WORDLIST_PATH: &str = crate::common::args::DEFAULT_WORDLIST_PATH;
 pub use command::run;

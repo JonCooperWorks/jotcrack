@@ -70,11 +70,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, anyhow, bail};
 
 use super::args::{DEFAULT_PIPELINE_DEPTH, Hs256WordlistArgs};
-use super::gpu::GpuHs256BruteForcer;
+use crate::common::gpu::{GpuBruteForcer, GpuCommandHandle, HmacVariant, metal::MetalBruteForcer};
 use super::jwt::parse_hs256_jwt;
-use crate::commands::common::batch::APPROX_WORD_BATCH_BUFFER_BYTES;
-use crate::commands::common::producer::{ProducerMessage, WordlistProducer};
-use crate::commands::common::stats::{
+use crate::common::batch::APPROX_WORD_BATCH_BUFFER_BYTES;
+use crate::common::producer::{ProducerMessage, WordlistProducer};
+use crate::common::stats::{
     RateReportSnapshot, RunTimings, format_duration_millis, format_human_count, print_final_stats,
     rate_per_second,
 };
@@ -89,8 +89,8 @@ use crate::commands::common::stats::{
 ///
 /// Defined at module scope so `handle_match` can reference it.
 struct InFlightBatch {
-    cmd_buf: metal::CommandBuffer,
-    batch: crate::commands::common::batch::WordBatch,
+    cmd_buf: GpuCommandHandle,
+    batch: crate::common::batch::WordBatch,
     candidate_count: u64,
 }
 
@@ -146,7 +146,7 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
 
     // ---- Phase 2: Initialize Metal GPU runtime ----
     // Compiles shaders, creates pipeline states, allocates shared buffers.
-    let mut gpu = GpuHs256BruteForcer::new(&signing_input)?;
+    let mut gpu = MetalBruteForcer::new(HmacVariant::Hs256, &signing_input)?;
 
     // ---- Phase 3: Resolve configuration parameters ----
     let parser_config = args.parser_config();
@@ -190,7 +190,7 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
     // can allocate shared-memory buffers directly (avoiding copies later).
     let mut producer = WordlistProducer::spawn(
         args.wordlist.clone(),
-        gpu.device.clone(),
+        gpu.device().clone(),
         parser_config,
         pipeline_depth,
         packer_threads,
@@ -357,7 +357,7 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
             // This burns a small sample (~16K candidates) to find the optimal
             // threadgroup width before entering steady-state dispatch.
             if !autotune_done {
-                gpu.autotune_threadgroup_width(target_signature, &batch)?;
+                gpu.autotune_threadgroup_width(&target_signature, &batch)?;
                 autotune_done = true;
             }
 
@@ -379,7 +379,7 @@ pub fn run(args: Hs256WordlistArgs) -> anyhow::Result<bool> {
             // N+1, and on the next iteration we will recv batch N+2 while
             // the GPU processes batch N+1.
             let (cmd_buf, host_prep, command_encode) =
-                gpu.encode_and_commit(target_signature, &batch)?;
+                gpu.encode_and_commit(&target_signature, &batch)?;
             timings.host_prep += host_prep;
             timings.command_encode += command_encode;
             timings.dispatch_total += host_prep + command_encode;

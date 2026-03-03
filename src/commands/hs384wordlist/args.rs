@@ -20,12 +20,12 @@ use std::path::PathBuf;
 
 use clap::Args;
 
-use crate::commands::common::args::{
+use crate::common::args::{
     DEFAULT_WORDLIST_PATH, ParserConfig, parse_positive_usize,
 };
 
 pub(crate) const DEFAULT_PIPELINE_DEPTH: usize =
-    crate::commands::common::args::DEFAULT_PIPELINE_DEPTH;
+    crate::common::args::DEFAULT_PIPELINE_DEPTH;
 
 /// Command-line arguments for the HS384 wordlist attack.
 ///
