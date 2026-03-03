@@ -25,17 +25,9 @@ impl HmacVariant {
         }
     }
 
-    /// Human-readable label for result output (e.g. "HS256 key:").
+    /// Human-readable algorithm name (e.g. "HS256").
+    /// Used for output labels, JWT `alg` header matching, and error messages.
     pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Hs256 => "HS256",
-            Self::Hs384 => "HS384",
-            Self::Hs512 => "HS512",
-        }
-    }
-
-    /// The JWT `alg` header string for this variant.
-    pub(crate) fn alg_string(self) -> &'static str {
         match self {
             Self::Hs256 => "HS256",
             Self::Hs384 => "HS384",

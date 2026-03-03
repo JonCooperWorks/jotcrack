@@ -1,44 +1,25 @@
-//! End-to-end orchestration for the HS512 wordlist cracking command.
-//!
-//! # Learning note: same pipeline, different types
-//!
-//! This module is structurally identical to `hs384wordlist/command.rs`.
-//! The only differences are:
-//!   - It calls `parse_hs512_jwt` (expects 64-byte signature, not 48).
-//!   - It uses `GpuHs512BruteForcer` (selects `hs512_*` kernel entry points).
-//!   - The `target_signature` is `[u8; 64]` instead of `[u8; 48]`.
-//!
-//! The producer-consumer pipeline, double-buffered dispatch, autotune, rate
-//! reporting, and shutdown logic are all the same.  In a larger codebase you
-//! might extract this into a generic function parameterized over signature
-//! size and GPU type, but the current approach keeps each subcommand easy to
-//! read and modify independently.
-
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 
-use super::args::{DEFAULT_PIPELINE_DEPTH, Hs512WordlistArgs};
-use crate::common::gpu::{GpuBruteForcer, GpuCommandHandle, HmacVariant, metal::MetalBruteForcer};
-use super::jwt::parse_hs512_jwt;
-use crate::common::batch::APPROX_WORD_BATCH_BUFFER_BYTES;
-use crate::common::producer::{ProducerMessage, WordlistProducer};
-use crate::common::stats::{
+use super::args::{WordlistArgs, DEFAULT_PIPELINE_DEPTH};
+use super::batch::APPROX_WORD_BATCH_BUFFER_BYTES;
+use super::gpu::{GpuBruteForcer, GpuCommandHandle, HmacVariant, metal::MetalBruteForcer};
+use super::jwt::parse_jwt;
+use super::producer::{ProducerMessage, WordlistProducer};
+use super::stats::{
     RateReportSnapshot, RunTimings, format_duration_millis, format_human_count, print_final_stats,
     rate_per_second,
 };
 
-/// Holds the command buffer + batch for a currently executing GPU dispatch.
-/// Same pattern as HS256 and HS384 command modules.
 struct InFlightBatch {
     cmd_buf: GpuCommandHandle,
-    batch: crate::common::batch::WordBatch,
+    batch: super::batch::WordBatch,
     candidate_count: u64,
 }
 
-// Extract the matched secret from a completed GPU batch, print final stats,
-// and return `Ok(true)`. Called from both the main loop and the post-EOF drain.
 fn handle_match(
+    variant: HmacVariant,
     flight: &InFlightBatch,
     local_match_index: u32,
     candidates_tested: u64,
@@ -60,18 +41,25 @@ fn handle_match(
         .batch
         .word_string_lossy(local_index)
         .ok_or_else(|| anyhow!("GPU returned invalid local candidate index"))?;
-    println!("HS512 key: {secret}");
+    println!("{} key: {secret}", variant.label());
     Ok(true)
 }
 
-/// End-to-end HS512 cracking flow:
-/// 1) parse the JWT,
-/// 2) initialize Metal + reusable buffers,
-/// 3) overlap wordlist parsing with GPU dispatch,
-/// 4) report the first matching secret (or NOT FOUND).
-pub fn run(args: Hs512WordlistArgs) -> anyhow::Result<bool> {
-    let (signing_input, target_signature) = parse_hs512_jwt(&args.jwt)?;
-    let mut gpu = MetalBruteForcer::new(HmacVariant::Hs512, &signing_input)?;
+/// Run the full wordlist cracking pipeline for any HMAC variant.
+///
+/// 1. Parse and validate the JWT.
+/// 2. Initialize the GPU backend.
+/// 3. Spawn the wordlist producer.
+/// 4. Execute the double-buffered dispatch loop.
+/// 5. Report results and shut down.
+///
+/// Returns `Ok(true)` if the key was found, `Ok(false)` if not found.
+pub(crate) fn run_wordlist_crack(
+    variant: HmacVariant,
+    args: WordlistArgs,
+) -> anyhow::Result<bool> {
+    let (signing_input, target_signature) = parse_jwt(variant, &args.jwt)?;
+    let mut gpu = MetalBruteForcer::new(variant, &signing_input)?;
     let parser_config = args.parser_config();
     let pipeline_depth = args.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH);
     let packer_threads = args
@@ -101,8 +89,6 @@ pub fn run(args: Hs512WordlistArgs) -> anyhow::Result<bool> {
         parser_config.parser_threads, packer_threads
     );
 
-    // Start the parser thread before entering the main loop so batch
-    // construction can overlap with GPU setup and dispatch wait time.
     let mut producer = WordlistProducer::spawn(
         args.wordlist.clone(),
         gpu.device().clone(),
@@ -124,21 +110,13 @@ pub fn run(args: Hs512WordlistArgs) -> anyhow::Result<bool> {
         let mut last_rate_report =
             RateReportSnapshot::capture(started_at, candidates_tested, &timings);
 
-        // Double-buffered dispatch: receive batch N+1 while GPU executes batch N.
-        // `in_flight` holds the command buffer + batch for the currently executing
-        // GPU dispatch; the consumer loop overlaps recv with GPU execution.
         let mut in_flight: Option<InFlightBatch> = None;
 
         loop {
-            // Receive the next batch while the GPU processes the in-flight one.
-            // This overlap is the key throughput improvement: idle_wait now runs
-            // concurrently with gpu_wait instead of serially.
             let recv_started = Instant::now();
             let message = producer.recv()?;
             timings.consumer_idle_wait += recv_started.elapsed();
 
-            // Complete the previous in-flight GPU dispatch before encoding a new
-            // one (params_buf/result_buf are shared across dispatches).
             if let Some(flight) = in_flight.take() {
                 let (maybe_match, gpu_wait, result_readback) = gpu.wait_and_readback(&flight.cmd_buf);
                 timings.gpu_wait += gpu_wait;
@@ -148,10 +126,9 @@ pub fn run(args: Hs512WordlistArgs) -> anyhow::Result<bool> {
                     candidates_tested.saturating_add(flight.candidate_count);
 
                 if let Some(local_match_index) = maybe_match {
-                    return handle_match(&flight, local_match_index, candidates_tested, started_at, &timings);
+                    return handle_match(variant, &flight, local_match_index, candidates_tested, started_at, &timings);
                 }
 
-                // Periodic rate reporting after completing a GPU batch.
                 let now = Instant::now();
                 let elapsed_since_last_report = now
                     .checked_duration_since(last_rate_report.reported_at)
@@ -218,8 +195,6 @@ pub fn run(args: Hs512WordlistArgs) -> anyhow::Result<bool> {
                 .total_batch_word_bytes
                 .saturating_add(batch.word_bytes_len() as u64);
 
-            // Encode and commit immediately (non-blocking). The GPU starts
-            // executing while we loop back to recv the next batch.
             let (cmd_buf, host_prep, command_encode) =
                 gpu.encode_and_commit(&target_signature, &batch)?;
             timings.host_prep += host_prep;
@@ -233,7 +208,7 @@ pub fn run(args: Hs512WordlistArgs) -> anyhow::Result<bool> {
             });
         }
 
-        // Drain the last in-flight batch after EOF from the producer.
+        // Drain the last in-flight batch after EOF.
         if let Some(flight) = in_flight.take() {
             let (maybe_match, gpu_wait, result_readback) = gpu.wait_and_readback(&flight.cmd_buf);
             timings.gpu_wait += gpu_wait;
@@ -243,7 +218,7 @@ pub fn run(args: Hs512WordlistArgs) -> anyhow::Result<bool> {
                 candidates_tested.saturating_add(flight.candidate_count);
 
             if let Some(local_match_index) = maybe_match {
-                return handle_match(&flight, local_match_index, candidates_tested, started_at, &timings);
+                return handle_match(variant, &flight, local_match_index, candidates_tested, started_at, &timings);
             }
 
             producer.recycle(flight.batch);
@@ -263,14 +238,10 @@ pub fn run(args: Hs512WordlistArgs) -> anyhow::Result<bool> {
         Ok(false)
     })();
 
-    // Shutdown order matters on early exit: signal stop, drop the receiver so a
-    // bounded send cannot block, then join the producer thread.
     producer.stop();
     producer.close_receiver();
     let join_result = producer.join();
 
-    // Preserve the primary command error if one occurred. Producer join errors
-    // only matter when the main run path succeeded.
     match (run_result, join_result) {
         (Err(err), _) => Err(err),
         (Ok(_), Err(err)) => Err(err),
@@ -280,12 +251,13 @@ pub fn run(args: Hs512WordlistArgs) -> anyhow::Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::args::Hs512WordlistArgs;
-    use crate::common::test_support::{make_test_jwt, write_temp_wordlist};
+    use super::super::gpu::HmacVariant;
+    use super::super::test_support::{make_test_jwt, write_temp_wordlist};
+    use super::*;
     use std::path::PathBuf;
 
-    fn make_args(jwt: &str, wordlist: PathBuf) -> Hs512WordlistArgs {
-        Hs512WordlistArgs {
+    fn make_args(jwt: &str, wordlist: PathBuf) -> WordlistArgs {
+        WordlistArgs {
             jwt: jwt.to_string(),
             wordlist,
             threads_per_group: None,
@@ -297,10 +269,46 @@ mod tests {
     }
 
     #[test]
+    fn hs256_cracks_known_secret() {
+        let jwt = make_test_jwt("HS256", r#"{"sub":"test"}"#, b"password");
+        let path = write_temp_wordlist(b"wrong1\nwrong2\npassword\nwrong3\n");
+        let result = run_wordlist_crack(HmacVariant::Hs256, make_args(&jwt, path.clone())).unwrap();
+        assert!(result, "expected HS256 crack to find 'password'");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hs256_reports_not_found() {
+        let jwt = make_test_jwt("HS256", r#"{"sub":"test"}"#, b"43i358hsfksdbfffsdf");
+        let path = write_temp_wordlist(b"wrong1\nwrong2\nwrong3\n");
+        let result = run_wordlist_crack(HmacVariant::Hs256, make_args(&jwt, path.clone())).unwrap();
+        assert!(!result, "expected HS256 crack to report not found");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hs384_cracks_known_secret() {
+        let jwt = make_test_jwt("HS384", r#"{"sub":"test"}"#, b"password");
+        let path = write_temp_wordlist(b"wrong1\nwrong2\npassword\nwrong3\n");
+        let result = run_wordlist_crack(HmacVariant::Hs384, make_args(&jwt, path.clone())).unwrap();
+        assert!(result, "expected HS384 crack to find 'password'");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn hs384_reports_not_found() {
+        let jwt = make_test_jwt("HS384", r#"{"sub":"test"}"#, b"43i358hsfksdbfffsdf");
+        let path = write_temp_wordlist(b"wrong1\nwrong2\nwrong3\n");
+        let result = run_wordlist_crack(HmacVariant::Hs384, make_args(&jwt, path.clone())).unwrap();
+        assert!(!result, "expected HS384 crack to report not found");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn hs512_cracks_known_secret() {
         let jwt = make_test_jwt("HS512", r#"{"sub":"test"}"#, b"password");
         let path = write_temp_wordlist(b"wrong1\nwrong2\npassword\nwrong3\n");
-        let result = super::run(make_args(&jwt, path.clone())).unwrap();
+        let result = run_wordlist_crack(HmacVariant::Hs512, make_args(&jwt, path.clone())).unwrap();
         assert!(result, "expected HS512 crack to find 'password'");
         let _ = std::fs::remove_file(path);
     }
@@ -309,8 +317,57 @@ mod tests {
     fn hs512_reports_not_found() {
         let jwt = make_test_jwt("HS512", r#"{"sub":"test"}"#, b"43i358hsfksdbfffsdf");
         let path = write_temp_wordlist(b"wrong1\nwrong2\nwrong3\n");
-        let result = super::run(make_args(&jwt, path.clone())).unwrap();
+        let result = run_wordlist_crack(HmacVariant::Hs512, make_args(&jwt, path.clone())).unwrap();
         assert!(!result, "expected HS512 crack to report not found");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn autocrack_routes_hs256() {
+        let jwt = make_test_jwt("HS256", r#"{"sub":"auto"}"#, b"password");
+        let path = write_temp_wordlist(b"wrong1\npassword\nwrong2\n");
+        let variant = super::super::jwt::detect_variant(&jwt).unwrap();
+        let result = run_wordlist_crack(variant, make_args(&jwt, path.clone())).unwrap();
+        assert!(result, "autocrack should find 'password' via HS256");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn autocrack_routes_hs384() {
+        let jwt = make_test_jwt("HS384", r#"{"sub":"auto"}"#, b"password");
+        let path = write_temp_wordlist(b"wrong1\npassword\nwrong2\n");
+        let variant = super::super::jwt::detect_variant(&jwt).unwrap();
+        let result = run_wordlist_crack(variant, make_args(&jwt, path.clone())).unwrap();
+        assert!(result, "autocrack should find 'password' via HS384");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn autocrack_routes_hs512() {
+        let jwt = make_test_jwt("HS512", r#"{"sub":"auto"}"#, b"password");
+        let path = write_temp_wordlist(b"wrong1\npassword\nwrong2\n");
+        let variant = super::super::jwt::detect_variant(&jwt).unwrap();
+        let result = run_wordlist_crack(variant, make_args(&jwt, path.clone())).unwrap();
+        assert!(result, "autocrack should find 'password' via HS512");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn autocrack_rejects_unsupported_alg() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(br#"{"sub":"test"}"#);
+        let fake_sig = URL_SAFE_NO_PAD.encode(b"fakesignaturebytes");
+        let jwt = format!("{header}.{payload}.{fake_sig}");
+
+        let result = super::super::jwt::detect_variant(&jwt);
+        let err = result.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("unsupported JWT algorithm: RS256"),
+            "expected unsupported algorithm error, got: {msg}"
+        );
     }
 }
