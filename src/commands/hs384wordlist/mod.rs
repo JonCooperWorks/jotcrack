@@ -7,7 +7,7 @@
 //!   1. Different initial hash values (IV), defined in FIPS 180-4 section 5.3.4.
 //!   2. The output is truncated to 48 bytes (384 bits) instead of 64 bytes.
 //!
-//! Despite sharing the GPU kernel source file (`common/hs512_wordlist.metal`),
+//! Despite sharing the GPU kernel source file (`hs512wordlist/hs512_wordlist.metal`),
 //! this module exists as its own subcommand because:
 //!   - The JWT validation enforces `alg=HS384` and expects a 48-byte signature.
 //!   - The host-side byte-to-word conversion fills only 6 of 8 u64 words.

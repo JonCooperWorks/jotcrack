@@ -5,7 +5,7 @@
 //! SHA-384 and SHA-512 use the same compression function -- they differ only
 //! in their initial state values and output length.  Rather than maintaining
 //! two nearly-identical `.metal` files, we keep one shared kernel source at
-//! `src/commands/common/hs512_wordlist.metal` that contains entry points for
+//! `src/commands/hs512wordlist/hs512_wordlist.metal` that contains entry points for
 //! **both** algorithms: `hs384_wordlist`, `hs384_wordlist_short_keys`,
 //! `hs512_wordlist`, and `hs512_wordlist_short_keys`.
 //!
@@ -47,13 +47,14 @@ use crate::commands::common::stats::{BatchDispatchTimings, format_human_count};
 
 // Embed the Metal source into the binary so release builds do not depend on a
 // runtime-relative source file path.  HS384 shares the HS512 Metal source
-// (which contains both hs384_* and hs512_* kernel entry points).
+// (which lives in the hs512wordlist/ directory and contains both hs384_* and
+// hs512_* kernel entry points).
 //
 // Learning note: `include_str!()` is a compile-time macro that reads a file
 // relative to the current source file and bakes its contents into the binary
 // as a `&'static str`.  This means the final executable is self-contained --
 // no external `.metal` file is needed at runtime.
-const METAL_SOURCE_EMBEDDED: &str = include_str!("../common/hs512_wordlist.metal");
+const METAL_SOURCE_EMBEDDED: &str = include_str!("../hs512wordlist/hs512_wordlist.metal");
 // We keep both kernels loaded and choose per batch based on candidate lengths.
 const METAL_FUNCTION_NAME_MIXED: &str = "hs384_wordlist";
 const METAL_FUNCTION_NAME_SHORT_KEYS: &str = "hs384_wordlist_short_keys";

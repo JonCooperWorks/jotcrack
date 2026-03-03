@@ -9,8 +9,8 @@
 //!   - The HMAC block size is 128 bytes, so keys <= 128 bytes are zero-padded
 //!     directly; keys > 128 bytes are hashed first (RFC 2104).
 //!
-//! This module shares the Metal kernel source with HS384 via
-//! `common/hs512_wordlist.metal`.  The kernel file contains entry points for
+//! This module owns the Metal kernel source (`hs512_wordlist.metal` in this
+//! directory), which is also shared with HS384.  The kernel file contains entry points for
 //! both `hs384_wordlist*` and `hs512_wordlist*`; each Rust-side GPU wrapper
 //! selects its own kernel function name and signature byte count.
 //!

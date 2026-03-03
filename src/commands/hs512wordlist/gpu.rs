@@ -36,10 +36,9 @@ use crate::commands::common::stats::{BatchDispatchTimings, format_human_count};
 // runtime-relative source file path.
 //
 // Learning note: the same `.metal` file is also `include_str!`'d by the HS384
-// gpu.rs.  Each binary only needs one copy because the linker deduplicates
-// identical string constants, but conceptually both modules reference the
-// same shared kernel source.
-const METAL_SOURCE_EMBEDDED: &str = include_str!("../common/hs512_wordlist.metal");
+// gpu.rs (which reaches over to this directory).  Each binary only needs one
+// copy because the linker deduplicates identical string constants.
+const METAL_SOURCE_EMBEDDED: &str = include_str!("hs512_wordlist.metal");
 // We keep both kernels loaded and choose per batch based on candidate lengths.
 const METAL_FUNCTION_NAME_MIXED: &str = "hs512_wordlist";
 const METAL_FUNCTION_NAME_SHORT_KEYS: &str = "hs512_wordlist_short_keys";

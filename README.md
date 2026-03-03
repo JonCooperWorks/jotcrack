@@ -37,12 +37,8 @@ The easiest way to crack a JWT is `autocrack` — it reads the algorithm from th
 Example:
 
 ```bash
-# Crack an HS256 JWT using the auto-detector
-./target/release/jotcrack autocrack "$(cat jwt_hs256_password)" --wordlist wordlists.txt
-
-# It also works with HS384 and HS512 — same command
-./target/release/jotcrack autocrack "$(cat jwt_hs384_password)" --wordlist wordlists.txt
-./target/release/jotcrack autocrack "$(cat jwt_hs512_password)" --wordlist wordlists.txt
+# Crack any HMAC-SHA JWT — autocrack reads the algorithm from the header
+./target/release/jotcrack autocrack 'eyJhbGciOiJIUzI1NiIs...' --wordlist my_wordlist.txt
 ```
 
 ## Subcommands
@@ -51,8 +47,8 @@ Example:
 |---------|-----------|---------------|------------|
 | `autocrack` | Auto-detect from JWT header | — | Routes to the right one |
 | `hs256wordlist` | HMAC-SHA256 | 32 bytes | `hs256_wordlist.metal` |
-| `hs384wordlist` | HMAC-SHA384 | 48 bytes | `hs512_wordlist.metal` (shared) |
-| `hs512wordlist` | HMAC-SHA512 | 64 bytes | `hs512_wordlist.metal` (shared) |
+| `hs384wordlist` | HMAC-SHA384 | 48 bytes | `hs512_wordlist.metal` (shared from hs512wordlist/) |
+| `hs512wordlist` | HMAC-SHA512 | 64 bytes | `hs512_wordlist.metal` |
 
 `autocrack` is the recommended default. Use the algorithm-specific commands if you want to skip the auto-detection step.
 
@@ -73,40 +69,11 @@ OPTIONS:
   --autotune                  Benchmark threadgroup widths on first batch
 ```
 
-## JWT test files
+## Testing
 
-The repo includes pre-generated JWT files for testing and benchmarking:
+We tested all three algorithms end-to-end with our own wordlist — cracking known secrets (e.g. `"password"`) and running full-throughput stress tests with random 32-character keys that don't appear in the wordlist (to force a complete scan and measure sustained GPU speed).
 
-| File | Algorithm | Secret | Purpose |
-|------|-----------|--------|---------|
-| `jwt_hs256_password` | HS256 | `password` | Quick crack test (should find it) |
-| `jwt_hs384_password` | HS384 | `password` | Quick crack test |
-| `jwt_hs512_password` | HS512 | `password` | Quick crack test |
-| `jwt_hs256_stress` | HS256 | random 32-char | Throughput benchmark (NOT FOUND) |
-| `jwt_hs384_stress` | HS384 | random 32-char | Throughput benchmark |
-| `jwt_hs512_stress` | HS512 | random 32-char | Throughput benchmark |
-
-Generate fresh ones with:
-
-```bash
-python3 -c "
-import hmac, hashlib, base64, json, secrets, string
-def make_jwt(alg, payload, secret):
-    header = json.dumps({'alg': alg, 'typ': 'JWT'}, separators=(',',':'))
-    h = base64.urlsafe_b64encode(header.encode()).rstrip(b'=').decode()
-    p = base64.urlsafe_b64encode(json.dumps(payload, separators=(',',':')).encode()).rstrip(b'=').decode()
-    si = f'{h}.{p}'
-    hf = {'HS256': hashlib.sha256, 'HS384': hashlib.sha384, 'HS512': hashlib.sha512}[alg]
-    sig = base64.urlsafe_b64encode(hmac.new(secret.encode(), si.encode(), hf).digest()).rstrip(b'=').decode()
-    return f'{si}.{sig}'
-stress = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
-for alg in ['HS256', 'HS384', 'HS512']:
-    for name, key in [('password', 'password'), ('stress', stress)]:
-        with open(f'jwt_{alg.lower()}_{name}', 'w') as f:
-            f.write(make_jwt(alg, {'sub': 'jotcrack-test'}, key))
-print(f'Stress key: {stress}')
-"
-```
+The repo does not include a wordlist. You'll need to build or source your own — one candidate secret per line, plain text. Any wordlist works; bigger lists give you a better throughput picture since the GPU stays saturated longer.
 
 ## Wordlist format
 
@@ -144,14 +111,14 @@ Benchmarked on Apple M4 Max (40-core GPU, 64 GB RAM) with a 112 GB wordlist (16.
 ### Benchmarking
 
 ```bash
-# Build once
 cargo build --release
 
-# Quick crack test (should find "password")
-./target/release/jotcrack autocrack "$(cat jwt_hs256_password)" --wordlist wordlists.txt
+# Crack a known secret (should find it quickly)
+./target/release/jotcrack autocrack '<your-jwt>' --wordlist my_wordlist.txt
 
-# Full throughput benchmark (NOT FOUND — processes entire wordlist)
-./target/release/jotcrack autocrack "$(cat jwt_hs256_stress)" --wordlist wordlists.txt 2>bench.log
+# Full throughput benchmark — use a JWT signed with a key NOT in your wordlist
+# so the entire wordlist is scanned and you get sustained GPU throughput numbers
+./target/release/jotcrack autocrack '<stress-jwt>' --wordlist my_wordlist.txt 2>bench.log
 ```
 
 Tips:
@@ -174,13 +141,15 @@ src/
       producer.rs                   Multi-threaded producer pipeline (~580 lines)
       stats.rs                      Timing, rate reporting, final stats
       test_support.rs               Test helpers (temp wordlists, JWT generation)
-      hs512_wordlist.metal          SHA-512 GPU kernel (shared by HS384/HS512)
     hs256wordlist/
       args.rs, jwt.rs, gpu.rs       HS256-specific parsing + GPU setup
       command.rs                    HS256 cracking pipeline
       hs256_wordlist.metal          SHA-256 GPU kernel
-    hs384wordlist/                  HS384-specific (uses common SHA-512 kernel)
-    hs512wordlist/                  HS512-specific (uses common SHA-512 kernel)
+    hs384wordlist/                  HS384-specific (uses hs512wordlist's kernel)
+    hs512wordlist/
+      args.rs, jwt.rs, gpu.rs       HS512-specific parsing + GPU setup
+      command.rs                    HS512 cracking pipeline
+      hs512_wordlist.metal          SHA-512 GPU kernel (shared by HS384)
     autocrack/                    Auto-detect algorithm + dispatch
 ```
 
