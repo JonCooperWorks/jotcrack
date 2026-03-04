@@ -54,8 +54,7 @@ use std::time::{Duration, Instant};
 use crate::batch::{DispatchBatchView, WordBatch};
 use crate::stats::{BatchDispatchTimings, format_human_count};
 
-use super::backend::{GpuBruteForcer, HmacVariant};
-use super::{GpuCommandHandle, GpuDevice, default_device};
+use super::{GpuBruteForcer, GpuCommandHandle, GpuDevice, HmacVariant, default_device};
 
 // ---------------------------------------------------------------------------
 // Embedded shader sources
