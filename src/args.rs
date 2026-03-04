@@ -8,7 +8,10 @@ pub(crate) const DEFAULT_PIPELINE_DEPTH: usize = 10;
 /// Shared CLI arguments for all wordlist cracking subcommands.
 #[derive(Debug, Clone, Args)]
 pub struct WordlistArgs {
-    /// JWT in compact form (`header.payload.signature`).
+    /// JWT or JWE token in compact form.
+    ///
+    /// For JWT: `header.payload.signature` (3 parts, HMAC-SHA cracking).
+    /// For JWE: `header.encrypted_key.iv.ciphertext.tag` (5 parts, Key Wrap cracking).
     pub jwt: String,
     /// Wordlist file path (one candidate secret per line).
     #[arg(long, default_value = DEFAULT_WORDLIST_PATH)]

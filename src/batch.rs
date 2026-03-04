@@ -213,11 +213,22 @@ pub(crate) struct WordBatch {
 //      These allocations live as long as the `WordBatch` itself, so the
 //      pointers remain valid regardless of which thread accesses them.
 //
-//   3. **No `Sync` needed** — `WordBatch` is never shared (`&WordBatch`)
-//      across threads; it is always moved or exclusively borrowed. We do not
-//      implement `Sync`, which would require additional reasoning about
-//      concurrent reads.
+//   3. **`Sync` for the JWE CPU path** — `WordBatch` is shared (`&WordBatch`)
+//      across CPU worker threads during JWE A128KW cracking. The cached raw
+//      pointers reference stable Metal shared-mode buffer memory that is never
+//      relocated. During CPU batch processing, all access is read-only via
+//      `word()` — the producer only writes after the batch is recycled.
 unsafe impl Send for WordBatch {}
+
+// SAFETY: The cached raw pointers (`word_bytes_ptr`, `word_offsets_ptr`,
+// `word_lengths_ptr`) reference Metal `StorageModeShared` buffers, which
+// on Apple Silicon are ordinary unified memory with stable addresses.
+// Multiple threads may safely read from these buffers concurrently as long
+// as no thread writes to them. This invariant is maintained by the pipeline
+// design: during CPU batch processing (JWE path), worker threads call
+// `word()` through `&self` (no mutation). The producer writes to a batch
+// only after recycling, which happens *after* all readers finish.
+unsafe impl Sync for WordBatch {}
 
 /// Check whether a single candidate of `line_len` bytes fits in the current batch state.
 ///

@@ -2,10 +2,11 @@ use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
 use crate::args::WordlistArgs;
+use crate::gpu::CrackVariant;
 use crate::gpu::HmacVariant;
 
 #[derive(Debug, Parser)]
-#[command(name = "jotcrack", about = "GPU-assisted JWT cracking with Metal")]
+#[command(name = "jotcrack", about = "GPU-assisted JWT/JWE cracking with Metal")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -19,7 +20,16 @@ enum Commands {
     Hs384wordlist(WordlistArgs),
     /// Crack an HS512-signed JWT using a wordlist attack.
     Hs512wordlist(WordlistArgs),
-    /// Auto-detect the HMAC-SHA algorithm from the JWT header and crack it.
+    /// Crack a JWE encrypted with A128KW (AES-128 Key Wrap) using a wordlist attack.
+    ///
+    /// Uses GPU compute (Metal/CUDA) with software AES-128 via S-box lookup
+    /// tables in constant memory. The RFC 3394 integrity check value
+    /// 0xA6A6A6A6A6A6A6A6 serves as the oracle — no known plaintext is needed.
+    JweA128kw(WordlistArgs),
+    /// Auto-detect the algorithm from the token header and crack it.
+    ///
+    /// Distinguishes JWT (3-part) from JWE (5-part) compact tokens,
+    /// reads the `alg` header field, and routes to the appropriate backend.
     Autocrack(WordlistArgs),
 }
 
@@ -30,17 +40,20 @@ pub fn run() -> ExitCode {
 
     let result = match cli.command {
         Commands::Hs256wordlist(args) => {
-            crate::runner::run_wordlist_crack(HmacVariant::Hs256, args)
+            crate::runner::run_wordlist_crack(CrackVariant::Hmac(HmacVariant::Hs256), args)
         }
         Commands::Hs384wordlist(args) => {
-            crate::runner::run_wordlist_crack(HmacVariant::Hs384, args)
+            crate::runner::run_wordlist_crack(CrackVariant::Hmac(HmacVariant::Hs384), args)
         }
         Commands::Hs512wordlist(args) => {
-            crate::runner::run_wordlist_crack(HmacVariant::Hs512, args)
+            crate::runner::run_wordlist_crack(CrackVariant::Hmac(HmacVariant::Hs512), args)
         }
-        Commands::Autocrack(args) => match crate::jwt::detect_variant(&args.jwt) {
+        Commands::JweA128kw(args) => {
+            crate::runner::run_wordlist_crack(CrackVariant::JweA128kw, args)
+        }
+        Commands::Autocrack(args) => match crate::jwt::detect_token_variant(&args.jwt) {
             Ok(variant) => {
-                eprintln!("AUTODETECT: JWT algorithm is {}", variant.label());
+                eprintln!("AUTODETECT: token algorithm is {}", variant.label());
                 crate::runner::run_wordlist_crack(variant, args)
             }
             Err(e) => Err(e),
@@ -227,5 +240,21 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::ValueValidation);
+    }
+
+    /// The jwe-a128kw subcommand parses correctly and routes to JWE mode.
+    #[test]
+    fn clap_cli_parses_jwe_a128kw() {
+        let cli = Cli::try_parse_from([
+            "jotcrack",
+            "jwe-a128kw",
+            "a.b.c.d.e",
+        ])
+        .unwrap();
+        let Commands::JweA128kw(args) = cli.command else {
+            panic!("expected JweA128kw");
+        };
+        assert_eq!(args.jwt, "a.b.c.d.e");
+        assert_eq!(args.wordlist, PathBuf::from(DEFAULT_WORDLIST_PATH));
     }
 }

@@ -1,4 +1,4 @@
-//! # Metal GPU backend for HMAC-SHA brute-force dispatch
+//! # Metal GPU backend for brute-force dispatch
 //!
 //! This module implements the macOS Metal compute backend. It compiles
 //! embedded `.metal` shader sources at runtime, manages GPU buffer
@@ -6,20 +6,30 @@
 //! encode → commit → wait → readback lifecycle for each batch of
 //! password candidates.
 //!
+//! ## Two compute backends
+//!
+//! - **`MetalBruteForcer`** — HMAC-SHA JWT cracking (HS256/384/512).
+//!   Uses GPU-optimised software SHA implementations.
+//!
+//! - **`MetalAesKwBruteForcer`** — JWE A128KW cracking via software
+//!   AES-128 in a Metal compute shader. Trades per-thread cost
+//!   (software AES vs CPU hardware AESD) for massive GPU parallelism.
+//!
+//! Both implement the `GpuBruteForcer` trait so the runner can use
+//! a single generic dispatch loop.
+//!
 //! ## Two-pipeline strategy
 //!
-//! Each HMAC variant exposes two kernel entry points:
+//! Each backend exposes two kernel entry points:
 //!
-//! - **`mixed`** — handles keys of any length. The shader performs both
-//!   the inner and outer HMAC passes with full-length key support,
-//!   including the extra SHA block required when key bytes exceed the
-//!   hash block size (64 bytes for SHA-256, 128 bytes for SHA-384/512).
+//! - **`mixed`** — handles keys of any length. For HMAC, this includes
+//!   keys exceeding the hash block size. For A128KW, this includes
+//!   candidates > 16 bytes (SHA-256 hashed to derive the AES key).
 //!
-//! - **`short_keys`** — optimised fast path for keys that fit within a
-//!   single SHA block. Skips the key-hashing pre-step and saves one
-//!   SHA compression round per candidate. When an entire batch consists
-//!   of short keys (the common case for dictionary attacks), this
-//!   pipeline is selected automatically.
+//! - **`short_keys`** — optimised fast path for short keys. For HMAC,
+//!   keys within the SHA block size. For A128KW, candidates ≤ 16 bytes
+//!   (zero-padded directly, no SHA-256 needed). This is the common
+//!   case for dictionary attacks.
 //!
 //! ## Memory model: `StorageModeShared`
 //!
@@ -72,6 +82,8 @@ use super::{GpuBruteForcer, GpuCommandHandle, GpuDevice, HmacVariant, default_de
 const METAL_SOURCE_HS256: &str = include_str!("hs256_wordlist.metal");
 
 const METAL_SOURCE_HS512: &str = include_str!("hs512_wordlist.metal");
+
+const METAL_SOURCE_A128KW: &str = include_str!("a128kw_wordlist.metal");
 
 // ---------------------------------------------------------------------------
 // Sentinel value for "no match in this batch"
@@ -140,6 +152,23 @@ struct Hs256BruteForceParams {
 struct Hs512BruteForceParams {
     target_signature: [u64; 8],
     message_length: u32,
+    candidate_count: u32,
+}
+
+/// Host → GPU parameters for the AES-128 Key Wrap (A128KW) shader.
+///
+/// Matches the Metal struct `A128kwBruteForceParams` in
+/// `a128kw_wordlist.metal`. The encrypted key itself is passed via a
+/// separate buffer (slot 1) rather than inlined here, because its
+/// length varies (24–72 bytes for standard JWE `enc` algorithms).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct A128kwBruteForceParams {
+    /// Byte length of the encrypted_key in buffer(1).
+    encrypted_key_len: u32,
+    /// Number of 64-bit blocks in the CEK (n ≥ 2).
+    n_blocks: u32,
+    /// Number of candidate secrets in this batch.
     candidate_count: u32,
 }
 
@@ -681,6 +710,382 @@ impl GpuBruteForcer for MetalBruteForcer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MetalAesKwBruteForcer
+// ---------------------------------------------------------------------------
+
+/// Metal compute backend for AES-128 Key Wrap (A128KW) JWE cracking.
+///
+/// Implements `GpuBruteForcer` using a software AES-128 Metal compute shader.
+/// The shader uses S-box lookup tables (512 bytes in `constant` address space)
+/// and GF(2^8) arithmetic for InvMixColumns, trading per-thread cost for
+/// massive GPU parallelism.
+///
+/// ## Buffer layout
+///
+/// Uses the same 6-slot binding convention as the HMAC backend:
+///
+/// | Slot | HMAC purpose          | A128KW purpose                     |
+/// |------|-----------------------|------------------------------------|
+/// | 0    | params struct         | `A128kwBruteForceParams`           |
+/// | 1    | JWT signing input     | encrypted_key bytes (pre-filled)   |
+/// | 2    | candidate word bytes  | candidate word bytes               |
+/// | 3    | candidate offsets     | candidate offsets                  |
+/// | 4    | candidate lengths     | candidate lengths                  |
+/// | 5    | result (atomic u32)   | result (atomic u32)                |
+///
+/// The encrypted_key is written once at construction and never changes
+/// (unlike the HMAC backend where the signing input varies per token).
+pub(crate) struct MetalAesKwBruteForcer {
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    /// Pipeline for candidates of any length (includes SHA-256 for > 16 bytes).
+    pipeline_mixed: metal::ComputePipelineState,
+    /// Pipeline optimised for candidates ≤ 16 bytes (zero-pad, no SHA-256).
+    pipeline_short_keys: metal::ComputePipelineState,
+    /// Persistent buffer holding `A128kwBruteForceParams`.
+    params_buf: metal::Buffer,
+    /// Persistent buffer holding the JWE encrypted_key bytes (slot 1).
+    enc_key_buf: metal::Buffer,
+    /// Persistent 4-byte buffer for the GPU to write the match result.
+    result_buf: metal::Buffer,
+    /// Byte length of the encrypted_key (stored for params writes).
+    encrypted_key_len: u32,
+    /// Number of 64-bit CEK blocks: `encrypted_key.len() / 8 - 1`.
+    n_blocks: u32,
+    /// Number of threads per threadgroup for compute dispatch.
+    threadgroup_width: usize,
+}
+
+impl MetalAesKwBruteForcer {
+    /// Compile the A128KW Metal shader, create pipelines, and allocate
+    /// persistent buffers.
+    ///
+    /// `encrypted_key` is the raw ciphertext from the JWE token's
+    /// encrypted_key field (base64url-decoded). `n` is the number of
+    /// 64-bit CEK blocks (`encrypted_key.len() / 8 - 1`).
+    pub(crate) fn new(encrypted_key: &[u8], n: usize) -> anyhow::Result<Self> {
+        let device = default_device()?;
+        let compile_options = CompileOptions::new();
+
+        let library = device
+            .new_library_with_source(METAL_SOURCE_A128KW, &compile_options)
+            .map_err(|e| anyhow!("failed to compile A128KW Metal kernel: {e}"))?;
+
+        let mixed_function = library
+            .get_function("a128kw_wordlist", None)
+            .map_err(|e| anyhow!("failed to get Metal function a128kw_wordlist: {e}"))?;
+        let short_function = library
+            .get_function("a128kw_wordlist_short_keys", None)
+            .map_err(|e| {
+                anyhow!("failed to get Metal function a128kw_wordlist_short_keys: {e}")
+            })?;
+
+        let pipeline_mixed = device
+            .new_compute_pipeline_state_with_function(&mixed_function)
+            .map_err(|e| anyhow!("failed to create A128KW mixed compute pipeline: {e}"))?;
+        let pipeline_short_keys = device
+            .new_compute_pipeline_state_with_function(&short_function)
+            .map_err(|e| anyhow!("failed to create A128KW short-key compute pipeline: {e}"))?;
+
+        let queue = device.new_command_queue();
+
+        let max_threads = (pipeline_mixed.max_total_threads_per_threadgroup() as usize)
+            .min(pipeline_short_keys.max_total_threads_per_threadgroup() as usize);
+        let threadgroup_width = 256usize.min(max_threads.max(1));
+
+        let encrypted_key_len =
+            u32::try_from(encrypted_key.len()).context("encrypted_key too long")?;
+        let n_blocks = u32::try_from(n).context("n_blocks overflow")?;
+
+        let options = metal::MTLResourceOptions::StorageModeShared;
+
+        let params_buf = device.new_buffer(
+            std::mem::size_of::<A128kwBruteForceParams>() as u64,
+            options,
+        );
+
+        // Pre-fill the encrypted_key buffer — it stays constant for the
+        // entire cracking run.
+        let enc_key_buf = device.new_buffer(encrypted_key.len().max(1) as u64, options);
+        copy_bytes_to_buffer(&enc_key_buf, encrypted_key);
+
+        let result_buf = device.new_buffer(std::mem::size_of::<u32>() as u64, options);
+        copy_value_to_buffer(&result_buf, &RESULT_NOT_FOUND_SENTINEL);
+
+        Ok(Self {
+            device,
+            queue,
+            pipeline_mixed,
+            pipeline_short_keys,
+            params_buf,
+            enc_key_buf,
+            result_buf,
+            encrypted_key_len,
+            n_blocks,
+            threadgroup_width,
+        })
+    }
+
+    // -----------------------------------------------------------------------
+    // Pipeline selection
+    // -----------------------------------------------------------------------
+
+    /// The AES-128 key size threshold. Candidates ≤ 16 bytes are zero-padded
+    /// directly; longer candidates go through SHA-256 → truncate(16).
+    fn short_key_threshold(&self) -> u16 {
+        16
+    }
+
+    /// Choose the compute pipeline based on the batch's longest candidate.
+    fn active_pipeline_for_view(
+        &self,
+        batch: DispatchBatchView<'_>,
+    ) -> &metal::ComputePipelineState {
+        if batch.max_word_len <= self.short_key_threshold() {
+            &self.pipeline_short_keys
+        } else {
+            &self.pipeline_mixed
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Core dispatch helpers
+    // -----------------------------------------------------------------------
+
+    /// Write the A128KW params struct into the GPU buffer.
+    fn write_params(&self, candidate_count: u32) {
+        let params = A128kwBruteForceParams {
+            encrypted_key_len: self.encrypted_key_len,
+            n_blocks: self.n_blocks,
+            candidate_count,
+        };
+        copy_value_to_buffer(&self.params_buf, &params);
+    }
+
+    /// Encode and commit a compute dispatch for the given batch.
+    fn encode_and_commit_view(
+        &self,
+        batch: DispatchBatchView<'_>,
+        threadgroup_width: usize,
+    ) -> anyhow::Result<(metal::CommandBuffer, Duration, Duration)> {
+        let candidate_count =
+            u32::try_from(batch.candidate_count).context("candidate count exceeds u32")?;
+        if candidate_count == 0 {
+            bail!("cannot encode empty batch for async dispatch");
+        }
+
+        let prep_started = Instant::now();
+        self.write_params(candidate_count);
+        copy_value_to_buffer(&self.result_buf, &RESULT_NOT_FOUND_SENTINEL);
+        let host_prep = prep_started.elapsed();
+
+        let encode_started = Instant::now();
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        let pipeline = self.active_pipeline_for_view(batch);
+        encoder.set_compute_pipeline_state(pipeline);
+        encoder.set_buffer(BUF_PARAMS, Some(&self.params_buf), 0);
+        encoder.set_buffer(BUF_MESSAGE, Some(&self.enc_key_buf), 0);
+        encoder.set_buffer(BUF_WORD_BYTES, Some(batch.word_bytes_buf), 0);
+        encoder.set_buffer(BUF_WORD_OFFSETS, Some(batch.word_offsets_buf), 0);
+        encoder.set_buffer(BUF_WORD_LENGTHS, Some(batch.word_lengths_buf), 0);
+        encoder.set_buffer(BUF_RESULT, Some(&self.result_buf), 0);
+
+        let threads_per_group = MTLSize::new(threadgroup_width as u64, 1, 1);
+        let threads_per_grid = MTLSize::new(candidate_count as u64, 1, 1);
+        encoder.dispatch_threads(threads_per_grid, threads_per_group);
+        encoder.end_encoding();
+        let command_encode = encode_started.elapsed();
+
+        command_buffer.commit();
+
+        let owned = command_buffer.to_owned();
+        Ok((owned, host_prep, command_encode))
+    }
+
+    /// Block until GPU execution completes, then read the result buffer.
+    fn wait_and_readback_impl(
+        &self,
+        cmd_buf: &metal::CommandBufferRef,
+    ) -> (Option<u32>, Duration, Duration) {
+        let gpu_wait_started = Instant::now();
+        cmd_buf.wait_until_completed();
+        let gpu_wait = gpu_wait_started.elapsed();
+
+        let readback_started = Instant::now();
+        let result_ptr = self.result_buf.contents().cast::<u32>();
+        // SAFETY: same justification as MetalBruteForcer::wait_and_readback_impl.
+        let result = unsafe { *result_ptr };
+        let result_readback = readback_started.elapsed();
+
+        let maybe_match = if result == RESULT_NOT_FOUND_SENTINEL {
+            None
+        } else {
+            Some(result)
+        };
+        (maybe_match, gpu_wait, result_readback)
+    }
+
+    /// Synchronous dispatch for autotune benchmarking.
+    fn dispatch_batch_view(
+        &self,
+        batch: DispatchBatchView<'_>,
+        threadgroup_width: usize,
+    ) -> anyhow::Result<(Option<u32>, BatchDispatchTimings)> {
+        let started = Instant::now();
+        let mut timings = BatchDispatchTimings::default();
+        let candidate_count =
+            u32::try_from(batch.candidate_count).context("candidate count exceeds u32")?;
+        if candidate_count == 0 {
+            timings.total = started.elapsed();
+            return Ok((None, timings));
+        }
+
+        let (cmd_buf, host_prep, command_encode) =
+            self.encode_and_commit_view(batch, threadgroup_width)?;
+        timings.host_prep = host_prep;
+        timings.command_encode = command_encode;
+
+        let (maybe_match, gpu_wait, result_readback) = self.wait_and_readback_impl(&cmd_buf);
+        timings.gpu_wait = gpu_wait;
+        timings.result_readback = result_readback;
+        timings.total = started.elapsed();
+        Ok((maybe_match, timings))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GpuBruteForcer trait implementation for MetalAesKwBruteForcer
+//
+// The `target_signature` parameter in `encode_and_commit` and
+// `autotune_threadgroup_width` is **ignored** by this implementation.
+// For HMAC backends, `target_signature` carries the JWT signature bytes.
+// For A128KW, the encrypted_key is pre-loaded into `enc_key_buf` at
+// construction time and never changes. The parameter is accepted (but
+// unused) to satisfy the trait contract, enabling the runner to use a
+// single generic `run_gpu_crack<B: GpuBruteForcer>` dispatch loop.
+// ---------------------------------------------------------------------------
+
+impl GpuBruteForcer for MetalAesKwBruteForcer {
+    fn device(&self) -> &GpuDevice {
+        &self.device
+    }
+
+    fn device_name(&self) -> &str {
+        self.device.name()
+    }
+
+    fn thread_execution_width(&self) -> usize {
+        (self.pipeline_mixed.thread_execution_width() as usize)
+            .min(self.pipeline_short_keys.thread_execution_width() as usize)
+    }
+
+    fn max_total_threads_per_threadgroup(&self) -> usize {
+        (self.pipeline_mixed.max_total_threads_per_threadgroup() as usize)
+            .min(self.pipeline_short_keys.max_total_threads_per_threadgroup() as usize)
+    }
+
+    fn current_threadgroup_width(&self) -> usize {
+        self.threadgroup_width
+    }
+
+    fn set_threadgroup_width(&mut self, requested: usize) -> anyhow::Result<()> {
+        let max_threads = self.max_total_threads_per_threadgroup();
+        if requested == 0 {
+            bail!("--threads-per-group must be > 0");
+        }
+        if requested > max_threads {
+            bail!(
+                "--threads-per-group {} exceeds pipeline max {}",
+                requested,
+                max_threads
+            );
+        }
+        self.threadgroup_width = requested;
+        Ok(())
+    }
+
+    fn encode_and_commit(
+        &self,
+        _target_signature: &[u8],
+        batch: &WordBatch,
+    ) -> anyhow::Result<(GpuCommandHandle, Duration, Duration)> {
+        // `_target_signature` is ignored — encrypted_key is in `enc_key_buf`.
+        self.encode_and_commit_view(batch.as_dispatch_view(), self.threadgroup_width)
+    }
+
+    fn wait_and_readback(
+        &self,
+        handle: &GpuCommandHandle,
+    ) -> (Option<u32>, Duration, Duration) {
+        self.wait_and_readback_impl(handle)
+    }
+
+    fn autotune_threadgroup_width(
+        &mut self,
+        _target_signature: &[u8],
+        batch: &WordBatch,
+    ) -> anyhow::Result<()> {
+        let sample_count = batch.candidate_count().min(16_384);
+        if sample_count == 0 {
+            return Ok(());
+        }
+        let sample_view = batch
+            .prefix_dispatch_view(sample_count)
+            .ok_or_else(|| anyhow!("failed to build autotune sample view"))?;
+
+        let tew = self.thread_execution_width();
+        let max_threads = self.max_total_threads_per_threadgroup();
+        let mut candidates = vec![
+            tew,
+            tew.saturating_mul(2),
+            tew.saturating_mul(4),
+            tew.saturating_mul(8),
+            64,
+            128,
+            256,
+            512,
+            1024,
+        ];
+        candidates.retain(|&v| v > 0 && v <= max_threads);
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!(
+            "AUTOTUNE: benchmarking {} candidates across {} threadgroup widths",
+            sample_view.candidate_count,
+            candidates.len()
+        );
+
+        let mut best: Option<(usize, f64)> = None;
+        for width in candidates {
+            let (_result, timings) = self.dispatch_batch_view(sample_view, width)?;
+            if timings.gpu_wait.is_zero() {
+                continue;
+            }
+            let rate = sample_view.candidate_count as f64 / timings.gpu_wait.as_secs_f64();
+            match best {
+                Some((_, best_rate)) if rate <= best_rate => {}
+                _ => best = Some((width, rate)),
+            }
+        }
+
+        if let Some((best_width, best_rate)) = best {
+            self.threadgroup_width = best_width;
+            eprintln!(
+                "AUTOTUNE: selected --threads-per-group {} ({}/s sample)",
+                best_width,
+                format_human_count(best_rate)
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -697,5 +1102,12 @@ mod tests {
         let params = Hs512BruteForceParams::default();
         let bytes = bytes_of(&params);
         assert_eq!(bytes.len(), std::mem::size_of::<Hs512BruteForceParams>());
+    }
+
+    #[test]
+    fn a128kw_params_round_trip_size_matches() {
+        let params = A128kwBruteForceParams::default();
+        let bytes = bytes_of(&params);
+        assert_eq!(bytes.len(), std::mem::size_of::<A128kwBruteForceParams>());
     }
 }

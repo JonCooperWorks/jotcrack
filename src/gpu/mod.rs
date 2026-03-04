@@ -45,6 +45,41 @@ impl HmacVariant {
 }
 
 // ---------------------------------------------------------------------------
+// CrackVariant
+// ---------------------------------------------------------------------------
+
+/// Top-level dispatch type covering both JWT (HMAC) and JWE (Key Wrap) attacks.
+///
+/// `HmacVariant` continues to drive GPU kernel selection for HMAC attacks.
+/// `CrackVariant` sits above it as the unified discriminant used by the
+/// runner and CLI layers to route tokens to the correct compute backend:
+///
+/// - **`Hmac(hv)`** → Metal/CUDA GPU shader (HMAC-SHA per candidate)
+/// - **`JweA128kw`** → Metal/CUDA GPU shader (software AES-128 Key Wrap per candidate)
+///
+/// Both paths run on the GPU. AES Key Wrap uses software S-box lookup tables
+/// in constant memory — the GPU's massive parallelism (thousands of concurrent
+/// threads) outweighs the per-thread cost of software AES vs hardware AESD,
+/// benchmarking at ~120M/s GPU vs ~5.3M/s CPU (22× faster on Apple M4 Max).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CrackVariant {
+    /// HMAC-SHA JWT cracking via GPU compute.
+    Hmac(HmacVariant),
+    /// JWE A128KW (AES-128 Key Wrap, RFC 3394) cracking via GPU compute.
+    JweA128kw,
+}
+
+impl CrackVariant {
+    /// Human-readable algorithm label for output (e.g. "HS256", "A128KW").
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Hmac(hv) => hv.label(),
+            Self::JweA128kw => "A128KW",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // GpuBruteForcer trait
 // ---------------------------------------------------------------------------
 

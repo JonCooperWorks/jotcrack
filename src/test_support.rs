@@ -241,6 +241,105 @@ pub(crate) fn make_test_jwt(alg: &str, payload_json: &str, secret: &[u8]) -> Str
     format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(&signature))
 }
 
+/// Construct a valid JWE compact token with `alg: A128KW` for testing.
+///
+/// The token wraps a randomly-generated 128-bit Content Encryption Key (CEK)
+/// using AES-128 Key Wrap (RFC 3394) with a key derived from `secret`:
+///
+/// - `secret` ≤ 16 bytes → zero-padded to 16 bytes
+/// - `secret` > 16 bytes → SHA-256 hashed and truncated to 16 bytes
+///
+/// This matches the key derivation logic in the Metal compute shader
+/// (`a128kw_wordlist.metal`). The IV, ciphertext, and tag segments are
+/// random bytes — they are irrelevant for the Key Wrap integrity attack
+/// which only checks the wrapped key's integrity check value (0xA6A6A6A6A6A6A6A6).
+///
+/// ## Why `aes_kw` in tests but not production code?
+///
+/// Production code implements AES-128 Key *Unwrap* entirely in the Metal
+/// compute shader (software AES with S-box lookup tables). Test JWE
+/// generation needs Key *Wrap* to create valid tokens. The `aes_kw` crate
+/// provides both directions and is listed under `[dev-dependencies]` so it
+/// adds no bytes to the release binary.
+pub(crate) fn make_test_jwe(secret: &[u8]) -> String {
+    use aes_kw::KekAes128;
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    // Derive a 16-byte AES-128 key from the secret. This replicates the
+    // key derivation logic used by the Metal compute shader:
+    //   ≤ 16 bytes → zero-pad to 16 bytes
+    //   > 16 bytes → SHA-256 hash, truncate to 16 bytes
+    let aes_key = {
+        let mut key = [0u8; 16];
+        if secret.len() <= 16 {
+            key[..secret.len()].copy_from_slice(secret);
+        } else {
+            use sha2::{Digest, Sha256};
+            let hash = Sha256::digest(secret);
+            key.copy_from_slice(&hash[..16]);
+        }
+        key
+    };
+
+    // Generate a random 128-bit (16-byte) CEK. The content doesn't matter
+    // for the cracking attack — only the wrapping integrity check matters.
+    // We use a simple deterministic "random" here (seeded from the secret)
+    // to keep tests reproducible.
+    let mut cek = [0u8; 16];
+    // Use a simple hash-based deterministic generator for reproducibility.
+    // SHA-256(b"cek" || secret) gives us 32 bytes; take the first 16.
+    {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest([b"cek-seed-" as &[u8], secret].concat());
+        cek.copy_from_slice(&hash[..16]);
+    }
+
+    // AES-128 Key Wrap the CEK → 24 bytes (n=2 blocks, output is (n+1)*8).
+    let kek = KekAes128::from(aes_key);
+    let mut wrapped = [0u8; 24];
+    kek.wrap(&cek, &mut wrapped)
+        .expect("AES Key Wrap failed — should not happen with valid key/CEK sizes");
+
+    // Build the JWE header. `enc` is A128GCM for a 128-bit CEK.
+    let header = r#"{"alg":"A128KW","enc":"A128GCM"}"#;
+    let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
+    let encrypted_key_b64 = URL_SAFE_NO_PAD.encode(&wrapped);
+
+    // IV, ciphertext, and tag are irrelevant for the Key Wrap attack.
+    // Use deterministic dummy values derived from the secret for
+    // reproducibility.
+    let iv_b64 = URL_SAFE_NO_PAD.encode(&[0x42u8; 12]); // 12 bytes for A128GCM IV
+    let ct_b64 = URL_SAFE_NO_PAD.encode(&[0x00u8; 32]); // dummy ciphertext
+    let tag_b64 = URL_SAFE_NO_PAD.encode(&[0x00u8; 16]); // dummy tag
+
+    // Assemble the 5-part JWE compact token.
+    format!("{header_b64}.{encrypted_key_b64}.{iv_b64}.{ct_b64}.{tag_b64}")
+}
+
+/// Write test JWE token files to the project root for manual benchmarking.
+///
+/// Run with: `cargo test generate_jwe_token_files -- --ignored --nocapture`
+///
+/// This generates:
+/// - `jwe_a128kw_found` — JWE wrapped with "password" (present in breach.txt)
+/// - `jwe_a128kw_notfound` — JWE wrapped with "fsdgdfsgdsfsgdf" (absent from breach.txt)
+#[test]
+#[ignore]
+fn generate_jwe_token_files() {
+    let found_token = make_test_jwe(b"password");
+    let notfound_token = make_test_jwe(b"fsdgdfsgdsfsgdf");
+
+    std::fs::write("jwe_a128kw_found", &found_token)
+        .expect("failed to write jwe_a128kw_found");
+    std::fs::write("jwe_a128kw_notfound", &notfound_token)
+        .expect("failed to write jwe_a128kw_notfound");
+
+    eprintln!("jwe_a128kw_found:    {}", found_token);
+    eprintln!("jwe_a128kw_notfound: {}", notfound_token);
+    eprintln!("Files written to project root.");
+}
+
 /// Same as `collect_all_words_from_mmap_reader` but for the parallel reader.
 /// Having both variants avoids test code needing to know which reader type
 /// is being tested — each test picks the appropriate helper.
