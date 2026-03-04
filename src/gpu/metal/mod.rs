@@ -35,7 +35,7 @@
 //!
 //! 1. **`copy_bytes_to_buffer` / `copy_value_to_buffer`** — raw pointer
 //!    writes into Metal shared buffers. Safe because buffer sizes are
-//!    validated at allocation time and `debug_assert!` guards against
+//!    validated at allocation time and `assert!` guards against
 //!    overflow.
 //!
 //! 2. **`bytes_of`** — reinterprets a `#[repr(C)]` struct as a byte
@@ -150,16 +150,27 @@ struct Hs512BruteForceParams {
 /// Copy raw bytes into a Metal shared buffer.
 ///
 /// The caller must ensure `data.len() <= buffer.length()`. This is
-/// enforced by a `debug_assert!` in debug builds but unchecked in
-/// release for performance (these are called on every GPU dispatch).
+/// enforced by an `assert!` that is active in all builds (including
+/// release). An earlier version used `debug_assert!`, which is compiled
+/// out in release builds — meaning the only bounds check guarding an
+/// `unsafe { copy_nonoverlapping }` into GPU-mapped memory was silently
+/// removed in the binary users actually run. Since this function is
+/// called once per GPU dispatch (not per candidate), the cost of a
+/// release-mode bounds check is negligible: one integer comparison
+/// amortised over millions of candidates.
 fn copy_bytes_to_buffer(buffer: &metal::Buffer, data: &[u8]) {
-    debug_assert!(buffer.length() as usize >= data.len());
+    assert!(
+        buffer.length() as usize >= data.len(),
+        "copy_bytes_to_buffer: data length {} exceeds buffer length {}",
+        data.len(),
+        buffer.length()
+    );
     if data.is_empty() {
         return;
     }
     // SAFETY: `buffer.contents()` returns a valid pointer to the
     // buffer's shared memory region, which is at least `buffer.length()`
-    // bytes. The `debug_assert!` above guarantees `data.len()` does not
+    // bytes. The `assert!` above guarantees `data.len()` does not
     // exceed this. The buffer is `StorageModeShared`, so CPU writes are
     // permitted. No concurrent GPU access occurs here because the
     // command buffer has not been committed yet.

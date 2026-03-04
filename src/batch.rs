@@ -141,19 +141,38 @@ pub(crate) struct WordBatch {
     // In a hot loop pushing millions of candidates, the overhead of repeated
     // Objective-C message dispatch is measurable. Since the pointer is stable
     // for the lifetime of the buffer (it never moves — Metal guarantees this
-    // for shared storage mode), we cache it as a plain `usize` at construction
-    // time and use raw pointer arithmetic in `push_candidate`.
+    // for shared storage mode), we cache it at construction time and use raw
+    // pointer arithmetic in `push_candidate` / `push_segment_bulk`.
     //
-    // Why `usize` instead of `*mut u8`? It's a stylistic choice — `usize` avoids
-    // accidentally dereferencing outside an `unsafe` block and makes the "this is
-    // just a number" nature explicit. We cast back to `*mut T` only inside the
-    // unsafe blocks where we actually write.
+    // ## Why typed `*mut T` instead of `usize`
+    //
+    // An earlier version stored these as `usize` and cast back to `*mut T` at
+    // every use site. That compiles to the same machine code, but loses
+    // *pointer provenance*: the compiler (and sanitizers like Miri) track which
+    // allocation a pointer was derived from to prove that `.add()` / dereference
+    // operations land within a valid allocation. Casting through `usize` erases
+    // that provenance, which can cause Miri failures and — in theory — allow
+    // future compiler optimisations to miscompile the code.
+    //
+    // Storing typed `*mut T` pointers preserves provenance end-to-end: the
+    // pointer originates from `buffer_host_ptr()`, is cast to the target
+    // element type (`u32` for offsets, `u16` for lengths) once at construction
+    // time via `.cast::<T>()`, and is used via `.add(index)` without ever
+    // round-tripping through an integer. This also removes the repetitive
+    // `as *mut T` casts that previously cluttered every `unsafe` block.
+    //
+    // ## Why `*mut` and not `*const`
+    //
+    // The pointers are used for both reads (`from_raw_parts` in slice accessors)
+    // and writes (in `push_candidate` / `push_segment_bulk`). Using `*mut`
+    // keeps one pointer per buffer; the read-only accessors cast to `*const`
+    // at the call site, which is a no-op at the machine level.
     //
     // Cached CPU-visible base pointers for the shared buffers.
     // This avoids repeated `contents()` Objective-C calls in the hot parser loop.
-    word_bytes_ptr: usize,
-    word_offsets_ptr: usize,
-    word_lengths_ptr: usize,
+    word_bytes_ptr: *mut u8,
+    word_offsets_ptr: *mut u32,
+    word_lengths_ptr: *mut u16,
 
     // --- Logical lengths (the "fill cursor") ---
     //
@@ -168,6 +187,37 @@ pub(crate) struct WordBatch {
     word_bytes_len: usize,
     max_word_len: u16,
 }
+
+// ## Why `unsafe impl Send`?
+//
+// Raw pointers (`*mut T`) do not auto-implement `Send` or `Sync`. This is a
+// deliberate Rust language decision: the compiler cannot verify that the
+// pointed-to memory is safe to access from another thread, so it refuses to
+// auto-derive thread-safety traits for types that contain raw pointers.
+//
+// Before a security fix, these fields were `usize` (which *is* `Send`), so
+// `WordBatch` auto-derived `Send` implicitly. Changing to typed `*mut T`
+// pointers — which is strictly more correct from a provenance standpoint —
+// requires us to explicitly opt back in with `unsafe impl Send`.
+//
+// SAFETY: The `Send` impl is sound because:
+//
+//   1. **Exclusive ownership protocol** — `WordBatch` instances travel through
+//      a single-owner channel: the producer thread fills a batch, sends it to
+//      the consumer thread for GPU dispatch, and the consumer sends it back
+//      for recycling. At no point do two threads hold `&mut` simultaneously.
+//
+//   2. **Pointer validity** — The cached pointers point into Metal shared
+//      buffers (`StorageModeShared`) that are owned by `self` via the
+//      `word_bytes_buf` / `word_offsets_buf` / `word_lengths_buf` fields.
+//      These allocations live as long as the `WordBatch` itself, so the
+//      pointers remain valid regardless of which thread accesses them.
+//
+//   3. **No `Sync` needed** — `WordBatch` is never shared (`&WordBatch`)
+//      across threads; it is always moved or exclusively borrowed. We do not
+//      implement `Sync`, which would require additional reasoning about
+//      concurrent reads.
+unsafe impl Send for WordBatch {}
 
 /// Check whether a single candidate of `line_len` bytes fits in the current batch state.
 ///
@@ -297,13 +347,22 @@ impl WordBatch {
             alloc_shared_buffer(device, MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u32>());
         let word_lengths_buf =
             alloc_shared_buffer(device, MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u16>());
-        // The host pointer is stable for the lifetime of each buffer allocation,
-        // so we cache it once and use raw pointer math in `push_candidate`.
+        // Cache the CPU-visible base pointer for each buffer. The pointer is
+        // stable for the lifetime of the buffer allocation (Metal guarantees
+        // shared-mode buffers do not relocate), so we cache once and use raw
+        // pointer arithmetic in `push_candidate` / `push_segment_bulk`.
+        //
+        // `buffer_host_ptr()` returns `*mut u8`. The offsets buffer stores
+        // `u32` entries and the lengths buffer stores `u16` entries, so we
+        // `.cast::<T>()` to get a correctly-typed pointer. This cast is purely
+        // a type-system operation — it compiles to zero instructions — but it
+        // lets `.add(index)` compute the correct stride (`index * size_of::<T>()`
+        // bytes) without manual arithmetic at every use site.
         Self {
             candidate_index_base,
-            word_bytes_ptr: buffer_host_ptr(&word_bytes_buf) as usize,
-            word_offsets_ptr: buffer_host_ptr(&word_offsets_buf) as usize,
-            word_lengths_ptr: buffer_host_ptr(&word_lengths_buf) as usize,
+            word_bytes_ptr: buffer_host_ptr(&word_bytes_buf),
+            word_offsets_ptr: buffer_host_ptr(&word_offsets_buf).cast::<u32>(),
+            word_lengths_ptr: buffer_host_ptr(&word_lengths_buf).cast::<u16>(),
             word_bytes_buf,
             word_offsets_buf,
             word_lengths_buf,
@@ -458,11 +517,11 @@ impl WordBatch {
         // `offsets[i]` = start in `word_bytes`, `lengths[i]` = candidate length,
         // and `word_bytes` contains candidates concatenated with no separators.
         unsafe {
-            *(self.word_offsets_ptr as *mut u32).add(index) = offset;
-            *(self.word_lengths_ptr as *mut u16).add(index) = line_len as u16;
+            *self.word_offsets_ptr.add(index) = offset;
+            *self.word_lengths_ptr.add(index) = line_len as u16;
             std::ptr::copy_nonoverlapping(
                 line.as_ptr(),
-                (self.word_bytes_ptr as *mut u8).add(self.word_bytes_len),
+                self.word_bytes_ptr.add(self.word_bytes_len),
                 line_len,
             );
         }
@@ -550,6 +609,34 @@ impl WordBatch {
             return;
         }
 
+        // Defense-in-depth: validate preconditions before entering unsafe code.
+        //
+        // The planner already guarantees these invariants (it sizes segments to
+        // respect batch caps and only produces valid line ranges). These asserts
+        // are *redundant* with the planner logic — they exist to catch bugs in
+        // the planner itself, not in normal operation. If the planner ever
+        // miscalculates a segment boundary, these fire immediately with a clear
+        // message instead of silently corrupting GPU buffer memory.
+        //
+        // Cost: O(1) per bulk call (three integer comparisons), not per
+        // candidate. At ~450 calls per 112 GB wordlist, the total overhead is
+        // immeasurable — well under a microsecond.
+        assert!(
+            self.candidate_count + count <= MAX_CANDIDATES_PER_BATCH,
+            "push_segment_bulk: candidate count {} + {} would exceed batch cap {}",
+            self.candidate_count, count, MAX_CANDIDATES_PER_BATCH
+        );
+        assert!(
+            line_end <= chunk_offsets_rel.len(),
+            "push_segment_bulk: line_end {} exceeds chunk_offsets_rel length {}",
+            line_end, chunk_offsets_rel.len()
+        );
+        assert!(
+            line_end <= chunk_lengths.len(),
+            "push_segment_bulk: line_end {} exceeds chunk_lengths length {}",
+            line_end, chunk_lengths.len()
+        );
+
         let base_idx = self.candidate_count;
         let mut wb_cursor = self.word_bytes_len;
 
@@ -557,9 +644,9 @@ impl WordBatch {
         // `batch_shape_can_fit`. The plan guarantees candidate_count and
         // word_bytes_len will not exceed the batch caps.
         unsafe {
-            let offsets_base = (self.word_offsets_ptr as *mut u32).add(base_idx);
-            let lengths_base = (self.word_lengths_ptr as *mut u16).add(base_idx);
-            let wb_base = self.word_bytes_ptr as *mut u8;
+            let offsets_base = self.word_offsets_ptr.add(base_idx);
+            let lengths_base = self.word_lengths_ptr.add(base_idx);
+            let wb_base = self.word_bytes_ptr;
 
             for i in 0..count {
                 let src_idx = line_start + i;
@@ -587,6 +674,17 @@ impl WordBatch {
         self.max_word_len = self.max_word_len.max(seg_max);
         self.candidate_count += count;
         self.word_bytes_len = wb_cursor;
+        // Post-loop byte budget check. This stays `debug_assert!` (compiled out
+        // in release) because computing the total bytes *before* the loop would
+        // require summing all `chunk_lengths[line_start..line_end]` — an O(count)
+        // scan that would add measurable overhead to the hot path. The planner
+        // already guarantees the byte budget via `batch_shape_can_fit_block`, so
+        // this is purely a development-time sanity check for planner correctness.
+        debug_assert!(
+            self.word_bytes_len <= MAX_WORD_BYTES_PER_BATCH,
+            "push_segment_bulk: word_bytes_len {} exceeds byte cap {}",
+            self.word_bytes_len, MAX_WORD_BYTES_PER_BATCH
+        );
     }
 
     /// Create a zero-copy view of this batch for GPU dispatch.

@@ -10,3 +10,10 @@
 # Local runtime inputs / outputs
 breach.txt
 *.log
+
+# JWT test tokens (may contain known secrets)
+jwt_*
+jwt_password.txt
+
+# Wordlist metadata
+wordlists.txt
