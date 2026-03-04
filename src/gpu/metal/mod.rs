@@ -12,9 +12,9 @@ use super::{GpuCommandHandle, GpuDevice, default_device};
 // Embedded shader sources
 // ---------------------------------------------------------------------------
 
-const METAL_SOURCE_HS256: &str = include_str!("kernels/hs256_wordlist.metal");
+const METAL_SOURCE_HS256: &str = include_str!("hs256_wordlist.metal");
 
-const METAL_SOURCE_HS512: &str = include_str!("kernels/hs512_wordlist.metal");
+const METAL_SOURCE_HS512: &str = include_str!("hs512_wordlist.metal");
 
 // ---------------------------------------------------------------------------
 // Sentinel value for "no match in this batch"
