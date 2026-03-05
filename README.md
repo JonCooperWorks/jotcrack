@@ -1,17 +1,24 @@
 # jotcrack
 
-GPU-accelerated HMAC-SHA JWT secret cracking on macOS using Apple Metal.
+GPU-accelerated JWT/JWE secret cracking on macOS using Apple Metal.
 
-Supports **HS256**, **HS384**, and **HS512** algorithms with automatic detection.
+Supports **HS256**, **HS384**, **HS512** (HMAC-SHA JWT signing) and **A128KW**, **A192KW**, **A256KW** (AES Key Wrap JWE key management) with automatic detection.
 
 ## How it works
 
+### JWT (HMAC-SHA)
+
 JWTs signed with HMAC (HS256/HS384/HS512) use a shared secret key. If you have a JWT and a wordlist of candidate secrets, `jotcrack` tries each candidate on the GPU in parallel and reports the first match.
 
-The pipeline:
+### JWE (AES Key Wrap)
+
+JWE tokens encrypted with A128KW/A192KW/A256KW wrap the Content Encryption Key (CEK) using AES Key Wrap (RFC 3394). The attack exploits the deterministic integrity check value (0xA6A6A6A6A6A6A6A6) — no known plaintext is needed. Each GPU thread unwraps the CEK with a candidate key and checks the integrity value.
+
+### Pipeline
+
 1. **Parse** the wordlist using memory-mapped I/O with parallel chunk scanning
 2. **Pack** candidates into GPU-friendly batches (contiguous byte arrays with offset/length tables)
-3. **Dispatch** HMAC-SHA computation on the Metal GPU (one thread per candidate)
+3. **Dispatch** computation on the Metal GPU (one thread per candidate)
 4. **Double-buffer** so the next batch is being prepared while the GPU processes the current one
 
 ## Requirements
@@ -28,27 +35,25 @@ cargo build --release
 
 ## Quick start
 
-The easiest way to crack a JWT is `autocrack` — it reads the algorithm from the JWT header automatically:
+The easiest way to crack a token is `autocrack` — it reads the algorithm from the token header automatically:
 
 ```bash
-./target/release/jotcrack autocrack '<jwt>' --wordlist <path>
+./target/release/jotcrack autocrack '<token>' --wordlist <path>
 ```
 
-Example:
-
-```bash
-# Crack any HMAC-SHA JWT — autocrack reads the algorithm from the header
-./target/release/jotcrack autocrack 'eyJhbGciOiJIUzI1NiIs...' --wordlist my_wordlist.txt
-```
+It distinguishes JWT (3-part) from JWE (5-part) compact tokens and routes to the correct GPU backend.
 
 ## Subcommands
 
-| Command | Algorithm | Signature size | GPU kernel |
-|---------|-----------|---------------|------------|
-| `autocrack` | Auto-detect from JWT header | — | Routes to the right one |
-| `hs256wordlist` | HMAC-SHA256 | 32 bytes | `hs256_wordlist.metal` |
-| `hs384wordlist` | HMAC-SHA384 | 48 bytes | `hs512_wordlist.metal` (shared from hs512wordlist/) |
-| `hs512wordlist` | HMAC-SHA512 | 64 bytes | `hs512_wordlist.metal` |
+| Command | Algorithm | Type | GPU kernel |
+|---------|-----------|------|------------|
+| `autocrack` | Auto-detect from header | JWT or JWE | Routes to the right one |
+| `hs256wordlist` | HMAC-SHA256 | JWT | `hs256_wordlist.metal` |
+| `hs384wordlist` | HMAC-SHA384 | JWT | `hs512_wordlist.metal` (shared) |
+| `hs512wordlist` | HMAC-SHA512 | JWT | `hs512_wordlist.metal` |
+| `jwe-a128kw` | AES-128 Key Wrap | JWE | `aeskw_wordlist.metal` (AES_KEY_BYTES=16) |
+| `jwe-a192kw` | AES-192 Key Wrap | JWE | `aeskw_wordlist.metal` (AES_KEY_BYTES=24) |
+| `jwe-a256kw` | AES-256 Key Wrap | JWE | `aeskw_wordlist.metal` (AES_KEY_BYTES=32) |
 
 `autocrack` is the recommended default. Use the algorithm-specific commands if you want to skip the auto-detection step.
 
@@ -58,7 +63,7 @@ All subcommands accept the same flags:
 
 ```
 ARGS:
-  <JWT>    JWT in compact form (header.payload.signature)
+  <JWT>    Token in compact form (JWT: header.payload.signature, JWE: header.ek.iv.ct.tag)
 
 OPTIONS:
   --wordlist <PATH>           Wordlist file path [default: breach.txt]
@@ -71,7 +76,7 @@ OPTIONS:
 
 ## Testing
 
-We tested all three algorithms end-to-end with our own wordlist — cracking known secrets (e.g. `"password"`) and running full-throughput stress tests with random 32-character keys that don't appear in the wordlist (to force a complete scan and measure sustained GPU speed).
+We tested all algorithms end-to-end with our own wordlist — cracking known secrets (e.g. `"password"`) and running full-throughput stress tests with random keys that don't appear in the wordlist (to force a complete scan and measure sustained GPU speed).
 
 The repo does not include a wordlist. You'll need to build or source your own — one candidate secret per line, plain text. Any wordlist works; bigger lists give you a better throughput picture since the GPU stays saturated longer.
 
@@ -85,7 +90,7 @@ The repo does not include a wordlist. You'll need to build or source your own �
 ## Output and exit codes
 
 Output:
-- `HS256 key: <secret>` / `HS384 key: <secret>` / `HS512 key: <secret>` — when found
+- `HS256 key: <secret>` / `A128KW key: <secret>` / etc. — when found
 - `NOT FOUND` — when no candidate matches
 - `ERROR: ...` — for invalid input or runtime failures
 
@@ -95,6 +100,8 @@ Exit codes:
 - `2` = error
 
 ## Performance
+
+### HMAC-SHA (JWT)
 
 Benchmarked on Apple M4 Max (40-core GPU, 64 GB RAM) with a 112 GB wordlist (16.4 billion candidates):
 
@@ -106,7 +113,17 @@ Benchmarked on Apple M4 Max (40-core GPU, 64 GB RAM) with a 112 GB wordlist (16.
 
 **Why HS384/HS512 are slower**: SHA-512 uses 64-bit words, but Apple GPUs have 32-bit ALUs — every 64-bit operation is emulated as multiple 32-bit instructions. SHA-512 also uses 128-byte blocks and 80 rounds (vs SHA-256's 64-byte blocks and 64 rounds).
 
-**Steady-state GPU rates** (outside the long-word region of the wordlist): ~105 M/s for both HS384/HS512, which is ~4.2x slower than HS256 — matching the expected cost of 64-bit emulation.
+### AES Key Wrap (JWE)
+
+Benchmarked on Apple M4 Max with breach.txt (~296M candidates):
+
+| Algorithm | End-to-End | GPU-Only | AES Rounds | Key Size |
+|-----------|-----------|----------|------------|----------|
+| **A128KW** | **120 M/s** | 125 M/s | 10 | 16 bytes |
+| **A192KW** | **106 M/s** | 110 M/s | 12 | 24 bytes |
+| **A256KW** | **90.5 M/s** | 93.4 M/s | 14 | 32 bytes |
+
+Performance scales linearly with AES round count — each additional 2 rounds adds ~12% overhead. The AES Key Wrap shader uses software AES with S-box lookup tables in Metal `constant` address space, broadcast-cached across SIMD groups.
 
 ### Benchmarking
 
@@ -114,11 +131,11 @@ Benchmarked on Apple M4 Max (40-core GPU, 64 GB RAM) with a 112 GB wordlist (16.
 cargo build --release
 
 # Crack a known secret (should find it quickly)
-./target/release/jotcrack autocrack '<your-jwt>' --wordlist my_wordlist.txt
+./target/release/jotcrack autocrack '<your-token>' --wordlist my_wordlist.txt
 
-# Full throughput benchmark — use a JWT signed with a key NOT in your wordlist
+# Full throughput benchmark — use a token with a key NOT in your wordlist
 # so the entire wordlist is scanned and you get sustained GPU throughput numbers
-./target/release/jotcrack autocrack '<stress-jwt>' --wordlist my_wordlist.txt 2>bench.log
+./target/release/jotcrack autocrack '<stress-token>' --wordlist my_wordlist.txt 2>bench.log
 ```
 
 Tips:
@@ -131,26 +148,23 @@ Tips:
 
 ```
 src/
-  main.rs                           Entry point (thin — delegates to commands::run())
-  commands/
-    mod.rs                          CLI parsing (clap) + subcommand dispatch
-    common/
-      args.rs                       Shared ParserConfig, constants
-      batch.rs                      WordBatch — packed GPU batch format
-      parser.rs                     Parallel mmap wordlist parsing (~1300 lines)
-      producer.rs                   Multi-threaded producer pipeline (~580 lines)
-      stats.rs                      Timing, rate reporting, final stats
-      test_support.rs               Test helpers (temp wordlists, JWT generation)
-    hs256wordlist/
-      args.rs, jwt.rs, gpu.rs       HS256-specific parsing + GPU setup
-      command.rs                    HS256 cracking pipeline
-      hs256_wordlist.metal          SHA-256 GPU kernel
-    hs384wordlist/                  HS384-specific (uses hs512wordlist's kernel)
-    hs512wordlist/
-      args.rs, jwt.rs, gpu.rs       HS512-specific parsing + GPU setup
-      command.rs                    HS512 cracking pipeline
-      hs512_wordlist.metal          SHA-512 GPU kernel (shared by HS384)
-    autocrack/                    Auto-detect algorithm + dispatch
+  main.rs               Entry point (thin — delegates to commands::run())
+  commands.rs            CLI parsing (clap) + subcommand dispatch
+  args.rs                Shared CLI args, ParserConfig, constants
+  jwt.rs                 JWT/JWE token parsing and algorithm detection
+  runner.rs              Unified cracking pipeline (GPU dispatch loop)
+  batch.rs               WordBatch — packed GPU batch format
+  parser.rs              Parallel mmap wordlist parsing
+  producer.rs            Multi-threaded producer pipeline
+  stats.rs               Timing, rate reporting, final stats
+  test_support.rs        Test helpers (temp wordlists, JWT/JWE generation)
+  gpu/
+    mod.rs               HmacVariant, AesKwVariant, CrackVariant enums + GpuBruteForcer trait
+    metal/
+      mod.rs             Metal GPU backends (MetalBruteForcer, MetalAesKwBruteForcer)
+      hs256_wordlist.metal   SHA-256 GPU kernel
+      hs512_wordlist.metal   SHA-512 GPU kernel (shared by HS384)
+      aeskw_wordlist.metal   AES Key Wrap GPU kernel (compile-time specialised for 128/192/256)
 ```
 
 ### Key design decisions
@@ -158,16 +172,24 @@ src/
 - **Metal kernels are embedded** via `include_str!()` — the binary is fully self-contained
 - **Double-buffered dispatch**: the next batch is parsed and packed while the GPU processes the current one
 - **Zero-copy batches**: wordlist parser writes directly into Metal shared-memory buffers
-- **Two kernel variants per algorithm**: a "short-key" specialization (keys <= 64/128 bytes) avoids the long-key hash-first path
+- **Two kernel variants per algorithm**: a "short-key" specialization avoids the long-key hash-first path
+- **Compile-time AES specialisation**: the AES Key Wrap shader is compiled three times with different `#define AES_KEY_BYTES` values, producing fully specialised kernels per variant (no runtime branching, exact register allocation)
 - **Autotune**: `--autotune` benchmarks several threadgroup widths on the first batch and picks the fastest
 
 ## Kernel optimizations
 
-Three GPU kernel techniques (applied to all algorithms):
+### HMAC-SHA kernels
 
 1. **Rolling 16-word message schedule**: `w[16]` replaces `w[64]` in SHA compression, saving register pressure. Rounds 16+ update `w[i&15]` in-place.
 2. **Flat HMAC**: Bare state arrays replace streaming hash contexts, eliminating block buffers from the hot path. HMAC inner/outer passes are manually finalized.
 3. **Precomputed target words**: Host converts signature bytes to native-endian words once, avoiding per-thread byte-swapping in the comparison loop.
+
+### AES Key Wrap kernel
+
+1. **Compile-time specialisation**: `AES_KEY_BYTES` controls Nk (key words), Nr (rounds), and round key array size at compile time — Metal unrolls loops and allocates exact registers.
+2. **Constant-memory S-boxes**: Forward and inverse S-box tables in `constant` address space — broadcast-cached across SIMD groups, avoiding per-thread register spills.
+3. **Arithmetic GF(2^8)**: MixColumns/InvMixColumns use inline `xtime`/`mul` arithmetic instead of lookup tables, reducing constant memory pressure.
+4. **SHA-256 key derivation**: Long candidates (> key_bytes) are SHA-256 hashed and truncated; short candidates are zero-padded — matching JOSE key derivation semantics.
 
 ## Tests
 
@@ -176,12 +198,14 @@ cargo test
 ```
 
 Tests cover:
-- JWT parsing for each algorithm (success, wrong alg, wrong sig length, bad base64)
+- JWT parsing for each HMAC algorithm (success, wrong alg, wrong sig length, bad base64)
+- JWE parsing for each AES-KW variant (success, wrong alg, wrong part count, short encrypted key)
 - GPU params struct size round-trips
 - End-to-end cracking for HS256, HS384, HS512 (finds "password" in a temp wordlist)
-- Not-found cases
-- Autodetect routing (autocrack dispatches to each algorithm correctly)
-- Autodetect rejection of unsupported algorithms (e.g., RS256)
+- End-to-end cracking for A128KW, A192KW, A256KW (finds "password" in a temp wordlist)
+- Not-found cases for all algorithms
+- Autodetect routing (autocrack dispatches to each algorithm correctly, both JWT and JWE)
+- Autodetect rejection of unsupported algorithms (e.g., RS256, A128GCMKW)
 - CLI contract tests (accepted flags, defaults, validation)
 - Wordlist parser correctness (batch boundaries, CRLF handling, oversized lines)
 - Producer pipeline lifecycle (spawn, produce, join)
