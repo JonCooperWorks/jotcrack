@@ -8,7 +8,7 @@ use super::gpu::{
     CrackVariant, GpuBruteForcer, GpuCommandHandle,
     metal::{MetalAesKwBruteForcer, MetalBruteForcer},
 };
-use super::jwt::{parse_jwe_a128kw, parse_jwt};
+use super::jwt::{parse_jwe_aes_kw, parse_jwt};
 use super::producer::{ProducerMessage, WordlistProducer};
 use super::stats::{
     RateReportSnapshot, RunTimings, format_duration_millis, format_human_count, print_final_stats,
@@ -53,7 +53,8 @@ fn handle_match(
 /// Dispatches to the appropriate GPU compute backend based on `variant`:
 ///
 /// - **`Hmac(hv)`**: Metal HMAC-SHA shader, double-buffered GPU dispatch.
-/// - **`JweA128kw`**: Metal software AES-128 shader for RFC 3394 Key Unwrap.
+/// - **`JweAesKw(akv)`**: Metal software AES shader for RFC 3394 Key Unwrap
+///   (A128KW / A192KW / A256KW, compile-time specialised per key size).
 ///
 /// Both paths share the same producer infrastructure (mmap, parser,
 /// planner, packer, `WordBatch` recycling) and timing/reporting code
@@ -70,10 +71,10 @@ pub(crate) fn run_wordlist_crack(
             let gpu = MetalBruteForcer::new(hv, &signing_input)?;
             run_gpu_crack(variant, gpu, &target_signature, args)
         }
-        CrackVariant::JweA128kw => {
-            let encrypted_key = parse_jwe_a128kw(&args.jwt)?;
+        CrackVariant::JweAesKw(akv) => {
+            let encrypted_key = parse_jwe_aes_kw(akv, &args.jwt)?;
             let n = encrypted_key.len() / 8 - 1;
-            let gpu = MetalAesKwBruteForcer::new(&encrypted_key, n)?;
+            let gpu = MetalAesKwBruteForcer::new(akv, &encrypted_key, n)?;
             run_gpu_crack(variant, gpu, &encrypted_key, args)
         }
     }
@@ -337,7 +338,7 @@ fn report_rate_if_due(
 
 #[cfg(test)]
 mod tests {
-    use super::super::gpu::{CrackVariant, HmacVariant};
+    use super::super::gpu::{AesKwVariant, CrackVariant, HmacVariant};
     use super::super::test_support::{make_test_jwt, make_test_jwe, write_temp_wordlist};
     use super::*;
     use std::path::PathBuf;
@@ -460,9 +461,9 @@ mod tests {
     /// JWE A128KW finds the known secret "password" in a small wordlist.
     #[test]
     fn jwe_a128kw_cracks_known_secret() {
-        let jwe = make_test_jwe(b"password");
+        let jwe = make_test_jwe(AesKwVariant::A128kw, b"password");
         let path = write_temp_wordlist(b"wrong1\nwrong2\npassword\nwrong3\n");
-        let result = run_wordlist_crack(CrackVariant::JweA128kw, make_args(&jwe, path.clone())).unwrap();
+        let result = run_wordlist_crack(CrackVariant::JweAesKw(AesKwVariant::A128kw), make_args(&jwe, path.clone())).unwrap();
         assert!(result, "expected A128KW crack to find 'password'");
         let _ = std::fs::remove_file(path);
     }
@@ -470,22 +471,86 @@ mod tests {
     /// JWE A128KW reports not-found when the secret is absent from the wordlist.
     #[test]
     fn jwe_a128kw_reports_not_found() {
-        let jwe = make_test_jwe(b"fsdgdfsgdsfsgdf");
+        let jwe = make_test_jwe(AesKwVariant::A128kw, b"fsdgdfsgdsfsgdf");
         let path = write_temp_wordlist(b"wrong1\nwrong2\nwrong3\n");
-        let result = run_wordlist_crack(CrackVariant::JweA128kw, make_args(&jwe, path.clone())).unwrap();
+        let result = run_wordlist_crack(CrackVariant::JweAesKw(AesKwVariant::A128kw), make_args(&jwe, path.clone())).unwrap();
         assert!(!result, "expected A128KW crack to report not found");
         let _ = std::fs::remove_file(path);
     }
 
-    /// Autocrack routes a 5-part JWE token to the A128KW path.
+    /// Autocrack routes a 5-part A128KW JWE token to the correct path.
     #[test]
-    fn autocrack_detects_jwe() {
-        let jwe = make_test_jwe(b"password");
+    fn autocrack_detects_jwe_a128kw() {
+        let jwe = make_test_jwe(AesKwVariant::A128kw, b"password");
         let path = write_temp_wordlist(b"wrong1\npassword\nwrong2\n");
         let variant = super::super::jwt::detect_token_variant(&jwe).unwrap();
-        assert_eq!(variant, CrackVariant::JweA128kw);
+        assert_eq!(variant, CrackVariant::JweAesKw(AesKwVariant::A128kw));
         let result = run_wordlist_crack(variant, make_args(&jwe, path.clone())).unwrap();
         assert!(result, "autocrack should find 'password' via A128KW");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// JWE A192KW finds the known secret "password" in a small wordlist.
+    #[test]
+    fn jwe_a192kw_cracks_known_secret() {
+        let jwe = make_test_jwe(AesKwVariant::A192kw, b"password");
+        let path = write_temp_wordlist(b"wrong1\nwrong2\npassword\nwrong3\n");
+        let result = run_wordlist_crack(CrackVariant::JweAesKw(AesKwVariant::A192kw), make_args(&jwe, path.clone())).unwrap();
+        assert!(result, "expected A192KW crack to find 'password'");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// JWE A192KW reports not-found when the secret is absent from the wordlist.
+    #[test]
+    fn jwe_a192kw_reports_not_found() {
+        let jwe = make_test_jwe(AesKwVariant::A192kw, b"fsdgdfsgdsfsgdf");
+        let path = write_temp_wordlist(b"wrong1\nwrong2\nwrong3\n");
+        let result = run_wordlist_crack(CrackVariant::JweAesKw(AesKwVariant::A192kw), make_args(&jwe, path.clone())).unwrap();
+        assert!(!result, "expected A192KW crack to report not found");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Autocrack routes a 5-part A192KW JWE token to the correct path.
+    #[test]
+    fn autocrack_detects_jwe_a192kw() {
+        let jwe = make_test_jwe(AesKwVariant::A192kw, b"password");
+        let path = write_temp_wordlist(b"wrong1\npassword\nwrong2\n");
+        let variant = super::super::jwt::detect_token_variant(&jwe).unwrap();
+        assert_eq!(variant, CrackVariant::JweAesKw(AesKwVariant::A192kw));
+        let result = run_wordlist_crack(variant, make_args(&jwe, path.clone())).unwrap();
+        assert!(result, "autocrack should find 'password' via A192KW");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// JWE A256KW finds the known secret "password" in a small wordlist.
+    #[test]
+    fn jwe_a256kw_cracks_known_secret() {
+        let jwe = make_test_jwe(AesKwVariant::A256kw, b"password");
+        let path = write_temp_wordlist(b"wrong1\nwrong2\npassword\nwrong3\n");
+        let result = run_wordlist_crack(CrackVariant::JweAesKw(AesKwVariant::A256kw), make_args(&jwe, path.clone())).unwrap();
+        assert!(result, "expected A256KW crack to find 'password'");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// JWE A256KW reports not-found when the secret is absent from the wordlist.
+    #[test]
+    fn jwe_a256kw_reports_not_found() {
+        let jwe = make_test_jwe(AesKwVariant::A256kw, b"fsdgdfsgdsfsgdf");
+        let path = write_temp_wordlist(b"wrong1\nwrong2\nwrong3\n");
+        let result = run_wordlist_crack(CrackVariant::JweAesKw(AesKwVariant::A256kw), make_args(&jwe, path.clone())).unwrap();
+        assert!(!result, "expected A256KW crack to report not found");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Autocrack routes a 5-part A256KW JWE token to the correct path.
+    #[test]
+    fn autocrack_detects_jwe_a256kw() {
+        let jwe = make_test_jwe(AesKwVariant::A256kw, b"password");
+        let path = write_temp_wordlist(b"wrong1\npassword\nwrong2\n");
+        let variant = super::super::jwt::detect_token_variant(&jwe).unwrap();
+        assert_eq!(variant, CrackVariant::JweAesKw(AesKwVariant::A256kw));
+        let result = run_wordlist_crack(variant, make_args(&jwe, path.clone())).unwrap();
+        assert!(result, "autocrack should find 'password' via A256KW");
         let _ = std::fs::remove_file(path);
     }
 }

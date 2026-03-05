@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // a file as a byte slice without reading it all into a `Vec<u8>`, which is
 // important for large wordlists (hundreds of MBs).
 use memmap2::MmapOptions;
-use super::gpu::GpuDevice;
+use super::gpu::{AesKwVariant, GpuDevice};
 
 use super::args::ParserConfig;
 use super::parser::{MmapWordlistBatchReader, ParallelMmapWordlistBatchReader};
@@ -241,74 +241,85 @@ pub(crate) fn make_test_jwt(alg: &str, payload_json: &str, secret: &[u8]) -> Str
     format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(&signature))
 }
 
-/// Construct a valid JWE compact token with `alg: A128KW` for testing.
+/// Construct a valid JWE compact token for any AES Key Wrap variant.
 ///
-/// The token wraps a randomly-generated 128-bit Content Encryption Key (CEK)
-/// using AES-128 Key Wrap (RFC 3394) with a key derived from `secret`:
+/// Supports A128KW, A192KW, and A256KW. The token wraps a randomly-generated
+/// 128-bit Content Encryption Key (CEK) using AES Key Wrap (RFC 3394) with a
+/// key derived from `secret`:
 ///
-/// - `secret` ≤ 16 bytes → zero-padded to 16 bytes
-/// - `secret` > 16 bytes → SHA-256 hashed and truncated to 16 bytes
+/// - `secret` ≤ N bytes → zero-padded to N bytes
+/// - `secret` > N bytes → SHA-256 hashed and truncated to N bytes
+///
+/// Where N = `variant.key_bytes()` (16 / 24 / 32 for A128KW / A192KW / A256KW).
 ///
 /// This matches the key derivation logic in the Metal compute shader
-/// (`a128kw_wordlist.metal`). The IV, ciphertext, and tag segments are
-/// random bytes — they are irrelevant for the Key Wrap integrity attack
+/// (`aeskw_wordlist.metal`). The IV, ciphertext, and tag segments are
+/// dummy bytes — they are irrelevant for the Key Wrap integrity attack
 /// which only checks the wrapped key's integrity check value (0xA6A6A6A6A6A6A6A6).
 ///
 /// ## Why `aes_kw` in tests but not production code?
 ///
-/// Production code implements AES-128 Key *Unwrap* entirely in the Metal
+/// Production code implements AES Key *Unwrap* entirely in the Metal
 /// compute shader (software AES with S-box lookup tables). Test JWE
 /// generation needs Key *Wrap* to create valid tokens. The `aes_kw` crate
 /// provides both directions and is listed under `[dev-dependencies]` so it
 /// adds no bytes to the release binary.
-pub(crate) fn make_test_jwe(secret: &[u8]) -> String {
-    use aes_kw::KekAes128;
+pub(crate) fn make_test_jwe(variant: AesKwVariant, secret: &[u8]) -> String {
+    use aes_kw::{KekAes128, KekAes192, KekAes256};
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-    // Derive a 16-byte AES-128 key from the secret. This replicates the
-    // key derivation logic used by the Metal compute shader:
-    //   ≤ 16 bytes → zero-pad to 16 bytes
-    //   > 16 bytes → SHA-256 hash, truncate to 16 bytes
-    let aes_key = {
-        let mut key = [0u8; 16];
-        if secret.len() <= 16 {
-            key[..secret.len()].copy_from_slice(secret);
-        } else {
-            use sha2::{Digest, Sha256};
-            let hash = Sha256::digest(secret);
-            key.copy_from_slice(&hash[..16]);
-        }
-        key
-    };
+    let key_bytes = variant.key_bytes();
 
-    // Generate a random 128-bit (16-byte) CEK. The content doesn't matter
-    // for the cracking attack — only the wrapping integrity check matters.
-    // We use a simple deterministic "random" here (seeded from the secret)
-    // to keep tests reproducible.
+    // Derive an AES key of the appropriate length from the secret.
+    // This replicates the key derivation logic used by the Metal shader:
+    //   ≤ key_bytes → zero-pad to key_bytes
+    //   > key_bytes → SHA-256 hash, truncate to key_bytes
+    let mut aes_key = [0u8; 32]; // max size for AES-256
+    if secret.len() <= key_bytes {
+        aes_key[..secret.len()].copy_from_slice(secret);
+    } else {
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(secret);
+        aes_key[..key_bytes].copy_from_slice(&hash[..key_bytes]);
+    }
+
+    // Generate a deterministic 128-bit (16-byte) CEK for reproducibility.
+    // SHA-256(b"cek-seed-" || secret) → take first 16 bytes.
     let mut cek = [0u8; 16];
-    // Use a simple hash-based deterministic generator for reproducibility.
-    // SHA-256(b"cek" || secret) gives us 32 bytes; take the first 16.
     {
         use sha2::{Digest, Sha256};
         let hash = Sha256::digest([b"cek-seed-" as &[u8], secret].concat());
         cek.copy_from_slice(&hash[..16]);
     }
 
-    // AES-128 Key Wrap the CEK → 24 bytes (n=2 blocks, output is (n+1)*8).
-    let kek = KekAes128::from(aes_key);
+    // AES Key Wrap the CEK → 24 bytes (n=2 blocks, output is (n+1)*8).
+    // Dispatch to the correct KEK type based on variant.
     let mut wrapped = [0u8; 24];
-    kek.wrap(&cek, &mut wrapped)
-        .expect("AES Key Wrap failed — should not happen with valid key/CEK sizes");
+    match variant {
+        AesKwVariant::A128kw => {
+            let kek = KekAes128::from(<[u8; 16]>::try_from(&aes_key[..16]).unwrap());
+            kek.wrap(&cek, &mut wrapped)
+                .expect("AES-128 Key Wrap failed");
+        }
+        AesKwVariant::A192kw => {
+            let kek = KekAes192::from(<[u8; 24]>::try_from(&aes_key[..24]).unwrap());
+            kek.wrap(&cek, &mut wrapped)
+                .expect("AES-192 Key Wrap failed");
+        }
+        AesKwVariant::A256kw => {
+            let kek = KekAes256::from(<[u8; 32]>::try_from(&aes_key[..32]).unwrap());
+            kek.wrap(&cek, &mut wrapped)
+                .expect("AES-256 Key Wrap failed");
+        }
+    }
 
-    // Build the JWE header. `enc` is A128GCM for a 128-bit CEK.
-    let header = r#"{"alg":"A128KW","enc":"A128GCM"}"#;
+    // Build the JWE header with the correct `alg` for this variant.
+    let header = format!(r#"{{"alg":"{}","enc":"A128GCM"}}"#, variant.label());
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
     let encrypted_key_b64 = URL_SAFE_NO_PAD.encode(&wrapped);
 
     // IV, ciphertext, and tag are irrelevant for the Key Wrap attack.
-    // Use deterministic dummy values derived from the secret for
-    // reproducibility.
     let iv_b64 = URL_SAFE_NO_PAD.encode(&[0x42u8; 12]); // 12 bytes for A128GCM IV
     let ct_b64 = URL_SAFE_NO_PAD.encode(&[0x00u8; 32]); // dummy ciphertext
     let tag_b64 = URL_SAFE_NO_PAD.encode(&[0x00u8; 16]); // dummy tag
@@ -321,22 +332,28 @@ pub(crate) fn make_test_jwe(secret: &[u8]) -> String {
 ///
 /// Run with: `cargo test generate_jwe_token_files -- --ignored --nocapture`
 ///
-/// This generates:
-/// - `jwe_a128kw_found` — JWE wrapped with "password" (present in breach.txt)
-/// - `jwe_a128kw_notfound` — JWE wrapped with "fsdgdfsgdsfsgdf" (absent from breach.txt)
+/// This generates token files for all three AES Key Wrap variants:
+/// - `jwe_a{128,192,256}kw_found` — JWE wrapped with "password" (present in breach.txt)
+/// - `jwe_a{128,192,256}kw_notfound` — JWE wrapped with "fsdgdfsgdsfsgdf" (absent)
 #[test]
 #[ignore]
 fn generate_jwe_token_files() {
-    let found_token = make_test_jwe(b"password");
-    let notfound_token = make_test_jwe(b"fsdgdfsgdsfsgdf");
+    for (variant, tag) in [
+        (AesKwVariant::A128kw, "a128kw"),
+        (AesKwVariant::A192kw, "a192kw"),
+        (AesKwVariant::A256kw, "a256kw"),
+    ] {
+        let found_token = make_test_jwe(variant, b"password");
+        let notfound_token = make_test_jwe(variant, b"fsdgdfsgdsfsgdf");
 
-    std::fs::write("jwe_a128kw_found", &found_token)
-        .expect("failed to write jwe_a128kw_found");
-    std::fs::write("jwe_a128kw_notfound", &notfound_token)
-        .expect("failed to write jwe_a128kw_notfound");
+        std::fs::write(format!("jwe_{tag}_found"), &found_token)
+            .unwrap_or_else(|_| panic!("failed to write jwe_{tag}_found"));
+        std::fs::write(format!("jwe_{tag}_notfound"), &notfound_token)
+            .unwrap_or_else(|_| panic!("failed to write jwe_{tag}_notfound"));
 
-    eprintln!("jwe_a128kw_found:    {}", found_token);
-    eprintln!("jwe_a128kw_notfound: {}", notfound_token);
+        eprintln!("jwe_{tag}_found:    {found_token}");
+        eprintln!("jwe_{tag}_notfound: {notfound_token}");
+    }
     eprintln!("Files written to project root.");
 }
 

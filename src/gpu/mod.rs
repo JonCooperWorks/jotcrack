@@ -45,28 +45,80 @@ impl HmacVariant {
 }
 
 // ---------------------------------------------------------------------------
+// AesKwVariant
+// ---------------------------------------------------------------------------
+
+/// Which AES Key Wrap variant to crack (RFC 7518 §4.4).
+///
+/// All three variants use RFC 3394 AES Key Wrap with different AES key sizes.
+/// The underlying algorithm is identical — only the AES block cipher changes:
+///
+/// | Variant | AES Key | Rounds | Round Keys | FIPS 197 §5.2 |
+/// |---------|---------|--------|------------|---------------|
+/// | A128KW  | 16 bytes (Nk=4) | 10 (Nr=10) | 44 words | Standard |
+/// | A192KW  | 24 bytes (Nk=6) | 12 (Nr=12) | 52 words | Standard |
+/// | A256KW  | 32 bytes (Nk=8) | 14 (Nr=14) | 60 words | Extra SubWord at i%8==4 |
+///
+/// The Metal shader is compiled three times with different `AES_KEY_BYTES`
+/// preprocessor defines, producing fully specialised kernels for each variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AesKwVariant {
+    /// AES-128 Key Wrap (16-byte key, 10 rounds).
+    A128kw,
+    /// AES-192 Key Wrap (24-byte key, 12 rounds).
+    A192kw,
+    /// AES-256 Key Wrap (32-byte key, 14 rounds).
+    A256kw,
+}
+
+impl AesKwVariant {
+    /// Human-readable algorithm name matching the JWE `alg` header value.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::A128kw => "A128KW",
+            Self::A192kw => "A192KW",
+            Self::A256kw => "A256KW",
+        }
+    }
+
+    /// AES key size in bytes for this variant.
+    ///
+    /// This determines the key expansion schedule, round count, and the
+    /// short-key threshold (candidates ≤ key_bytes are zero-padded;
+    /// longer candidates are SHA-256 hashed and truncated).
+    pub(crate) fn key_bytes(self) -> usize {
+        match self {
+            Self::A128kw => 16,
+            Self::A192kw => 24,
+            Self::A256kw => 32,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CrackVariant
 // ---------------------------------------------------------------------------
 
 /// Top-level dispatch type covering both JWT (HMAC) and JWE (Key Wrap) attacks.
 ///
-/// `HmacVariant` continues to drive GPU kernel selection for HMAC attacks.
-/// `CrackVariant` sits above it as the unified discriminant used by the
+/// `HmacVariant` drives GPU kernel selection for HMAC attacks.
+/// `AesKwVariant` drives GPU kernel selection for AES Key Wrap attacks.
+/// `CrackVariant` sits above them as the unified discriminant used by the
 /// runner and CLI layers to route tokens to the correct compute backend:
 ///
 /// - **`Hmac(hv)`** → Metal/CUDA GPU shader (HMAC-SHA per candidate)
-/// - **`JweA128kw`** → Metal/CUDA GPU shader (software AES-128 Key Wrap per candidate)
+/// - **`JweAesKw(akv)`** → Metal/CUDA GPU shader (software AES Key Wrap per candidate)
 ///
 /// Both paths run on the GPU. AES Key Wrap uses software S-box lookup tables
 /// in constant memory — the GPU's massive parallelism (thousands of concurrent
-/// threads) outweighs the per-thread cost of software AES vs hardware AESD,
-/// benchmarking at ~120M/s GPU vs ~5.3M/s CPU (22× faster on Apple M4 Max).
+/// threads) outweighs the per-thread cost of software AES vs hardware AESD.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CrackVariant {
     /// HMAC-SHA JWT cracking via GPU compute.
     Hmac(HmacVariant),
-    /// JWE A128KW (AES-128 Key Wrap, RFC 3394) cracking via GPU compute.
-    JweA128kw,
+    /// JWE AES Key Wrap (RFC 3394) cracking via GPU compute.
+    /// Supports A128KW, A192KW, and A256KW.
+    JweAesKw(AesKwVariant),
 }
 
 impl CrackVariant {
@@ -74,7 +126,7 @@ impl CrackVariant {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Hmac(hv) => hv.label(),
-            Self::JweA128kw => "A128KW",
+            Self::JweAesKw(akv) => akv.label(),
         }
     }
 }

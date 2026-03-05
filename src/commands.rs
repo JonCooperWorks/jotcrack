@@ -2,8 +2,7 @@ use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
 use crate::args::WordlistArgs;
-use crate::gpu::CrackVariant;
-use crate::gpu::HmacVariant;
+use crate::gpu::{AesKwVariant, CrackVariant, HmacVariant};
 
 #[derive(Debug, Parser)]
 #[command(name = "jotcrack", about = "GPU-assisted JWT/JWE cracking with Metal")]
@@ -22,10 +21,22 @@ enum Commands {
     Hs512wordlist(WordlistArgs),
     /// Crack a JWE encrypted with A128KW (AES-128 Key Wrap) using a wordlist attack.
     ///
-    /// Uses GPU compute (Metal/CUDA) with software AES-128 via S-box lookup
-    /// tables in constant memory. The RFC 3394 integrity check value
-    /// 0xA6A6A6A6A6A6A6A6 serves as the oracle — no known plaintext is needed.
+    /// Uses GPU compute (Metal/CUDA) with software AES-128 (10 rounds, 16-byte key)
+    /// via S-box lookup tables in constant memory. The RFC 3394 integrity check
+    /// value 0xA6A6A6A6A6A6A6A6 serves as the oracle — no known plaintext is needed.
     JweA128kw(WordlistArgs),
+    /// Crack a JWE encrypted with A192KW (AES-192 Key Wrap) using a wordlist attack.
+    ///
+    /// Uses GPU compute (Metal/CUDA) with software AES-192 (12 rounds, 24-byte key)
+    /// via S-box lookup tables in constant memory. The RFC 3394 integrity check
+    /// value 0xA6A6A6A6A6A6A6A6 serves as the oracle — no known plaintext is needed.
+    JweA192kw(WordlistArgs),
+    /// Crack a JWE encrypted with A256KW (AES-256 Key Wrap) using a wordlist attack.
+    ///
+    /// Uses GPU compute (Metal/CUDA) with software AES-256 (14 rounds, 32-byte key)
+    /// via S-box lookup tables in constant memory. The RFC 3394 integrity check
+    /// value 0xA6A6A6A6A6A6A6A6 serves as the oracle — no known plaintext is needed.
+    JweA256kw(WordlistArgs),
     /// Auto-detect the algorithm from the token header and crack it.
     ///
     /// Distinguishes JWT (3-part) from JWE (5-part) compact tokens,
@@ -49,7 +60,13 @@ pub fn run() -> ExitCode {
             crate::runner::run_wordlist_crack(CrackVariant::Hmac(HmacVariant::Hs512), args)
         }
         Commands::JweA128kw(args) => {
-            crate::runner::run_wordlist_crack(CrackVariant::JweA128kw, args)
+            crate::runner::run_wordlist_crack(CrackVariant::JweAesKw(AesKwVariant::A128kw), args)
+        }
+        Commands::JweA192kw(args) => {
+            crate::runner::run_wordlist_crack(CrackVariant::JweAesKw(AesKwVariant::A192kw), args)
+        }
+        Commands::JweA256kw(args) => {
+            crate::runner::run_wordlist_crack(CrackVariant::JweAesKw(AesKwVariant::A256kw), args)
         }
         Commands::Autocrack(args) => match crate::jwt::detect_token_variant(&args.jwt) {
             Ok(variant) => {
@@ -253,6 +270,38 @@ mod tests {
         .unwrap();
         let Commands::JweA128kw(args) = cli.command else {
             panic!("expected JweA128kw");
+        };
+        assert_eq!(args.jwt, "a.b.c.d.e");
+        assert_eq!(args.wordlist, PathBuf::from(DEFAULT_WORDLIST_PATH));
+    }
+
+    /// The jwe-a192kw subcommand parses correctly and routes to JWE mode.
+    #[test]
+    fn clap_cli_parses_jwe_a192kw() {
+        let cli = Cli::try_parse_from([
+            "jotcrack",
+            "jwe-a192kw",
+            "a.b.c.d.e",
+        ])
+        .unwrap();
+        let Commands::JweA192kw(args) = cli.command else {
+            panic!("expected JweA192kw");
+        };
+        assert_eq!(args.jwt, "a.b.c.d.e");
+        assert_eq!(args.wordlist, PathBuf::from(DEFAULT_WORDLIST_PATH));
+    }
+
+    /// The jwe-a256kw subcommand parses correctly and routes to JWE mode.
+    #[test]
+    fn clap_cli_parses_jwe_a256kw() {
+        let cli = Cli::try_parse_from([
+            "jotcrack",
+            "jwe-a256kw",
+            "a.b.c.d.e",
+        ])
+        .unwrap();
+        let Commands::JweA256kw(args) = cli.command else {
+            panic!("expected JweA256kw");
         };
         assert_eq!(args.jwt, "a.b.c.d.e");
         assert_eq!(args.wordlist, PathBuf::from(DEFAULT_WORDLIST_PATH));

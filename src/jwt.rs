@@ -3,7 +3,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::Deserialize;
 
-use super::gpu::{CrackVariant, HmacVariant};
+use super::gpu::{AesKwVariant, CrackVariant, HmacVariant};
 
 #[derive(Debug, Deserialize)]
 struct JwtHeader {
@@ -13,9 +13,10 @@ struct JwtHeader {
 /// JWE (JSON Web Encryption) header.
 ///
 /// JWE headers carry both an `alg` (key management algorithm) and an `enc`
-/// (content encryption algorithm). For A128KW cracking we only need `alg`
-/// to confirm the key wrapping method, but `enc` is parsed for validation
-/// and future use (it determines the CEK length and thus the wrapped key size).
+/// (content encryption algorithm). For AES Key Wrap cracking we only need
+/// `alg` to confirm the key wrapping method (A128KW/A192KW/A256KW), but
+/// `enc` is parsed for validation and future use (it determines the CEK
+/// length and thus the wrapped key size).
 #[derive(Debug, Deserialize)]
 struct JweHeader {
     alg: String,
@@ -69,13 +70,17 @@ pub(crate) fn parse_jwt(
     Ok((signing_input, signature_bytes))
 }
 
-/// Parse and validate a JWE compact token with `alg: A128KW`.
+/// Parse and validate a JWE compact token with an AES Key Wrap algorithm.
+///
+/// Supports A128KW, A192KW, and A256KW — all three ECB-based AES Key Wrap
+/// variants defined in RFC 7518 §4.4. The `variant` parameter determines
+/// which `alg` header value is expected.
 ///
 /// JWE compact serialisation has five dot-separated base64url segments:
 ///   `<header>.<encrypted_key>.<iv>.<ciphertext>.<tag>`
 ///
 /// For Key Wrap cracking, only the `encrypted_key` matters — it contains
-/// the CEK wrapped using AES-128 Key Wrap (RFC 3394). The IV, ciphertext,
+/// the CEK wrapped using AES Key Wrap (RFC 3394). The IV, ciphertext,
 /// and tag are ignored because the attack's oracle is the RFC 3394
 /// integrity check value (0xA6A6A6A6A6A6A6A6), not the decrypted content.
 ///
@@ -83,7 +88,7 @@ pub(crate) fn parse_jwt(
 /// (number of 64-bit CEK blocks). Common sizes:
 /// - 24 bytes → n=2 (A128GCM: 128-bit CEK)
 /// - 40 bytes → n=4 (A128CBC-HS256: 256-bit CEK)
-pub(crate) fn parse_jwe_a128kw(jwe: &str) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn parse_jwe_aes_kw(variant: AesKwVariant, jwe: &str) -> anyhow::Result<Vec<u8>> {
     let parts: Vec<&str> = jwe.split('.').collect();
     if parts.len() != 5 {
         bail!(
@@ -98,9 +103,11 @@ pub(crate) fn parse_jwe_a128kw(jwe: &str) -> anyhow::Result<Vec<u8>> {
     let header: JweHeader =
         serde_json::from_slice(&header_bytes).context("invalid JWE header JSON")?;
 
-    if header.alg != "A128KW" {
+    let expected_alg = variant.label();
+    if header.alg != expected_alg {
         bail!(
-            "unsupported JWE alg: expected A128KW, got {}",
+            "unsupported JWE alg: expected {}, got {}",
+            expected_alg,
             header.alg
         );
     }
@@ -114,7 +121,8 @@ pub(crate) fn parse_jwe_a128kw(jwe: &str) -> anyhow::Result<Vec<u8>> {
     // encrypted_key length is 24 bytes.
     if encrypted_key.len() < 24 || encrypted_key.len() % 8 != 0 {
         bail!(
-            "invalid A128KW encrypted_key length: expected multiple of 8 bytes (>= 24), got {}",
+            "invalid {} encrypted_key length: expected multiple of 8 bytes (>= 24), got {}",
+            expected_alg,
             encrypted_key.len()
         );
     }
@@ -176,9 +184,11 @@ pub(crate) fn detect_token_variant(token: &str) -> anyhow::Result<CrackVariant> 
                 serde_json::from_slice(&header_bytes).context("invalid JSON in JWE header")?;
 
             match header.alg.as_str() {
-                "A128KW" => Ok(CrackVariant::JweA128kw),
+                "A128KW" => Ok(CrackVariant::JweAesKw(AesKwVariant::A128kw)),
+                "A192KW" => Ok(CrackVariant::JweAesKw(AesKwVariant::A192kw)),
+                "A256KW" => Ok(CrackVariant::JweAesKw(AesKwVariant::A256kw)),
                 other => bail!(
-                    "unsupported JWE algorithm: {} (expected A128KW)",
+                    "unsupported JWE algorithm: {} (expected A128KW, A192KW, or A256KW)",
                     other
                 ),
             }
@@ -314,7 +324,7 @@ mod tests {
     // JWE parsing tests
     // -----------------------------------------------------------------------
 
-    /// A well-formed 5-part A128KW JWE token is detected as `CrackVariant::JweA128kw`.
+    /// A well-formed 5-part A128KW JWE token is detected as `CrackVariant::JweAesKw(A128kw)`.
     #[test]
     fn detect_token_variant_jwe_a128kw() {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"A128KW","enc":"A128GCM"}"#);
@@ -322,7 +332,31 @@ mod tests {
         let jwe = format!("{header}.{ek}.iv.ct.tag");
         assert_eq!(
             detect_token_variant(&jwe).unwrap(),
-            CrackVariant::JweA128kw
+            CrackVariant::JweAesKw(AesKwVariant::A128kw)
+        );
+    }
+
+    /// A well-formed 5-part A192KW JWE token is detected as `CrackVariant::JweAesKw(A192kw)`.
+    #[test]
+    fn detect_token_variant_jwe_a192kw() {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"A192KW","enc":"A128GCM"}"#);
+        let ek = URL_SAFE_NO_PAD.encode(&[0u8; 24]);
+        let jwe = format!("{header}.{ek}.iv.ct.tag");
+        assert_eq!(
+            detect_token_variant(&jwe).unwrap(),
+            CrackVariant::JweAesKw(AesKwVariant::A192kw)
+        );
+    }
+
+    /// A well-formed 5-part A256KW JWE token is detected as `CrackVariant::JweAesKw(A256kw)`.
+    #[test]
+    fn detect_token_variant_jwe_a256kw() {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"A256KW","enc":"A128GCM"}"#);
+        let ek = URL_SAFE_NO_PAD.encode(&[0u8; 24]);
+        let jwe = format!("{header}.{ek}.iv.ct.tag");
+        assert_eq!(
+            detect_token_variant(&jwe).unwrap(),
+            CrackVariant::JweAesKw(AesKwVariant::A256kw)
         );
     }
 
@@ -348,15 +382,15 @@ mod tests {
     /// A JWE with an unsupported alg is rejected by `detect_token_variant`.
     #[test]
     fn detect_token_variant_rejects_unsupported_jwe_alg() {
-        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"A256KW","enc":"A256GCM"}"#);
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"A128GCMKW","enc":"A128GCM"}"#);
         let jwe = format!("{header}.ek.iv.ct.tag");
         let err = detect_token_variant(&jwe).unwrap_err();
-        assert!(format!("{err:#}").contains("unsupported JWE algorithm: A256KW"));
+        assert!(format!("{err:#}").contains("unsupported JWE algorithm: A128GCMKW"));
     }
 
-    /// `parse_jwe_a128kw` extracts the encrypted_key from a valid JWE.
+    /// `parse_jwe_aes_kw` extracts the encrypted_key from a valid A128KW JWE.
     #[test]
-    fn parse_jwe_a128kw_valid() {
+    fn parse_jwe_aes_kw_valid_a128kw() {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"A128KW","enc":"A128GCM"}"#);
         let ek_bytes = [42u8; 24];
         let ek = URL_SAFE_NO_PAD.encode(&ek_bytes);
@@ -364,34 +398,62 @@ mod tests {
         let ct = URL_SAFE_NO_PAD.encode(&[0u8; 32]);
         let tag = URL_SAFE_NO_PAD.encode(&[0u8; 16]);
         let jwe = format!("{header}.{ek}.{iv}.{ct}.{tag}");
-        let result = parse_jwe_a128kw(&jwe).unwrap();
+        let result = parse_jwe_aes_kw(AesKwVariant::A128kw, &jwe).unwrap();
         assert_eq!(result, ek_bytes);
     }
 
-    /// `parse_jwe_a128kw` rejects a JWE with a non-A128KW algorithm.
+    /// `parse_jwe_aes_kw` extracts the encrypted_key from a valid A192KW JWE.
     #[test]
-    fn parse_jwe_a128kw_rejects_wrong_alg() {
+    fn parse_jwe_aes_kw_valid_a192kw() {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"A192KW","enc":"A128GCM"}"#);
+        let ek_bytes = [42u8; 24];
+        let ek = URL_SAFE_NO_PAD.encode(&ek_bytes);
+        let iv = URL_SAFE_NO_PAD.encode(&[0u8; 12]);
+        let ct = URL_SAFE_NO_PAD.encode(&[0u8; 32]);
+        let tag = URL_SAFE_NO_PAD.encode(&[0u8; 16]);
+        let jwe = format!("{header}.{ek}.{iv}.{ct}.{tag}");
+        let result = parse_jwe_aes_kw(AesKwVariant::A192kw, &jwe).unwrap();
+        assert_eq!(result, ek_bytes);
+    }
+
+    /// `parse_jwe_aes_kw` extracts the encrypted_key from a valid A256KW JWE.
+    #[test]
+    fn parse_jwe_aes_kw_valid_a256kw() {
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"A256KW","enc":"A128GCM"}"#);
+        let ek_bytes = [42u8; 24];
+        let ek = URL_SAFE_NO_PAD.encode(&ek_bytes);
+        let iv = URL_SAFE_NO_PAD.encode(&[0u8; 12]);
+        let ct = URL_SAFE_NO_PAD.encode(&[0u8; 32]);
+        let tag = URL_SAFE_NO_PAD.encode(&[0u8; 16]);
+        let jwe = format!("{header}.{ek}.{iv}.{ct}.{tag}");
+        let result = parse_jwe_aes_kw(AesKwVariant::A256kw, &jwe).unwrap();
+        assert_eq!(result, ek_bytes);
+    }
+
+    /// `parse_jwe_aes_kw` rejects a JWE with a non-matching algorithm.
+    #[test]
+    fn parse_jwe_aes_kw_rejects_wrong_alg() {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"A256KW","enc":"A256GCM"}"#);
         let ek = URL_SAFE_NO_PAD.encode(&[0u8; 24]);
         let jwe = format!("{header}.{ek}.iv.ct.tag");
-        let err = parse_jwe_a128kw(&jwe).unwrap_err();
+        let err = parse_jwe_aes_kw(AesKwVariant::A128kw, &jwe).unwrap_err();
         assert!(format!("{err:#}").contains("expected A128KW"));
     }
 
-    /// `parse_jwe_a128kw` rejects tokens with wrong segment count.
+    /// `parse_jwe_aes_kw` rejects tokens with wrong segment count.
     #[test]
-    fn parse_jwe_a128kw_rejects_wrong_part_count() {
-        let err = parse_jwe_a128kw("a.b.c").unwrap_err();
+    fn parse_jwe_aes_kw_rejects_wrong_part_count() {
+        let err = parse_jwe_aes_kw(AesKwVariant::A128kw, "a.b.c").unwrap_err();
         assert!(format!("{err:#}").contains("5 dot-separated"));
     }
 
-    /// `parse_jwe_a128kw` rejects encrypted_key shorter than 24 bytes.
+    /// `parse_jwe_aes_kw` rejects encrypted_key shorter than 24 bytes.
     #[test]
-    fn parse_jwe_a128kw_rejects_short_encrypted_key() {
+    fn parse_jwe_aes_kw_rejects_short_encrypted_key() {
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"A128KW","enc":"A128GCM"}"#);
         let ek = URL_SAFE_NO_PAD.encode(&[0u8; 16]); // too short
         let jwe = format!("{header}.{ek}.iv.ct.tag");
-        let err = parse_jwe_a128kw(&jwe).unwrap_err();
+        let err = parse_jwe_aes_kw(AesKwVariant::A128kw, &jwe).unwrap_err();
         assert!(format!("{err:#}").contains("multiple of 8 bytes"));
     }
 }

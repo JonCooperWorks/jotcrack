@@ -11,9 +11,12 @@
 //! - **`MetalBruteForcer`** — HMAC-SHA JWT cracking (HS256/384/512).
 //!   Uses GPU-optimised software SHA implementations.
 //!
-//! - **`MetalAesKwBruteForcer`** — JWE A128KW cracking via software
-//!   AES-128 in a Metal compute shader. Trades per-thread cost
-//!   (software AES vs CPU hardware AESD) for massive GPU parallelism.
+//! - **`MetalAesKwBruteForcer`** — JWE AES Key Wrap cracking (A128KW,
+//!   A192KW, A256KW) via software AES in a Metal compute shader.
+//!   The shader is compiled three times with different `AES_KEY_BYTES`
+//!   defines, producing specialised kernels for each key size.
+//!   Trades per-thread cost (software AES vs CPU hardware AESD)
+//!   for massive GPU parallelism.
 //!
 //! Both implement the `GpuBruteForcer` trait so the runner can use
 //! a single generic dispatch loop.
@@ -27,9 +30,9 @@
 //!   candidates > 16 bytes (SHA-256 hashed to derive the AES key).
 //!
 //! - **`short_keys`** — optimised fast path for short keys. For HMAC,
-//!   keys within the SHA block size. For A128KW, candidates ≤ 16 bytes
-//!   (zero-padded directly, no SHA-256 needed). This is the common
-//!   case for dictionary attacks.
+//!   keys within the SHA block size. For AES-KW, candidates ≤ the AES
+//!   key size (16/24/32 bytes) are zero-padded directly (no SHA-256
+//!   needed). This is the common case for dictionary attacks.
 //!
 //! ## Memory model: `StorageModeShared`
 //!
@@ -64,7 +67,7 @@ use std::time::{Duration, Instant};
 use crate::batch::{DispatchBatchView, WordBatch};
 use crate::stats::{BatchDispatchTimings, format_human_count};
 
-use super::{GpuBruteForcer, GpuCommandHandle, GpuDevice, HmacVariant, default_device};
+use super::{AesKwVariant, GpuBruteForcer, GpuCommandHandle, GpuDevice, HmacVariant, default_device};
 
 // ---------------------------------------------------------------------------
 // Embedded shader sources
@@ -83,7 +86,7 @@ const METAL_SOURCE_HS256: &str = include_str!("hs256_wordlist.metal");
 
 const METAL_SOURCE_HS512: &str = include_str!("hs512_wordlist.metal");
 
-const METAL_SOURCE_A128KW: &str = include_str!("a128kw_wordlist.metal");
+const METAL_SOURCE_AESKW: &str = include_str!("aeskw_wordlist.metal");
 
 // ---------------------------------------------------------------------------
 // Sentinel value for "no match in this batch"
@@ -155,15 +158,17 @@ struct Hs512BruteForceParams {
     candidate_count: u32,
 }
 
-/// Host → GPU parameters for the AES-128 Key Wrap (A128KW) shader.
+/// Host → GPU parameters for the AES Key Wrap shader (A128KW/A192KW/A256KW).
 ///
-/// Matches the Metal struct `A128kwBruteForceParams` in
-/// `a128kw_wordlist.metal`. The encrypted key itself is passed via a
-/// separate buffer (slot 1) rather than inlined here, because its
-/// length varies (24–72 bytes for standard JWE `enc` algorithms).
+/// Matches the Metal struct `AesKwBruteForceParams` in
+/// `aeskw_wordlist.metal`. The AES key size is baked in at shader
+/// compile time via `#define AES_KEY_BYTES`, so it does not appear
+/// here. The encrypted key itself is passed via a separate buffer
+/// (slot 1) rather than inlined here, because its length varies
+/// (24–72 bytes for standard JWE `enc` algorithms).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
-struct A128kwBruteForceParams {
+struct AesKwBruteForceParams {
     /// Byte length of the encrypted_key in buffer(1).
     encrypted_key_len: u32,
     /// Number of 64-bit blocks in the CEK (n ≥ 2).
@@ -714,20 +719,26 @@ impl GpuBruteForcer for MetalBruteForcer {
 // MetalAesKwBruteForcer
 // ---------------------------------------------------------------------------
 
-/// Metal compute backend for AES-128 Key Wrap (A128KW) JWE cracking.
+/// Metal compute backend for AES Key Wrap JWE cracking (A128KW/A192KW/A256KW).
 ///
-/// Implements `GpuBruteForcer` using a software AES-128 Metal compute shader.
-/// The shader uses S-box lookup tables (512 bytes in `constant` address space)
-/// and GF(2^8) arithmetic for InvMixColumns, trading per-thread cost for
-/// massive GPU parallelism.
+/// Implements `GpuBruteForcer` using a software AES Metal compute shader.
+/// The shader source (`aeskw_wordlist.metal`) is compiled with a
+/// `#define AES_KEY_BYTES N` preprocessor directive that specialises it
+/// for the target AES key size (16/24/32 bytes).  This produces fully
+/// optimised kernels — the Metal compiler statically resolves loop bounds,
+/// array sizes, and branch elimination at compile time.
+///
+/// The shader uses S-box lookup tables (512 bytes in `constant` address
+/// space) and GF(2^8) arithmetic for InvMixColumns, trading per-thread
+/// cost for massive GPU parallelism.
 ///
 /// ## Buffer layout
 ///
 /// Uses the same 6-slot binding convention as the HMAC backend:
 ///
-/// | Slot | HMAC purpose          | A128KW purpose                     |
+/// | Slot | HMAC purpose          | AES-KW purpose                     |
 /// |------|-----------------------|------------------------------------|
-/// | 0    | params struct         | `A128kwBruteForceParams`           |
+/// | 0    | params struct         | `AesKwBruteForceParams`            |
 /// | 1    | JWT signing input     | encrypted_key bytes (pre-filled)   |
 /// | 2    | candidate word bytes  | candidate word bytes               |
 /// | 3    | candidate offsets     | candidate offsets                  |
@@ -739,16 +750,18 @@ impl GpuBruteForcer for MetalBruteForcer {
 pub(crate) struct MetalAesKwBruteForcer {
     device: metal::Device,
     queue: metal::CommandQueue,
-    /// Pipeline for candidates of any length (includes SHA-256 for > 16 bytes).
+    /// Pipeline for candidates of any length (includes SHA-256 for long keys).
     pipeline_mixed: metal::ComputePipelineState,
-    /// Pipeline optimised for candidates ≤ 16 bytes (zero-pad, no SHA-256).
+    /// Pipeline optimised for candidates ≤ AES key size (zero-pad, no SHA-256).
     pipeline_short_keys: metal::ComputePipelineState,
-    /// Persistent buffer holding `A128kwBruteForceParams`.
+    /// Persistent buffer holding `AesKwBruteForceParams`.
     params_buf: metal::Buffer,
     /// Persistent buffer holding the JWE encrypted_key bytes (slot 1).
     enc_key_buf: metal::Buffer,
     /// Persistent 4-byte buffer for the GPU to write the match result.
     result_buf: metal::Buffer,
+    /// Which AES Key Wrap variant (determines short_key_threshold).
+    variant: AesKwVariant,
     /// Byte length of the encrypted_key (stored for params writes).
     encrypted_key_len: u32,
     /// Number of 64-bit CEK blocks: `encrypted_key.len() / 8 - 1`.
@@ -758,35 +771,54 @@ pub(crate) struct MetalAesKwBruteForcer {
 }
 
 impl MetalAesKwBruteForcer {
-    /// Compile the A128KW Metal shader, create pipelines, and allocate
-    /// persistent buffers.
+    /// Compile the AES Key Wrap Metal shader for the given variant, create
+    /// pipelines, and allocate persistent buffers.
+    ///
+    /// The shader source is prepended with `#define AES_KEY_BYTES N` to
+    /// specialise it for the target AES key size.  Each variant gets its
+    /// own compiled Metal library — there is no runtime branching in the
+    /// shader.
     ///
     /// `encrypted_key` is the raw ciphertext from the JWE token's
     /// encrypted_key field (base64url-decoded). `n` is the number of
     /// 64-bit CEK blocks (`encrypted_key.len() / 8 - 1`).
-    pub(crate) fn new(encrypted_key: &[u8], n: usize) -> anyhow::Result<Self> {
+    pub(crate) fn new(
+        variant: AesKwVariant,
+        encrypted_key: &[u8],
+        n: usize,
+    ) -> anyhow::Result<Self> {
         let device = default_device()?;
         let compile_options = CompileOptions::new();
 
+        // Prepend the AES_KEY_BYTES define to specialise the shader.
+        // This is simpler and more portable than using Metal's
+        // CompileOptions preprocessor API.
+        let specialised_source = format!(
+            "#define AES_KEY_BYTES {}\n{}",
+            variant.key_bytes(),
+            METAL_SOURCE_AESKW
+        );
+
+        let label = variant.label();
         let library = device
-            .new_library_with_source(METAL_SOURCE_A128KW, &compile_options)
-            .map_err(|e| anyhow!("failed to compile A128KW Metal kernel: {e}"))?;
+            .new_library_with_source(&specialised_source, &compile_options)
+            .map_err(|e| anyhow!("failed to compile {label} Metal kernel: {e}"))?;
 
         let mixed_function = library
-            .get_function("a128kw_wordlist", None)
-            .map_err(|e| anyhow!("failed to get Metal function a128kw_wordlist: {e}"))?;
+            .get_function("aeskw_wordlist", None)
+            .map_err(|e| anyhow!("failed to get Metal function aeskw_wordlist: {e}"))?;
         let short_function = library
-            .get_function("a128kw_wordlist_short_keys", None)
+            .get_function("aeskw_wordlist_short_keys", None)
             .map_err(|e| {
-                anyhow!("failed to get Metal function a128kw_wordlist_short_keys: {e}")
+                anyhow!("failed to get Metal function aeskw_wordlist_short_keys: {e}")
             })?;
 
         let pipeline_mixed = device
             .new_compute_pipeline_state_with_function(&mixed_function)
-            .map_err(|e| anyhow!("failed to create A128KW mixed compute pipeline: {e}"))?;
+            .map_err(|e| anyhow!("failed to create {label} mixed compute pipeline: {e}"))?;
         let pipeline_short_keys = device
             .new_compute_pipeline_state_with_function(&short_function)
-            .map_err(|e| anyhow!("failed to create A128KW short-key compute pipeline: {e}"))?;
+            .map_err(|e| anyhow!("failed to create {label} short-key compute pipeline: {e}"))?;
 
         let queue = device.new_command_queue();
 
@@ -801,7 +833,7 @@ impl MetalAesKwBruteForcer {
         let options = metal::MTLResourceOptions::StorageModeShared;
 
         let params_buf = device.new_buffer(
-            std::mem::size_of::<A128kwBruteForceParams>() as u64,
+            std::mem::size_of::<AesKwBruteForceParams>() as u64,
             options,
         );
 
@@ -821,6 +853,7 @@ impl MetalAesKwBruteForcer {
             params_buf,
             enc_key_buf,
             result_buf,
+            variant,
             encrypted_key_len,
             n_blocks,
             threadgroup_width,
@@ -831,10 +864,12 @@ impl MetalAesKwBruteForcer {
     // Pipeline selection
     // -----------------------------------------------------------------------
 
-    /// The AES-128 key size threshold. Candidates ≤ 16 bytes are zero-padded
-    /// directly; longer candidates go through SHA-256 → truncate(16).
+    /// The AES key size threshold for this variant. Candidates ≤ this size
+    /// are zero-padded directly; longer candidates go through SHA-256 →
+    /// truncate to key_bytes. Returns 16 for A128KW, 24 for A192KW,
+    /// 32 for A256KW.
     fn short_key_threshold(&self) -> u16 {
-        16
+        self.variant.key_bytes() as u16
     }
 
     /// Choose the compute pipeline based on the batch's longest candidate.
@@ -855,7 +890,7 @@ impl MetalAesKwBruteForcer {
 
     /// Write the A128KW params struct into the GPU buffer.
     fn write_params(&self, candidate_count: u32) {
-        let params = A128kwBruteForceParams {
+        let params = AesKwBruteForceParams {
             encrypted_key_len: self.encrypted_key_len,
             n_blocks: self.n_blocks,
             candidate_count,
@@ -961,7 +996,7 @@ impl MetalAesKwBruteForcer {
 // The `target_signature` parameter in `encode_and_commit` and
 // `autotune_threadgroup_width` is **ignored** by this implementation.
 // For HMAC backends, `target_signature` carries the JWT signature bytes.
-// For A128KW, the encrypted_key is pre-loaded into `enc_key_buf` at
+// For AES-KW, the encrypted_key is pre-loaded into `enc_key_buf` at
 // construction time and never changes. The parameter is accepted (but
 // unused) to satisfy the trait contract, enabling the runner to use a
 // single generic `run_gpu_crack<B: GpuBruteForcer>` dispatch loop.
@@ -1105,9 +1140,9 @@ mod tests {
     }
 
     #[test]
-    fn a128kw_params_round_trip_size_matches() {
-        let params = A128kwBruteForceParams::default();
+    fn aeskw_params_round_trip_size_matches() {
+        let params = AesKwBruteForceParams::default();
         let bytes = bytes_of(&params);
-        assert_eq!(bytes.len(), std::mem::size_of::<A128kwBruteForceParams>());
+        assert_eq!(bytes.len(), std::mem::size_of::<AesKwBruteForceParams>());
     }
 }
