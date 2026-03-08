@@ -268,6 +268,7 @@ pub(crate) fn buffer_host_ptr(buf: &CudaBuffer) -> *mut u8 {
 }
 
 /// Create a CUDA context on GPU device 0 (the default).
+#[allow(dead_code)] // Used via gpu::default_device() on Linux
 pub(crate) fn default_device() -> anyhow::Result<CudaDeviceHandle> {
     let ctx =
         CudaContext::new(0).map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
@@ -335,6 +336,7 @@ fn compile_and_load(
 /// the biggest CPU→GPU transfer bottleneck (~32MB word_bytes per batch).
 pub(crate) struct CudaBruteForcer {
     variant: HmacVariant,
+    #[allow(dead_code)] // Kept alive to prevent CUDA context from being dropped
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     _module: Arc<cudarc::driver::CudaModule>,
@@ -818,6 +820,7 @@ impl GpuBruteForcer for CudaBruteForcer {
 pub(crate) struct CudaAesKwBruteForcer {
     #[allow(dead_code)]
     variant: AesKwVariant,
+    #[allow(dead_code)] // Kept alive to prevent CUDA context from being dropped
     ctx: Arc<CudaContext>,
     stream: Arc<CudaStream>,
     _module: Arc<cudarc::driver::CudaModule>,

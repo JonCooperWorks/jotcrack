@@ -517,6 +517,11 @@ pub(crate) fn pack_batch_plan_into_batch(
         );
     }
 
+    // On Linux (zero-copy), push_segment_bulk skips per-segment word_bytes_len
+    // and max_word_len computation. Set them from the plan's pre-computed values.
+    #[cfg(target_os = "linux")]
+    batch.set_plan_metadata(plan.word_bytes_len, plan.max_word_len);
+
     if batch.candidate_count() != plan.candidate_count {
         bail!(
             "batch plan candidate count mismatch: packed {} planned {}",

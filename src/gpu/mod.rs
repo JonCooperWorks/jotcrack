@@ -246,6 +246,7 @@ pub(crate) fn buffer_host_ptr(buf: &GpuBuffer) -> *mut u8 {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(dead_code)] // Available for tests and future direct usage
 pub(crate) fn default_device() -> anyhow::Result<GpuDevice> {
     cuda::default_device()
 }

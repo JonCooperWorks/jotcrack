@@ -361,6 +361,16 @@ impl WordBatch {
     // Allocate fixed-capacity shared buffers sized to the batch caps so parser
     // writes can go straight into memory later bound to the kernel.
     pub(crate) fn new(device: &GpuDevice, candidate_index_base: u64) -> Self {
+        // On Linux (zero-copy mmap dispatch), the GPU reads candidate bytes
+        // from the pre-uploaded mmap — word_bytes_buf is never written to
+        // by the production path (push_segment_bulk). Allocate just 1 byte
+        // to save ~44 MiB per batch (440 MiB total at pipeline_depth=10).
+        //
+        // In test mode, the sequential reader uses push_candidate which
+        // writes directly into word_bytes_buf, so we need the full allocation.
+        #[cfg(all(target_os = "linux", not(test)))]
+        let word_bytes_buf = alloc_shared_buffer(device, 1);
+        #[cfg(not(all(target_os = "linux", not(test))))]
         let word_bytes_buf = alloc_shared_buffer(device, WORD_BYTES_ALLOC_SIZE);
         let word_offsets_buf =
             alloc_shared_buffer(device, MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u32>());
@@ -551,6 +561,17 @@ impl WordBatch {
         Ok(())
     }
 
+    /// Set word_bytes_len and max_word_len from pre-computed BatchPlan values.
+    ///
+    /// On Linux (zero-copy), `push_segment_bulk` skips per-segment O(count)
+    /// scans for these values since the BatchPlan already computed them during
+    /// planning. This method is called once after all segments are packed.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_plan_metadata(&mut self, word_bytes_len: usize, max_word_len: u16) {
+        self.word_bytes_len = word_bytes_len;
+        self.max_word_len = max_word_len;
+    }
+
     /// Reconstruct a candidate as a byte slice from the packed storage.
     ///
     /// This is the inverse of `push_candidate`: given a batch-local index,
@@ -588,6 +609,7 @@ impl WordBatch {
 
     // Human-readable reconstruction for final reporting. We keep this lossy to
     // avoid crashing on non-UTF-8 wordlist entries while still printing a key.
+    #[allow(dead_code)] // Used on macOS
     pub(crate) fn word_string_lossy(&self, local_index: usize) -> Option<String> {
         Some(String::from_utf8_lossy(self.word(local_index)?).into_owned())
     }
@@ -760,50 +782,34 @@ impl WordBatch {
             }
         }
 
-        // Track word_bytes_len for planner validation.
+        self.candidate_count += count;
+
+        // On macOS, track word_bytes_len and max_word_len per-segment.
+        // On Linux, these are set from the BatchPlan after all segments
+        // are packed (via set_plan_metadata), skipping per-segment O(count)
+        // scans that are redundant with the planner's pre-computed values.
         #[cfg(not(target_os = "linux"))]
-        let new_wb_len = {
+        {
             // Account for the bulk-copied bytes (including inter-candidate gaps).
             let seg_first_offset = chunk_offsets_rel[line_start] as usize;
             let last_idx = line_end - 1;
             let seg_end_offset = chunk_offsets_rel[last_idx] as usize
                 + chunk_lengths[last_idx] as usize;
-            wb_cursor + (seg_end_offset - seg_first_offset)
-        };
+            self.word_bytes_len = wb_cursor + (seg_end_offset - seg_first_offset);
 
-        #[cfg(target_os = "linux")]
-        let new_wb_len = {
-            // On Linux (zero-copy), track pure candidate byte count.
-            // The planner computes word_bytes_len the same way.
-            let total_candidate_bytes: usize = chunk_lengths[line_start..line_end]
+            let seg_max = chunk_lengths[line_start..line_end]
                 .iter()
-                .map(|&l| l as usize)
-                .sum();
-            self.word_bytes_len + total_candidate_bytes
-        };
+                .copied()
+                .max()
+                .unwrap_or(0);
+            self.max_word_len = self.max_word_len.max(seg_max);
 
-        // Update max_word_len by scanning the segment's lengths.
-        let seg_max = chunk_lengths[line_start..line_end]
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        self.max_word_len = self.max_word_len.max(seg_max);
-        self.candidate_count += count;
-        self.word_bytes_len = new_wb_len;
-        // Post-loop byte budget check.
-        #[cfg(not(target_os = "linux"))]
-        debug_assert!(
-            self.word_bytes_len <= WORD_BYTES_ALLOC_SIZE,
-            "push_segment_bulk: word_bytes_len {} exceeds alloc size {}",
-            self.word_bytes_len, WORD_BYTES_ALLOC_SIZE
-        );
-        #[cfg(target_os = "linux")]
-        debug_assert!(
-            self.word_bytes_len <= MAX_WORD_BYTES_PER_BATCH + MAX_CANDIDATES_PER_BATCH * 2,
-            "push_segment_bulk: word_bytes_len {} exceeds max",
-            self.word_bytes_len
-        );
+            debug_assert!(
+                self.word_bytes_len <= WORD_BYTES_ALLOC_SIZE,
+                "push_segment_bulk: word_bytes_len {} exceeds alloc size {}",
+                self.word_bytes_len, WORD_BYTES_ALLOC_SIZE
+            );
+        }
     }
 
     /// Create a zero-copy view of this batch for GPU dispatch.
@@ -840,6 +846,7 @@ impl WordBatch {
     /// Note: the Metal buffers still contain ALL candidates — we just tell the
     /// GPU to only process the first `sample_count`. The offset/length tables
     /// are indexed 0..sample_count, so extra data past the end is never read.
+    #[allow(dead_code)] // Used on macOS for autotune
     pub(crate) fn prefix_dispatch_view(
         &self,
         sample_count: usize,
@@ -885,9 +892,8 @@ impl WordBatch {
 /// (all of which are `Copy`), the whole view is `Copy`. This means it can be
 /// passed around freely without any allocation or reference counting.
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Fields used on macOS (Metal) and CUDA paths
 pub(crate) struct DispatchBatchView<'a> {
-    // Minimal metadata + buffer references required to dispatch a full batch or
-    // sampled prefix batch without owning the storage.
     pub(crate) candidate_count: usize,
     pub(crate) max_word_len: u16,
     pub(crate) word_bytes_buf: &'a GpuBuffer,

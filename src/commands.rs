@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(args.threads_per_group, None);
         assert_eq!(args.parser_threads, None);
         assert_eq!(args.pipeline_depth, None);
-        assert_eq!(args.packer_threads, None);
+
         assert!(!args.autotune);
     }
 
@@ -169,7 +169,7 @@ mod tests {
         assert_eq!(args.threads_per_group, Some(512));
         assert_eq!(args.parser_threads, Some(3));
         assert_eq!(args.pipeline_depth, None);
-        assert_eq!(args.packer_threads, None);
+
         assert!(args.autotune);
     }
 
@@ -187,22 +187,6 @@ mod tests {
             panic!("expected Hs256wordlist");
         };
         assert_eq!(args.pipeline_depth, Some(10));
-    }
-
-    #[test]
-    fn clap_cli_accepts_packer_threads() {
-        let cli = Cli::try_parse_from([
-            "jotcrack",
-            "hs256wordlist",
-            "abc.def.ghi",
-            "--packer-threads",
-            "3",
-        ])
-        .unwrap();
-        let Commands::Hs256wordlist(args) = cli.command else {
-            panic!("expected Hs256wordlist");
-        };
-        assert_eq!(args.packer_threads, Some(3));
     }
 
     #[test]
@@ -242,21 +226,8 @@ mod tests {
         assert_eq!(args.threads_per_group, None);
         assert_eq!(args.parser_threads, None);
         assert_eq!(args.pipeline_depth, None);
-        assert_eq!(args.packer_threads, None);
-        assert!(!args.autotune);
-    }
 
-    #[test]
-    fn clap_cli_rejects_zero_packer_threads() {
-        let err = Cli::try_parse_from([
-            "jotcrack",
-            "hs256wordlist",
-            "abc.def.ghi",
-            "--packer-threads",
-            "0",
-        ])
-        .unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(!args.autotune);
     }
 
     /// The jwe-a128kw subcommand parses correctly and routes to JWE mode.

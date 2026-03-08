@@ -79,7 +79,6 @@ pub(crate) struct RunTimings {
     pub(crate) total_batch_candidates: u64,
     pub(crate) total_batch_word_bytes: u64,
     pub(crate) pipeline_depth: usize,
-    pub(crate) packer_threads: usize,
     pub(crate) parser_threads: usize,
     pub(crate) parser_chunk_bytes: usize,
     pub(crate) parser_chunks: u64,
@@ -313,7 +312,6 @@ pub(crate) fn print_final_stats(
         format_human_count(avg_word_bytes_per_batch)
     );
     eprintln!("  pipeline_depth: {}", timings.pipeline_depth);
-    eprintln!("  packer_threads: {}", timings.packer_threads);
     eprintln!("  parser_threads: {}", timings.parser_threads);
     eprintln!(
         "  parser_chunk_bytes: {} bytes",

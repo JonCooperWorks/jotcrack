@@ -25,9 +25,6 @@ pub struct WordlistArgs {
     /// Max number of in-flight batches queued between parser and GPU consumer.
     #[arg(long, value_parser = parse_positive_usize)]
     pub pipeline_depth: Option<usize>,
-    /// Number of host packer workers that materialize planned batches.
-    #[arg(long, value_parser = parse_positive_usize)]
-    pub packer_threads: Option<usize>,
     /// Benchmark several threadgroup widths on the first batch before steady-state dispatch.
     #[arg(long)]
     pub autotune: bool,

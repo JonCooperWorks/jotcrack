@@ -146,14 +146,6 @@ fn run_gpu_crack<B: GpuBruteForcer>(
 ) -> anyhow::Result<bool> {
     let parser_config = args.parser_config();
     let pipeline_depth = args.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH);
-    let auto_packer_threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(2);
-    let packer_threads = args
-        .packer_threads
-        .unwrap_or(auto_packer_threads)
-        .max(1)
-        .min(pipeline_depth.max(1));
     if let Some(tpg) = args.threads_per_group {
         gpu.set_threadgroup_width(tpg)?;
     }
@@ -172,8 +164,8 @@ fn run_gpu_crack<B: GpuBruteForcer>(
         format_human_count(approx_prefetch_bytes as f64),
     );
     eprintln!(
-        "HOST parser_threads={} packer_threads={}",
-        parser_config.parser_threads, packer_threads
+        "HOST parser_threads={}",
+        parser_config.parser_threads
     );
 
     let mut producer = WordlistProducer::spawn(
@@ -181,7 +173,6 @@ fn run_gpu_crack<B: GpuBruteForcer>(
         gpu.device().clone(),
         parser_config,
         pipeline_depth,
-        packer_threads,
     );
     let run_result = (|| -> anyhow::Result<bool> {
         let started_at = Instant::now();
@@ -189,7 +180,6 @@ fn run_gpu_crack<B: GpuBruteForcer>(
         let mut autotune_done = !args.autotune;
         let mut timings = RunTimings {
             pipeline_depth,
-            packer_threads,
             parser_threads: parser_config.parser_threads,
             parser_chunk_bytes: parser_config.chunk_bytes,
             ..RunTimings::default()
@@ -401,7 +391,6 @@ mod tests {
             threads_per_group: None,
             parser_threads: Some(1),
             pipeline_depth: Some(2),
-            packer_threads: Some(1),
             autotune: false,
         }
     }
