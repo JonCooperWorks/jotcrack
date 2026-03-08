@@ -686,9 +686,17 @@ impl ParallelMmapWordlistBatchReader {
 
     // Submit more jobs until we hit the in-flight limit or exhaust the chunk
     // plan. The bounded channel keeps memory growth predictable.
+    //
+    // In addition to the in-flight cap, we ensure that all outstanding chunk
+    // IDs (in-flight + received-but-not-yet-consumed) fit within the pending
+    // ring capacity. Without this, out-of-order results can wrap around and
+    // collide with unconsumed ring slots, causing either silent mis-ordering
+    // or a "duplicate parsed chunk id" bail.
     fn pump_jobs(&mut self) -> anyhow::Result<()> {
         while self.in_flight_jobs < self.max_in_flight_jobs
             && self.next_job_to_send < self.chunks.len()
+            && (self.next_job_to_send as u64).saturating_sub(self.next_chunk_to_emit)
+                < self.pending_ring_capacity as u64
         {
             let job = self.chunks[self.next_job_to_send];
             let tx = self
@@ -742,6 +750,11 @@ impl ParallelMmapWordlistBatchReader {
         }
         let ring_idx = (self.next_chunk_to_emit as usize) % self.pending_ring_capacity;
         if let Some(chunk) = self.pending_ring[ring_idx].take() {
+            debug_assert_eq!(
+                chunk.chunk_id, self.next_chunk_to_emit,
+                "ring slot contained chunk {} but expected chunk {}",
+                chunk.chunk_id, self.next_chunk_to_emit
+            );
             self.active_chunk = Some(chunk);
             self.active_chunk_line_cursor = 0;
             return true;
