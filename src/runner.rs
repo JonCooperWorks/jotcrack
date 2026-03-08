@@ -16,6 +16,9 @@ use super::stats::{
     rate_per_second,
 };
 
+#[cfg(target_os = "linux")]
+use memmap2::Mmap;
+
 struct InFlightBatch {
     cmd_buf: GpuCommandHandle,
     batch: super::batch::WordBatch,
@@ -28,6 +31,10 @@ struct InFlightBatch {
 /// `WordBatch` directly rather than an `InFlightBatch` so it works
 /// regardless of whether the batch came from GPU dispatch or CPU
 /// processing.
+///
+/// On Linux (zero-copy path), `mmap_source` provides the wordlist bytes
+/// for candidate reconstruction. On macOS, it is `None` and `word_string_lossy`
+/// reads from the batch's local word_bytes buffer.
 fn handle_match(
     variant: CrackVariant,
     batch: &super::batch::WordBatch,
@@ -35,6 +42,7 @@ fn handle_match(
     candidates_tested: u64,
     started_at: Instant,
     timings: &RunTimings,
+    #[cfg(target_os = "linux")] mmap_source: &[u8],
 ) -> anyhow::Result<bool> {
     let elapsed = started_at.elapsed();
     let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
@@ -42,6 +50,11 @@ fn handle_match(
     print_final_stats(candidates_tested, elapsed, rate_end_to_end, rate_compute_only, timings);
     let local_index = usize::try_from(local_match_index)
         .context("returned invalid result index")?;
+    #[cfg(target_os = "linux")]
+    let secret = batch
+        .word_string_lossy_from_source(local_index, mmap_source)
+        .ok_or_else(|| anyhow!("returned invalid local candidate index"))?;
+    #[cfg(not(target_os = "linux"))]
     let secret = batch
         .word_string_lossy(local_index)
         .ok_or_else(|| anyhow!("returned invalid local candidate index"))?;
@@ -66,13 +79,29 @@ pub(crate) fn run_wordlist_crack(
     variant: CrackVariant,
     args: WordlistArgs,
 ) -> anyhow::Result<bool> {
+    // On Linux (CUDA), open the mmap for two purposes:
+    //   1. Upload the entire wordlist to GPU VRAM once (zero-copy dispatch)
+    //   2. Reconstruct the matching candidate after GPU finds a hit
+    // This mmap shares the same OS page cache pages as the producer's mmap,
+    // so it costs virtually no extra physical memory.
+    #[cfg(target_os = "linux")]
+    let mmap = {
+        let file = std::fs::File::open(&args.wordlist)
+            .with_context(|| format!("failed to open wordlist: {:?}", args.wordlist))?;
+        unsafe { Mmap::map(&file) }
+            .with_context(|| format!("failed to mmap wordlist: {:?}", args.wordlist))?
+    };
+
     match variant {
         CrackVariant::Hmac(hv) => {
             let (signing_input, target_signature) = parse_jwt(hv, &args.jwt)?;
             #[cfg(target_os = "macos")]
             let gpu = MetalBruteForcer::new(hv, &signing_input)?;
             #[cfg(target_os = "linux")]
-            let gpu = CudaBruteForcer::new(hv, &signing_input)?;
+            let gpu = CudaBruteForcer::new(hv, &signing_input, &mmap)?;
+            #[cfg(target_os = "linux")]
+            return run_gpu_crack(variant, gpu, &target_signature, args, &mmap);
+            #[cfg(not(target_os = "linux"))]
             run_gpu_crack(variant, gpu, &target_signature, args)
         }
         CrackVariant::JweAesKw(akv) => {
@@ -81,7 +110,10 @@ pub(crate) fn run_wordlist_crack(
             #[cfg(target_os = "macos")]
             let gpu = MetalAesKwBruteForcer::new(akv, &encrypted_key, n)?;
             #[cfg(target_os = "linux")]
-            let gpu = CudaAesKwBruteForcer::new(akv, &encrypted_key, n)?;
+            let gpu = CudaAesKwBruteForcer::new(akv, &encrypted_key, n, &mmap)?;
+            #[cfg(target_os = "linux")]
+            return run_gpu_crack(variant, gpu, &encrypted_key, args, &mmap);
+            #[cfg(not(target_os = "linux"))]
             run_gpu_crack(variant, gpu, &encrypted_key, args)
         }
     }
@@ -110,12 +142,16 @@ fn run_gpu_crack<B: GpuBruteForcer>(
     mut gpu: B,
     target_data: &[u8],
     args: WordlistArgs,
+    #[cfg(target_os = "linux")] mmap_source: &[u8],
 ) -> anyhow::Result<bool> {
     let parser_config = args.parser_config();
     let pipeline_depth = args.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH);
+    let auto_packer_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(2);
     let packer_threads = args
         .packer_threads
-        .unwrap_or(2)
+        .unwrap_or(auto_packer_threads)
         .max(1)
         .min(pipeline_depth.max(1));
     if let Some(tpg) = args.threads_per_group {
@@ -177,7 +213,11 @@ fn run_gpu_crack<B: GpuBruteForcer>(
                     candidates_tested.saturating_add(flight.candidate_count);
 
                 if let Some(local_match_index) = maybe_match {
-                    return handle_match(variant, &flight.batch, local_match_index, candidates_tested, started_at, &timings);
+                    return handle_match(
+                        variant, &flight.batch, local_match_index,
+                        candidates_tested, started_at, &timings,
+                        #[cfg(target_os = "linux")] mmap_source,
+                    );
                 }
 
                 report_rate_if_due(
@@ -249,7 +289,11 @@ fn run_gpu_crack<B: GpuBruteForcer>(
                 candidates_tested.saturating_add(flight.candidate_count);
 
             if let Some(local_match_index) = maybe_match {
-                return handle_match(variant, &flight.batch, local_match_index, candidates_tested, started_at, &timings);
+                return handle_match(
+                    variant, &flight.batch, local_match_index,
+                    candidates_tested, started_at, &timings,
+                    #[cfg(target_os = "linux")] mmap_source,
+                );
             }
 
             producer.recycle(flight.batch);

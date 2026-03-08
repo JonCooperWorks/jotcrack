@@ -57,7 +57,7 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::{self, CompileOptions};
 
-use crate::batch::{MAX_CANDIDATES_PER_BATCH, MAX_WORD_BYTES_PER_BATCH, WordBatch};
+use crate::batch::{MAX_CANDIDATES_PER_BATCH, WordBatch};
 use crate::stats::{BatchDispatchTimings, format_human_count};
 
 use super::{AesKwVariant, GpuBruteForcer, HmacVariant};
@@ -140,17 +140,66 @@ unsafe impl DeviceRepr for AesKwBruteForceParams {}
 // Platform types — used by batch.rs, producer.rs via type aliases
 // ---------------------------------------------------------------------------
 
-/// Host-side staging buffer for GPU batch data.
+/// Host-side staging buffer for GPU batch data, backed by CUDA
+/// **pinned (page-locked) memory**.
 ///
 /// On CUDA (discrete GPU), there is no unified memory like Metal's
 /// `StorageModeShared`. Instead, batch data lives in host memory
-/// (this `Vec<u8>`) and is explicitly copied to device memory before
-/// each kernel launch. The `Vec` is allocated once at batch creation
-/// and reused for the lifetime of the batch (the producer pipeline
-/// recycles `WordBatch` objects).
-#[derive(Debug)]
+/// and is explicitly copied to device memory before each kernel launch.
+///
+/// ## Why pinned memory?
+///
+/// Regular `Vec<u8>` memory is *pageable* — the OS can swap pages out.
+/// When `cuMemcpyHtoD` copies pageable memory, the CUDA driver must
+/// first copy it to an internal pinned staging buffer, then DMA that
+/// to the GPU. With pinned memory, the DMA engine reads directly from
+/// the host buffer, eliminating one copy and roughly doubling PCIe
+/// throughput (measured ~2x improvement on discrete NVIDIA GPUs).
+///
+/// ## Safety
+///
+/// The buffer is allocated via `cuMemHostAlloc` and freed via
+/// `cuMemFreeHost` on drop. The raw pointer is valid for the
+/// lifetime of the struct. `Send` and `Sync` are safe because
+/// the memory is owned exclusively and never aliased.
 pub(crate) struct CudaBuffer {
-    pub(crate) data: Vec<u8>,
+    ptr: *mut u8,
+    pub(crate) len: usize,
+}
+
+// SAFETY: CudaBuffer owns its pinned memory exclusively.
+// No aliasing occurs — batch.rs writes through buffer_host_ptr()
+// and the CUDA driver reads during memcpy_htod, but these are
+// sequenced by the pipeline (pack completes before dispatch).
+unsafe impl Send for CudaBuffer {}
+unsafe impl Sync for CudaBuffer {}
+
+impl std::fmt::Debug for CudaBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CudaBuffer")
+            .field("len", &self.len)
+            .field("pinned", &true)
+            .finish()
+    }
+}
+
+impl Drop for CudaBuffer {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: ptr was allocated by cuMemHostAlloc in alloc_shared_buffer.
+            unsafe {
+                let _ = cudarc::driver::result::free_host(self.ptr.cast());
+            }
+        }
+    }
+}
+
+impl CudaBuffer {
+    /// Return a slice view of the pinned buffer contents.
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr is valid for len bytes, allocated by cuMemHostAlloc.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
 }
 
 /// Wrapper around a CUDA context, serving as the device handle.
@@ -175,25 +224,47 @@ pub(crate) struct CudaCommandHandle;
 // via the platform-gated wrappers in gpu/mod.rs
 // ---------------------------------------------------------------------------
 
-/// Allocate a host-side staging buffer of the given byte size.
+/// Allocate a pinned (page-locked) host-side staging buffer.
 ///
-/// The `_device` parameter is unused on CUDA (host memory does not
-/// need a device handle), but the signature must match the Metal
-/// version where `device.new_buffer()` is called.
-pub(crate) fn alloc_shared_buffer(_device: &CudaDeviceHandle, size: usize) -> CudaBuffer {
+/// Uses `cuMemHostAlloc` for DMA-friendly memory that transfers
+/// to the GPU at full PCIe bandwidth (no intermediate staging copy).
+///
+/// The `device` parameter provides the CUDA context needed for
+/// pinned allocation. `cuMemHostAlloc` requires an active context
+/// on the calling thread, so we push it before allocating.
+pub(crate) fn alloc_shared_buffer(device: &CudaDeviceHandle, size: usize) -> CudaBuffer {
+    if size == 0 {
+        return CudaBuffer {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+        };
+    }
+    // Push the CUDA context onto the calling thread's context stack.
+    // This is needed because packer worker threads (spawned by the
+    // producer pipeline) don't inherit the main thread's context.
+    // SAFETY: cu_ctx() returns the valid context from CudaContext::new().
+    unsafe {
+        let _ = cudarc::driver::result::ctx::set_current(device.0.cu_ctx());
+    }
+    // SAFETY: We request `size` bytes of pinned host memory.
+    // Flag 0 = default (portable, not mapped to device address space).
+    let ptr = unsafe { cudarc::driver::result::malloc_host(size, 0) }
+        .expect("cuMemHostAlloc failed — out of pinned memory?");
+    // Zero-initialize to match Vec<u8> behaviour.
+    unsafe { std::ptr::write_bytes(ptr.cast::<u8>(), 0, size) };
     CudaBuffer {
-        data: vec![0u8; size],
+        ptr: ptr.cast::<u8>(),
+        len: size,
     }
 }
 
-/// Return a raw mutable pointer to the buffer's host memory.
+/// Return a raw mutable pointer to the buffer's pinned host memory.
 ///
 /// The caller (batch.rs) writes candidate data directly through this
 /// pointer. The pointer remains valid as long as the `CudaBuffer` is
-/// not dropped or reallocated — guaranteed because `WordBatch` owns
-/// the buffer and never resizes it.
+/// not dropped — guaranteed because `WordBatch` owns the buffer.
 pub(crate) fn buffer_host_ptr(buf: &CudaBuffer) -> *mut u8 {
-    buf.data.as_ptr() as *mut u8
+    buf.ptr
 }
 
 /// Create a CUDA context on GPU device 0 (the default).
@@ -254,8 +325,14 @@ fn compile_and_load(
 /// CUDA compute backend for HMAC-SHA brute-force cracking.
 ///
 /// Owns the CUDA context, stream, compiled kernels, and pre-allocated
-/// device buffers. Per-batch candidate data is copied from host
-/// `CudaBuffer` objects to device before each kernel launch.
+/// device buffers.
+///
+/// ## Zero-copy mmap dispatch
+///
+/// The entire wordlist mmap is uploaded to GPU VRAM once at construction.
+/// Per-batch dispatch only copies the small metadata arrays (offsets and
+/// lengths) — the candidate bytes are already on-device. This eliminates
+/// the biggest CPU→GPU transfer bottleneck (~32MB word_bytes per batch).
 pub(crate) struct CudaBruteForcer {
     variant: HmacVariant,
     ctx: Arc<CudaContext>,
@@ -266,7 +343,10 @@ pub(crate) struct CudaBruteForcer {
     // Pre-allocated device buffers (UnsafeCell for interior mutability).
     d_params: UnsafeCell<CudaSlice<u8>>,
     d_message: CudaSlice<u8>,
-    d_word_bytes: UnsafeCell<CudaSlice<u8>>,
+    /// Entire wordlist mmap uploaded to GPU VRAM once at startup.
+    /// Kernel reads candidate bytes directly from this buffer using
+    /// absolute mmap offsets stored in the per-batch offsets array.
+    d_mmap: CudaSlice<u8>,
     d_word_offsets: UnsafeCell<CudaSlice<u8>>,
     d_word_lengths: UnsafeCell<CudaSlice<u8>>,
     d_result: UnsafeCell<CudaSlice<u32>>,
@@ -278,9 +358,12 @@ pub(crate) struct CudaBruteForcer {
 }
 
 impl CudaBruteForcer {
-    /// Compile the CUDA kernel, load functions, and allocate device
-    /// buffers for the given HMAC variant and JWT signing input.
-    pub(crate) fn new(variant: HmacVariant, signing_input: &[u8]) -> anyhow::Result<Self> {
+    /// Compile the CUDA kernel, load functions, upload mmap to VRAM,
+    /// and allocate device buffers for the given HMAC variant.
+    ///
+    /// `mmap_bytes` is the entire wordlist file content. It is uploaded
+    /// to GPU VRAM once here; per-batch dispatch only copies metadata.
+    pub(crate) fn new(variant: HmacVariant, signing_input: &[u8], mmap_bytes: &[u8]) -> anyhow::Result<Self> {
         let ctx = CudaContext::new(0)
             .map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
         let stream = ctx
@@ -347,9 +430,22 @@ impl CudaBruteForcer {
                 .map_err(|e| anyhow!("failed to copy message to device: {e}"))?
         };
 
-        let d_word_bytes = stream
-            .alloc_zeros::<u8>(MAX_WORD_BYTES_PER_BATCH)
-            .map_err(|e| anyhow!("failed to alloc word_bytes buffer: {e}"))?;
+        // Upload entire mmap to GPU VRAM once. The kernel reads candidate
+        // bytes directly from this buffer using absolute mmap offsets.
+        let mmap_len = mmap_bytes.len();
+        let d_mmap = if mmap_len > 0 {
+            eprintln!(
+                "CUDA: uploading {} byte mmap to GPU VRAM",
+                format_human_count(mmap_len as f64)
+            );
+            stream
+                .clone_htod(mmap_bytes)
+                .map_err(|e| anyhow!("failed to upload mmap to device ({mmap_len} bytes): {e}"))?
+        } else {
+            stream
+                .alloc_zeros::<u8>(1)
+                .map_err(|e| anyhow!("failed to alloc placeholder mmap buffer: {e}"))?
+        };
         let d_word_offsets = stream
             .alloc_zeros::<u8>(MAX_CANDIDATES_PER_BATCH * 4)
             .map_err(|e| anyhow!("failed to alloc word_offsets buffer: {e}"))?;
@@ -375,7 +471,7 @@ impl CudaBruteForcer {
             func_short_keys,
             d_params: UnsafeCell::new(d_params),
             d_message,
-            d_word_bytes: UnsafeCell::new(d_word_bytes),
+            d_mmap,
             d_word_offsets: UnsafeCell::new(d_word_offsets),
             d_word_lengths: UnsafeCell::new(d_word_lengths),
             d_result: UnsafeCell::new(d_result),
@@ -456,10 +552,14 @@ impl CudaBruteForcer {
         Ok(())
     }
 
-    /// Copy batch data to device, launch kernel, return command handle.
+    /// Copy batch metadata to device, launch kernel, return command handle.
+    ///
+    /// With zero-copy mmap dispatch, only the small metadata arrays (offsets
+    /// and lengths) are copied per batch. The candidate bytes are already in
+    /// GPU VRAM via `d_mmap`.
     ///
     /// `candidate_count_override` allows autotuning to dispatch a
-    /// smaller prefix of the batch without copying all candidate data.
+    /// smaller prefix of the batch without copying all metadata.
     fn encode_and_commit_impl(
         &self,
         target_signature: &[u8],
@@ -475,9 +575,9 @@ impl CudaBruteForcer {
         }
 
         let view = batch.as_dispatch_view();
-        let word_bytes_len = batch.word_bytes_len();
 
-        // Phase 1: Host prep — write params and copy batch data to device.
+        // Phase 1: Host prep — write params and copy metadata to device.
+        // No word_bytes copy needed — mmap is already in VRAM.
         let prep_started = Instant::now();
         self.write_params(target_signature, candidate_count)?;
 
@@ -487,21 +587,15 @@ impl CudaBruteForcer {
             .memcpy_htod(&[RESULT_NOT_FOUND_SENTINEL], d_result)
             .map_err(|e| anyhow!("failed to reset result sentinel: {e}"))?;
 
-        // Copy batch candidate data from host to device.
-        let d_word_bytes = unsafe { &mut *self.d_word_bytes.get() };
+        // Copy only metadata (offsets + lengths) from host to device.
         let d_word_offsets = unsafe { &mut *self.d_word_offsets.get() };
         let d_word_lengths = unsafe { &mut *self.d_word_lengths.get() };
 
-        if word_bytes_len > 0 {
-            self.stream
-                .memcpy_htod(&view.word_bytes_buf.data[..word_bytes_len], d_word_bytes)
-                .map_err(|e| anyhow!("failed to copy word_bytes to device: {e}"))?;
-        }
         let offsets_bytes = actual_count * 4;
         if offsets_bytes > 0 {
             self.stream
                 .memcpy_htod(
-                    &view.word_offsets_buf.data[..offsets_bytes],
+                    &view.word_offsets_buf.as_slice()[..offsets_bytes],
                     d_word_offsets,
                 )
                 .map_err(|e| anyhow!("failed to copy word_offsets to device: {e}"))?;
@@ -510,7 +604,7 @@ impl CudaBruteForcer {
         if lengths_bytes > 0 {
             self.stream
                 .memcpy_htod(
-                    &view.word_lengths_buf.data[..lengths_bytes],
+                    &view.word_lengths_buf.as_slice()[..lengths_bytes],
                     d_word_lengths,
                 )
                 .map_err(|e| anyhow!("failed to copy word_lengths to device: {e}"))?;
@@ -529,9 +623,8 @@ impl CudaBruteForcer {
 
         // SAFETY: Kernel arguments match the CUDA kernel signature:
         //   params*, message*, word_bytes*, word_offsets*, word_lengths*, result*
-        // All device pointers are valid and properly sized.
+        // d_mmap replaces d_word_bytes — offsets are absolute mmap positions.
         let d_params = unsafe { &*self.d_params.get() };
-        let d_word_bytes = unsafe { &*self.d_word_bytes.get() };
         let d_word_offsets = unsafe { &*self.d_word_offsets.get() };
         let d_word_lengths = unsafe { &*self.d_word_lengths.get() };
         let d_result = unsafe { &mut *self.d_result.get() };
@@ -541,7 +634,7 @@ impl CudaBruteForcer {
                 .launch_builder(func)
                 .arg(d_params)
                 .arg(&self.d_message)
-                .arg(d_word_bytes)
+                .arg(&self.d_mmap)
                 .arg(d_word_offsets)
                 .arg(d_word_lengths)
                 .arg(d_result)
@@ -721,6 +814,7 @@ impl GpuBruteForcer for CudaBruteForcer {
 ///
 /// The kernel source is compiled with `#define AES_KEY_BYTES N` to
 /// produce a fully specialised binary for each AES key size.
+/// Uses zero-copy mmap dispatch — the wordlist is in VRAM.
 pub(crate) struct CudaAesKwBruteForcer {
     #[allow(dead_code)]
     variant: AesKwVariant,
@@ -731,7 +825,7 @@ pub(crate) struct CudaAesKwBruteForcer {
     func_short_keys: CudaFunction,
     d_params: UnsafeCell<CudaSlice<u8>>,
     d_encrypted_key: CudaSlice<u8>,
-    d_word_bytes: UnsafeCell<CudaSlice<u8>>,
+    d_mmap: CudaSlice<u8>,
     d_word_offsets: UnsafeCell<CudaSlice<u8>>,
     d_word_lengths: UnsafeCell<CudaSlice<u8>>,
     d_result: UnsafeCell<CudaSlice<u32>>,
@@ -745,11 +839,12 @@ pub(crate) struct CudaAesKwBruteForcer {
 
 impl CudaAesKwBruteForcer {
     /// Compile the AESKW CUDA kernel with the appropriate AES_KEY_BYTES
-    /// define, load functions, and allocate device buffers.
+    /// define, load functions, upload mmap to VRAM, and allocate device buffers.
     pub(crate) fn new(
         variant: AesKwVariant,
         encrypted_key: &[u8],
         n_blocks: usize,
+        mmap_bytes: &[u8],
     ) -> anyhow::Result<Self> {
         let ctx = CudaContext::new(0)
             .map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
@@ -787,9 +882,21 @@ impl CudaAesKwBruteForcer {
         let d_encrypted_key = stream
             .clone_htod(encrypted_key)
             .map_err(|e| anyhow!("failed to copy encrypted_key to device: {e}"))?;
-        let d_word_bytes = stream
-            .alloc_zeros::<u8>(MAX_WORD_BYTES_PER_BATCH)
-            .map_err(|e| anyhow!("failed to alloc word_bytes buffer: {e}"))?;
+        // Upload entire mmap to GPU VRAM once.
+        let mmap_len = mmap_bytes.len();
+        let d_mmap = if mmap_len > 0 {
+            eprintln!(
+                "CUDA: uploading {} byte mmap to GPU VRAM",
+                format_human_count(mmap_len as f64)
+            );
+            stream
+                .clone_htod(mmap_bytes)
+                .map_err(|e| anyhow!("failed to upload mmap to device ({mmap_len} bytes): {e}"))?
+        } else {
+            stream
+                .alloc_zeros::<u8>(1)
+                .map_err(|e| anyhow!("failed to alloc placeholder mmap buffer: {e}"))?
+        };
         let d_word_offsets = stream
             .alloc_zeros::<u8>(MAX_CANDIDATES_PER_BATCH * 4)
             .map_err(|e| anyhow!("failed to alloc word_offsets buffer: {e}"))?;
@@ -816,7 +923,7 @@ impl CudaAesKwBruteForcer {
             func_short_keys,
             d_params: UnsafeCell::new(d_params),
             d_encrypted_key,
-            d_word_bytes: UnsafeCell::new(d_word_bytes),
+            d_mmap,
             d_word_offsets: UnsafeCell::new(d_word_offsets),
             d_word_lengths: UnsafeCell::new(d_word_lengths),
             d_result: UnsafeCell::new(d_result),
@@ -866,7 +973,6 @@ impl CudaAesKwBruteForcer {
         }
 
         let view = batch.as_dispatch_view();
-        let word_bytes_len = batch.word_bytes_len();
 
         let prep_started = Instant::now();
         self.write_params(candidate_count)?;
@@ -876,20 +982,15 @@ impl CudaAesKwBruteForcer {
             .memcpy_htod(&[RESULT_NOT_FOUND_SENTINEL], d_result)
             .map_err(|e| anyhow!("failed to reset result sentinel: {e}"))?;
 
-        let d_word_bytes = unsafe { &mut *self.d_word_bytes.get() };
+        // Copy only metadata (offsets + lengths) — mmap is already in VRAM.
         let d_word_offsets = unsafe { &mut *self.d_word_offsets.get() };
         let d_word_lengths = unsafe { &mut *self.d_word_lengths.get() };
 
-        if word_bytes_len > 0 {
-            self.stream
-                .memcpy_htod(&view.word_bytes_buf.data[..word_bytes_len], d_word_bytes)
-                .map_err(|e| anyhow!("failed to copy word_bytes to device: {e}"))?;
-        }
         let offsets_bytes = actual_count * 4;
         if offsets_bytes > 0 {
             self.stream
                 .memcpy_htod(
-                    &view.word_offsets_buf.data[..offsets_bytes],
+                    &view.word_offsets_buf.as_slice()[..offsets_bytes],
                     d_word_offsets,
                 )
                 .map_err(|e| anyhow!("failed to copy word_offsets to device: {e}"))?;
@@ -898,7 +999,7 @@ impl CudaAesKwBruteForcer {
         if lengths_bytes > 0 {
             self.stream
                 .memcpy_htod(
-                    &view.word_lengths_buf.data[..lengths_bytes],
+                    &view.word_lengths_buf.as_slice()[..lengths_bytes],
                     d_word_lengths,
                 )
                 .map_err(|e| anyhow!("failed to copy word_lengths to device: {e}"))?;
@@ -915,7 +1016,6 @@ impl CudaAesKwBruteForcer {
         };
 
         let d_params = unsafe { &*self.d_params.get() };
-        let d_word_bytes = unsafe { &*self.d_word_bytes.get() };
         let d_word_offsets = unsafe { &*self.d_word_offsets.get() };
         let d_word_lengths = unsafe { &*self.d_word_lengths.get() };
         let d_result = unsafe { &mut *self.d_result.get() };
@@ -925,7 +1025,7 @@ impl CudaAesKwBruteForcer {
                 .launch_builder(func)
                 .arg(d_params)
                 .arg(&self.d_encrypted_key)
-                .arg(d_word_bytes)
+                .arg(&self.d_mmap)
                 .arg(d_word_offsets)
                 .arg(d_word_lengths)
                 .arg(d_result)

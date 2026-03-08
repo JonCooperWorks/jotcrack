@@ -1,6 +1,6 @@
 # jotcrack
 
-GPU-accelerated JWT/JWE secret cracking on macOS using Apple Metal.
+GPU-accelerated JWT/JWE secret cracking on macOS (Metal) and Linux (CUDA).
 
 Supports **HS256**, **HS384**, **HS512** (HMAC-SHA JWT signing) and **A128KW**, **A192KW**, **A256KW** (AES Key Wrap JWE key management) with automatic detection.
 
@@ -18,13 +18,21 @@ JWE tokens encrypted with A128KW/A192KW/A256KW wrap the Content Encryption Key (
 
 1. **Parse** the wordlist using memory-mapped I/O with parallel chunk scanning
 2. **Pack** candidates into GPU-friendly batches (contiguous byte arrays with offset/length tables)
-3. **Dispatch** computation on the Metal GPU (one thread per candidate)
+3. **Dispatch** computation on the GPU via Metal (macOS) or CUDA (Linux) — one thread per candidate
 4. **Double-buffer** so the next batch is being prepared while the GPU processes the current one
 
 ## Requirements
 
-- macOS with Apple Silicon (Metal GPU required)
+**macOS:**
+- Apple Silicon (Metal GPU required)
 - Rust toolchain (`cargo`)
+
+**Linux:**
+- NVIDIA GPU with CUDA 11.4+ (tested on RTX PRO 6000 with CUDA 13.1)
+- NVIDIA driver with CUDA runtime and NVRTC libraries
+- Rust toolchain (`cargo`)
+
+**Both platforms:**
 - A wordlist file (default: `breach.txt`)
 
 ## Build
@@ -45,15 +53,15 @@ It distinguishes JWT (3-part) from JWE (5-part) compact tokens and routes to the
 
 ## Subcommands
 
-| Command | Algorithm | Type | GPU kernel |
-|---------|-----------|------|------------|
-| `autocrack` | Auto-detect from header | JWT or JWE | Routes to the right one |
-| `hs256wordlist` | HMAC-SHA256 | JWT | `hs256_wordlist.metal` |
-| `hs384wordlist` | HMAC-SHA384 | JWT | `hs512_wordlist.metal` (shared) |
-| `hs512wordlist` | HMAC-SHA512 | JWT | `hs512_wordlist.metal` |
-| `jwe-a128kw` | AES-128 Key Wrap | JWE | `aeskw_wordlist.metal` (AES_KEY_BYTES=16) |
-| `jwe-a192kw` | AES-192 Key Wrap | JWE | `aeskw_wordlist.metal` (AES_KEY_BYTES=24) |
-| `jwe-a256kw` | AES-256 Key Wrap | JWE | `aeskw_wordlist.metal` (AES_KEY_BYTES=32) |
+| Command | Algorithm | Type | Metal kernel | CUDA kernel |
+|---------|-----------|------|-------------|-------------|
+| `autocrack` | Auto-detect from header | JWT or JWE | Routes to the right one | Routes to the right one |
+| `hs256wordlist` | HMAC-SHA256 | JWT | `hs256_wordlist.metal` | `hs256_wordlist.cu` |
+| `hs384wordlist` | HMAC-SHA384 | JWT | `hs512_wordlist.metal` (shared) | `hs512_wordlist.cu` (shared) |
+| `hs512wordlist` | HMAC-SHA512 | JWT | `hs512_wordlist.metal` | `hs512_wordlist.cu` |
+| `jwe-a128kw` | AES-128 Key Wrap | JWE | `aeskw_wordlist.metal` (AES_KEY_BYTES=16) | `aeskw_wordlist.cu` (AES_KEY_BYTES=16) |
+| `jwe-a192kw` | AES-192 Key Wrap | JWE | `aeskw_wordlist.metal` (AES_KEY_BYTES=24) | `aeskw_wordlist.cu` (AES_KEY_BYTES=24) |
+| `jwe-a256kw` | AES-256 Key Wrap | JWE | `aeskw_wordlist.metal` (AES_KEY_BYTES=32) | `aeskw_wordlist.cu` (AES_KEY_BYTES=32) |
 
 `autocrack` is the recommended default. Use the algorithm-specific commands if you want to skip the auto-detection step.
 
@@ -67,7 +75,7 @@ ARGS:
 
 OPTIONS:
   --wordlist <PATH>           Wordlist file path [default: breach.txt]
-  --threads-per-group <N>     Fixed Metal threadgroup width override
+  --threads-per-group <N>     Fixed GPU threadgroup/block width override
   --parser-threads <N>        Number of parallel wordlist parser workers
   --pipeline-depth <N>        Max in-flight batches between parser and GPU
   --packer-threads <N>        Number of host batch packing workers
@@ -103,7 +111,15 @@ Exit codes:
 
 ### HMAC-SHA (JWT)
 
-Benchmarked on Apple M4 Max (40-core GPU, 64 GB RAM) with a 112 GB wordlist (16.4 billion candidates):
+**NVIDIA RTX PRO 6000** (Blackwell, 96 GB VRAM, CUDA 13.1) with breach.txt (~347M candidates):
+
+| Algorithm | End-to-End | GPU-Only |
+|-----------|-----------|----------|
+| **HS256** | **355 M/s** | 2.74 B/s |
+
+GPU-only throughput is massively faster than end-to-end because the GPU finishes each batch in ~1ms while CPU-side packing takes ~20ms. The pipeline is CPU-bound.
+
+**Apple M4 Max** (40-core GPU, 64 GB RAM) with a 112 GB wordlist (16.4 billion candidates):
 
 | Algorithm | End-to-End | GPU-Only | vs HS256 |
 |-----------|-----------|----------|----------|
@@ -111,7 +127,7 @@ Benchmarked on Apple M4 Max (40-core GPU, 64 GB RAM) with a 112 GB wordlist (16.
 | **HS384** | **70 M/s** | 96 M/s | 6.3x slower |
 | **HS512** | **73 M/s** | 91 M/s | 6.1x slower |
 
-**Why HS384/HS512 are slower**: SHA-512 uses 64-bit words, but Apple GPUs have 32-bit ALUs — every 64-bit operation is emulated as multiple 32-bit instructions. SHA-512 also uses 128-byte blocks and 80 rounds (vs SHA-256's 64-byte blocks and 64 rounds).
+**Why HS384/HS512 are slower on Apple Silicon**: SHA-512 uses 64-bit words, but Apple GPUs have 32-bit ALUs — every 64-bit operation is emulated as multiple 32-bit instructions. SHA-512 also uses 128-byte blocks and 80 rounds (vs SHA-256's 64-byte blocks and 64 rounds). NVIDIA GPUs have native 64-bit integer support, so the gap is smaller on CUDA.
 
 ### AES Key Wrap (JWE)
 
@@ -123,7 +139,7 @@ Benchmarked on Apple M4 Max with breach.txt (~296M candidates):
 | **A192KW** | **106 M/s** | 110 M/s | 12 | 24 bytes |
 | **A256KW** | **90.5 M/s** | 93.4 M/s | 14 | 32 bytes |
 
-Performance scales linearly with AES round count — each additional 2 rounds adds ~12% overhead. The AES Key Wrap shader uses software AES with S-box lookup tables in Metal `constant` address space, broadcast-cached across SIMD groups.
+Performance scales linearly with AES round count — each additional 2 rounds adds ~12% overhead. The AES Key Wrap shader uses software AES with S-box lookup tables in GPU constant memory, broadcast-cached across SIMD groups/warps.
 
 ### Benchmarking
 
@@ -159,24 +175,32 @@ src/
   stats.rs               Timing, rate reporting, final stats
   test_support.rs        Test helpers (temp wordlists, JWT/JWE generation)
   gpu/
-    mod.rs               HmacVariant, AesKwVariant, CrackVariant enums + GpuBruteForcer trait
-    metal/
-      mod.rs             Metal GPU backends (MetalBruteForcer, MetalAesKwBruteForcer)
-      hs256_wordlist.metal   SHA-256 GPU kernel
-      hs512_wordlist.metal   SHA-512 GPU kernel (shared by HS384)
-      aeskw_wordlist.metal   AES Key Wrap GPU kernel (compile-time specialised for 128/192/256)
+    mod.rs               GpuBruteForcer trait + platform type aliases + variant enums
+    metal/               macOS Metal backend
+      mod.rs             MetalBruteForcer, MetalAesKwBruteForcer
+      hs256_wordlist.metal   SHA-256 Metal kernel
+      hs512_wordlist.metal   SHA-512 Metal kernel (shared by HS384)
+      aeskw_wordlist.metal   AES Key Wrap Metal kernel
+    cuda/                Linux CUDA backend
+      mod.rs             CudaBruteForcer, CudaAesKwBruteForcer
+      hs256_wordlist.cu  SHA-256 CUDA kernel
+      hs512_wordlist.cu  SHA-512 CUDA kernel (shared by HS384)
+      aeskw_wordlist.cu  AES Key Wrap CUDA kernel
 ```
 
 ### Key design decisions
 
-- **Metal kernels are embedded** via `include_str!()` — the binary is fully self-contained
+- **GPU kernels are embedded** via `include_str!()` — the binary is fully self-contained. Metal shaders are compiled at pipeline creation; CUDA kernels are compiled to PTX at startup via NVRTC
+- **Platform abstraction**: the `GpuBruteForcer` trait and platform-gated type aliases (`GpuBuffer`, `GpuDevice`, `GpuCommandHandle`) keep Metal and CUDA concerns isolated — `runner.rs`, `batch.rs`, and `producer.rs` compile unchanged on both platforms
 - **Double-buffered dispatch**: the next batch is parsed and packed while the GPU processes the current one
-- **Zero-copy batches**: wordlist parser writes directly into Metal shared-memory buffers
+- **Zero-copy batches** (Metal): wordlist parser writes directly into Metal shared-memory buffers. On CUDA, **pinned (page-locked) host memory** enables DMA transfers at full PCIe bandwidth without intermediate staging copies
 - **Two kernel variants per algorithm**: a "short-key" specialization avoids the long-key hash-first path
-- **Compile-time AES specialisation**: the AES Key Wrap shader is compiled three times with different `#define AES_KEY_BYTES` values, producing fully specialised kernels per variant (no runtime branching, exact register allocation)
-- **Autotune**: `--autotune` benchmarks several threadgroup widths on the first batch and picks the fastest
+- **Compile-time AES specialisation**: the AES Key Wrap kernel is compiled three times with different `#define AES_KEY_BYTES` values, producing fully specialised kernels per variant (no runtime branching, exact register allocation)
+- **Autotune**: `--autotune` benchmarks several threadgroup/block widths on the first batch and picks the fastest
 
 ## Kernel optimizations
+
+These optimizations apply to both Metal and CUDA kernels — the CUDA ports preserve the same algorithmic structure.
 
 ### HMAC-SHA kernels
 
@@ -186,10 +210,17 @@ src/
 
 ### AES Key Wrap kernel
 
-1. **Compile-time specialisation**: `AES_KEY_BYTES` controls Nk (key words), Nr (rounds), and round key array size at compile time — Metal unrolls loops and allocates exact registers.
-2. **Constant-memory S-boxes**: Forward and inverse S-box tables in `constant` address space — broadcast-cached across SIMD groups, avoiding per-thread register spills.
+1. **Compile-time specialisation**: `AES_KEY_BYTES` controls Nk (key words), Nr (rounds), and round key array size at compile time — the compiler unrolls loops and allocates exact registers.
+2. **Constant-memory S-boxes**: Forward and inverse S-box tables in constant memory (`constant` on Metal, `__constant__` on CUDA) — broadcast-cached across SIMD groups/warps, avoiding per-thread register spills.
 3. **Arithmetic GF(2^8)**: MixColumns/InvMixColumns use inline `xtime`/`mul` arithmetic instead of lookup tables, reducing constant memory pressure.
 4. **SHA-256 key derivation**: Long candidates (> key_bytes) are SHA-256 hashed and truncated; short candidates are zero-padded — matching JOSE key derivation semantics.
+
+### CUDA-specific details
+
+- **Unified address space**: CUDA has a flat global memory model, so the Metal pattern of duplicating helper functions for `device`/`constant`/`threadgroup` address spaces collapses to single implementations.
+- **`__constant__` memory**: SHA round constants and AES S-box tables use CUDA's dedicated 64KB constant cache, which broadcasts reads to all 32 threads in a warp simultaneously.
+- **Pinned host memory**: Host-side batch buffers use `cuMemHostAlloc` (page-locked memory), enabling DMA transfers at full PCIe bandwidth and eliminating the driver's internal staging copy.
+- **NVRTC runtime compilation**: Kernel sources are compiled to PTX at startup via NVIDIA's Runtime Compilation library, matching Metal's runtime shader compilation approach. Compute capability is auto-detected for architecture-specific codegen.
 
 ## Tests
 

@@ -13,7 +13,7 @@ breach.txt
 
 # JWT test tokens (may contain known secrets)
 jwt_*
-jwt_password.txt
+jwe_*
 
 # Wordlist metadata
 wordlists.txt

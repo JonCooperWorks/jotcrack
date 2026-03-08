@@ -72,19 +72,27 @@ use super::gpu::{GpuBuffer, GpuDevice, alloc_shared_buffer, buffer_host_ptr};
 // `batch_shape_can_fit()` whenever candidates are added.
 pub(crate) const MAX_CANDIDATES_PER_BATCH: usize = 6_182_240;
 pub(crate) const MAX_WORD_BYTES_PER_BATCH: usize = 32 * 1024 * 1024;
+// Actual allocation size for the word_bytes buffer. Larger than
+// MAX_WORD_BYTES_PER_BATCH because the bulk-copy packing optimization
+// copies contiguous mmap ranges including inter-candidate line endings
+// (LF or CRLF). The GPU ignores these gap bytes — it reads only
+// (offset, length) per candidate — but the buffer must be large enough
+// to hold them. Worst case: 2 bytes (CRLF) per candidate gap.
+pub(crate) const WORD_BYTES_ALLOC_SIZE: usize =
+    MAX_WORD_BYTES_PER_BATCH + MAX_CANDIDATES_PER_BATCH * 2;
 // Approximate shared-buffer bytes held by one `WordBatch` allocation. This is
 // the dominant memory cost when increasing producer/consumer pipeline depth.
 //
 // Breakdown:
-//   - word_bytes buffer:   32 MiB                        (MAX_WORD_BYTES_PER_BATCH)
+//   - word_bytes buffer:   ~44 MiB                       (WORD_BYTES_ALLOC_SIZE)
 //   - word_offsets buffer: 6.2M × 4 bytes ≈ 23.6 MiB    (one u32 per candidate)
 //   - word_lengths buffer: 6.2M × 2 bytes ≈ 11.8 MiB    (one u16 per candidate)
-//   - Total: ~67 MiB per WordBatch
+//   - Total: ~80 MiB per WordBatch
 //
 // When the pipeline depth is N, we have up to N WordBatch objects alive at once,
 // so total GPU buffer memory is roughly N × 67 MiB. This is why pipeline_depth
 // is a tunable parameter — deeper pipelines trade memory for better overlap.
-pub(crate) const APPROX_WORD_BATCH_BUFFER_BYTES: usize = MAX_WORD_BYTES_PER_BATCH
+pub(crate) const APPROX_WORD_BATCH_BUFFER_BYTES: usize = WORD_BYTES_ALLOC_SIZE
     + (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u32>())
     + (MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u16>());
 
@@ -353,7 +361,7 @@ impl WordBatch {
     // Allocate fixed-capacity shared buffers sized to the batch caps so parser
     // writes can go straight into memory later bound to the kernel.
     pub(crate) fn new(device: &GpuDevice, candidate_index_base: u64) -> Self {
-        let word_bytes_buf = alloc_shared_buffer(device, MAX_WORD_BYTES_PER_BATCH);
+        let word_bytes_buf = alloc_shared_buffer(device, WORD_BYTES_ALLOC_SIZE);
         let word_offsets_buf =
             alloc_shared_buffer(device, MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u32>());
         let word_lengths_buf =
@@ -553,6 +561,10 @@ impl WordBatch {
     ///
     /// Returns `None` if the index is out of bounds (which would indicate
     /// a bug in the GPU kernel or result decoding).
+    ///
+    /// **Note**: On Linux (zero-copy path), offsets are absolute mmap
+    /// positions and word_bytes is not populated. Use `word_from_source()`
+    /// with the mmap instead.
     // Reconstruct a candidate slice from the packed storage.
     // Offsets and lengths are guaranteed to have matching indices by the batch
     // builders, so any `None` here indicates a bug or invalid GPU result.
@@ -562,10 +574,28 @@ impl WordBatch {
         self.word_bytes_slice().get(start..start + len)
     }
 
+    /// Reconstruct a candidate from an external source buffer using stored offsets.
+    ///
+    /// On Linux (zero-copy path), `push_segment_bulk` writes absolute mmap
+    /// offsets and does not copy candidate bytes into `word_bytes`. This
+    /// method reads from the original source (the mmap) using those absolute
+    /// offsets.
+    pub(crate) fn word_from_source<'a>(&self, local_index: usize, source: &'a [u8]) -> Option<&'a [u8]> {
+        let start = *self.offsets_slice().get(local_index)? as usize;
+        let len = *self.lengths_slice().get(local_index)? as usize;
+        source.get(start..start + len)
+    }
+
     // Human-readable reconstruction for final reporting. We keep this lossy to
     // avoid crashing on non-UTF-8 wordlist entries while still printing a key.
     pub(crate) fn word_string_lossy(&self, local_index: usize) -> Option<String> {
         Some(String::from_utf8_lossy(self.word(local_index)?).into_owned())
+    }
+
+    /// Reconstruct a candidate string from an external source (mmap).
+    /// Used on Linux (zero-copy path) for match reporting.
+    pub(crate) fn word_string_lossy_from_source(&self, local_index: usize, source: &[u8]) -> Option<String> {
+        Some(String::from_utf8_lossy(self.word_from_source(local_index, source)?).into_owned())
     }
 
     /// Bulk-append a contiguous run of candidates from parsed chunk metadata.
@@ -649,7 +679,11 @@ impl WordBatch {
         );
 
         let base_idx = self.candidate_count;
-        let mut wb_cursor = self.word_bytes_len;
+        #[cfg(not(target_os = "linux"))]
+        let wb_cursor = self.word_bytes_len;
+        // On Linux (zero-copy), mmap bytes aren't copied — suppress unused warning.
+        #[cfg(target_os = "linux")]
+        let _ = mmap;
 
         // SAFETY: all capacity checks were performed at plan time via
         // `batch_shape_can_fit`. The plan guarantees candidate_count and
@@ -657,24 +691,96 @@ impl WordBatch {
         unsafe {
             let offsets_base = self.word_offsets_ptr.add(base_idx);
             let lengths_base = self.word_lengths_ptr.add(base_idx);
-            let wb_base = self.word_bytes_ptr;
 
-            for i in 0..count {
-                let src_idx = line_start + i;
-                let len = *chunk_lengths.get_unchecked(src_idx) as usize;
-                let src_offset =
-                    chunk_start + *chunk_offsets_rel.get_unchecked(src_idx) as usize;
+            // BULK METADATA: copy lengths in one memcpy (contiguous u16 slice).
+            // Same on all platforms — the GPU always needs per-candidate lengths.
+            std::ptr::copy_nonoverlapping(
+                chunk_lengths.as_ptr().add(line_start),
+                lengths_base,
+                count,
+            );
 
-                *offsets_base.add(i) = wb_cursor as u32;
-                *lengths_base.add(i) = len as u16;
+            // ---------- Platform-specific word_bytes + offsets handling ----------
+            //
+            // macOS (Metal): Unified memory — CPU and GPU share physical RAM.
+            //   Copy candidate bytes into the batch's word_bytes buffer (single
+            //   bulk memcpy including inter-candidate gaps), then write batch-
+            //   relative offsets into word_bytes.
+            //
+            // Linux (CUDA): Discrete GPU — the entire mmap is uploaded to GPU
+            //   VRAM once at startup. No per-batch byte copy needed. Offsets
+            //   are absolute mmap positions (chunk_start + relative_offset).
+            //   This eliminates the biggest CPU bottleneck: copying ~32MB of
+            //   candidate bytes per batch.
+
+            #[cfg(not(target_os = "linux"))]
+            {
+                let wb_base = self.word_bytes_ptr;
+                let seg_first_offset =
+                    *chunk_offsets_rel.get_unchecked(line_start) as usize;
+                let last_idx = line_end - 1;
+                let seg_end_offset = *chunk_offsets_rel.get_unchecked(last_idx) as usize
+                    + *chunk_lengths.get_unchecked(last_idx) as usize;
+                let seg_byte_range = seg_end_offset - seg_first_offset;
+
+                // Single bulk copy of the entire segment from mmap to GPU buffer.
                 std::ptr::copy_nonoverlapping(
-                    mmap.as_ptr().add(src_offset),
+                    mmap.as_ptr().add(chunk_start + seg_first_offset),
                     wb_base.add(wb_cursor),
-                    len,
+                    seg_byte_range,
                 );
-                wb_cursor += len;
+
+                // Offsets: copy from chunk-relative, then adjust to batch-relative.
+                std::ptr::copy_nonoverlapping(
+                    chunk_offsets_rel.as_ptr().add(line_start),
+                    offsets_base,
+                    count,
+                );
+                let adjustment = (wb_cursor as u32).wrapping_sub(seg_first_offset as u32);
+                let offsets_slice = std::slice::from_raw_parts_mut(offsets_base, count);
+                for o in offsets_slice.iter_mut() {
+                    *o = o.wrapping_add(adjustment);
+                }
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                // ZERO-COPY: write absolute mmap offsets.
+                // offset[i] = chunk_start + chunk_offsets_rel[i]
+                std::ptr::copy_nonoverlapping(
+                    chunk_offsets_rel.as_ptr().add(line_start),
+                    offsets_base,
+                    count,
+                );
+                let chunk_start_u32 = chunk_start as u32;
+                let offsets_slice = std::slice::from_raw_parts_mut(offsets_base, count);
+                for o in offsets_slice.iter_mut() {
+                    *o = o.wrapping_add(chunk_start_u32);
+                }
             }
         }
+
+        // Track word_bytes_len for planner validation.
+        #[cfg(not(target_os = "linux"))]
+        let new_wb_len = {
+            // Account for the bulk-copied bytes (including inter-candidate gaps).
+            let seg_first_offset = chunk_offsets_rel[line_start] as usize;
+            let last_idx = line_end - 1;
+            let seg_end_offset = chunk_offsets_rel[last_idx] as usize
+                + chunk_lengths[last_idx] as usize;
+            wb_cursor + (seg_end_offset - seg_first_offset)
+        };
+
+        #[cfg(target_os = "linux")]
+        let new_wb_len = {
+            // On Linux (zero-copy), track pure candidate byte count.
+            // The planner computes word_bytes_len the same way.
+            let total_candidate_bytes: usize = chunk_lengths[line_start..line_end]
+                .iter()
+                .map(|&l| l as usize)
+                .sum();
+            self.word_bytes_len + total_candidate_bytes
+        };
 
         // Update max_word_len by scanning the segment's lengths.
         let seg_max = chunk_lengths[line_start..line_end]
@@ -684,17 +790,19 @@ impl WordBatch {
             .unwrap_or(0);
         self.max_word_len = self.max_word_len.max(seg_max);
         self.candidate_count += count;
-        self.word_bytes_len = wb_cursor;
-        // Post-loop byte budget check. This stays `debug_assert!` (compiled out
-        // in release) because computing the total bytes *before* the loop would
-        // require summing all `chunk_lengths[line_start..line_end]` — an O(count)
-        // scan that would add measurable overhead to the hot path. The planner
-        // already guarantees the byte budget via `batch_shape_can_fit_block`, so
-        // this is purely a development-time sanity check for planner correctness.
+        self.word_bytes_len = new_wb_len;
+        // Post-loop byte budget check.
+        #[cfg(not(target_os = "linux"))]
         debug_assert!(
-            self.word_bytes_len <= MAX_WORD_BYTES_PER_BATCH,
-            "push_segment_bulk: word_bytes_len {} exceeds byte cap {}",
-            self.word_bytes_len, MAX_WORD_BYTES_PER_BATCH
+            self.word_bytes_len <= WORD_BYTES_ALLOC_SIZE,
+            "push_segment_bulk: word_bytes_len {} exceeds alloc size {}",
+            self.word_bytes_len, WORD_BYTES_ALLOC_SIZE
+        );
+        #[cfg(target_os = "linux")]
+        debug_assert!(
+            self.word_bytes_len <= MAX_WORD_BYTES_PER_BATCH + MAX_CANDIDATES_PER_BATCH * 2,
+            "push_segment_bulk: word_bytes_len {} exceeds max",
+            self.word_bytes_len
         );
     }
 

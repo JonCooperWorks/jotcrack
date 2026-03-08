@@ -524,7 +524,10 @@ pub(crate) fn pack_batch_plan_into_batch(
             plan.candidate_count
         );
     }
-    if batch.word_bytes_len() != plan.word_bytes_len {
+    // With the bulk-copy optimization, word_bytes_len includes inter-candidate
+    // newline gap bytes (the GPU ignores them via offset/length indexing).
+    // The plan only counts pure candidate bytes, so packed >= planned.
+    if batch.word_bytes_len() < plan.word_bytes_len {
         bail!(
             "batch plan packed byte length mismatch: packed {} planned {}",
             batch.word_bytes_len(),
@@ -1098,16 +1101,28 @@ mod tests {
     fn parallel_mmap_reader_packs_offsets_lengths_and_trims_crlf() {
         let (mut reader, path) =
             parallel_mmap_reader_from_temp_file(b"alpha\r\n\nbe\ncharlie\n", 2, 8);
+        let mmap = reader.shared_mmap();
         let batch = reader.next_batch_reusing(None).unwrap().unwrap();
 
         assert_eq!(batch.candidate_index_base, 0);
-        assert_eq!(batch.offsets_slice(), &[0, 5, 7]);
+        assert_eq!(batch.candidate_count(), 3);
         assert_eq!(batch.lengths_slice(), &[5, 2, 7]);
-        assert_eq!(batch.word_bytes_slice(), b"alphabecharlie");
         assert_eq!(batch.max_word_len(), 7);
-        assert_eq!(batch.word(0).unwrap(), b"alpha");
-        assert_eq!(batch.word(1).unwrap(), b"be");
-        assert_eq!(batch.word(2).unwrap(), b"charlie");
+        // Per-candidate reconstruction is the semantic invariant we care about.
+        // On Linux (zero-copy), use word_from_source since offsets are absolute mmap positions.
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(batch.word_from_source(0, mmap.as_ref()).unwrap(), b"alpha");
+            assert_eq!(batch.word_from_source(1, mmap.as_ref()).unwrap(), b"be");
+            assert_eq!(batch.word_from_source(2, mmap.as_ref()).unwrap(), b"charlie");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = &mmap;
+            assert_eq!(batch.word(0).unwrap(), b"alpha");
+            assert_eq!(batch.word(1).unwrap(), b"be");
+            assert_eq!(batch.word(2).unwrap(), b"charlie");
+        }
         assert!(reader.next_batch_reusing(None).unwrap().is_none());
 
         let _ = fs::remove_file(path);
@@ -1116,11 +1131,21 @@ mod tests {
     #[test]
     fn parallel_mmap_reader_handles_final_line_without_newline() {
         let (mut reader, path) = parallel_mmap_reader_from_temp_file(b"alpha\nbeta", 2, 5);
+        let mmap = reader.shared_mmap();
         let batch = reader.next_batch_reusing(None).unwrap().unwrap();
 
         assert_eq!(batch.candidate_count(), 2);
-        assert_eq!(batch.word(0).unwrap(), b"alpha");
-        assert_eq!(batch.word(1).unwrap(), b"beta");
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(batch.word_from_source(0, mmap.as_ref()).unwrap(), b"alpha");
+            assert_eq!(batch.word_from_source(1, mmap.as_ref()).unwrap(), b"beta");
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = &mmap;
+            assert_eq!(batch.word(0).unwrap(), b"alpha");
+            assert_eq!(batch.word(1).unwrap(), b"beta");
+        }
         assert!(reader.next_batch_reusing(None).unwrap().is_none());
 
         let _ = fs::remove_file(path);
@@ -1227,11 +1252,21 @@ mod tests {
                         direct_batch.candidate_index_base
                     );
                     assert_eq!(packed.candidate_count(), direct_batch.candidate_count());
-                    assert_eq!(packed.word_bytes_len(), direct_batch.word_bytes_len());
                     assert_eq!(packed.max_word_len(), direct_batch.max_word_len());
-                    assert_eq!(packed.offsets_slice(), direct_batch.offsets_slice());
                     assert_eq!(packed.lengths_slice(), direct_batch.lengths_slice());
-                    assert_eq!(packed.word_bytes_slice(), direct_batch.word_bytes_slice());
+                    for i in 0..packed.candidate_count() {
+                        // On Linux (zero-copy), use word_from_source since offsets are
+                        // absolute mmap positions.
+                        #[cfg(target_os = "linux")]
+                        assert_eq!(
+                            packed.word_from_source(i, mmap.as_ref()),
+                            direct_batch.word_from_source(i, mmap.as_ref()),
+                            "candidate {} mismatch", i
+                        );
+                        #[cfg(not(target_os = "linux"))]
+                        assert_eq!(packed.word(i), direct_batch.word(i),
+                            "candidate {} mismatch", i);
+                    }
                 }
                 (lhs, rhs) => panic!(
                     "planned/direct batch stream length mismatch: planned={} direct={}",
