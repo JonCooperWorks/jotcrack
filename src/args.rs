@@ -16,7 +16,7 @@ pub struct WordlistArgs {
     /// Wordlist file path (one candidate secret per line).
     #[arg(long, default_value = DEFAULT_WORDLIST_PATH)]
     pub wordlist: PathBuf,
-    /// Fixed Metal threadgroup width override (default picks a safe value).
+    /// Fixed GPU threadgroup/block width override (default picks a safe value).
     #[arg(long)]
     pub threads_per_group: Option<usize>,
     /// Number of parser worker threads for mmap chunk scanning.

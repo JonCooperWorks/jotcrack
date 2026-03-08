@@ -6,7 +6,7 @@ use crate::batch::WordBatch;
 pub(crate) mod metal;
 
 #[cfg(target_os = "linux")]
-mod cuda;
+pub(crate) mod cuda;
 
 // ---------------------------------------------------------------------------
 // HmacVariant
@@ -205,7 +205,13 @@ pub(crate) type GpuDevice = ::metal::Device;
 pub(crate) type GpuCommandHandle = ::metal::CommandBuffer;
 
 #[cfg(target_os = "linux")]
-compile_error!("CUDA backend not yet implemented — see src/gpu/cuda.rs");
+pub(crate) type GpuBuffer = cuda::CudaBuffer;
+
+#[cfg(target_os = "linux")]
+pub(crate) type GpuDevice = cuda::CudaDeviceHandle;
+
+#[cfg(target_os = "linux")]
+pub(crate) type GpuCommandHandle = cuda::CudaCommandHandle;
 
 // ---------------------------------------------------------------------------
 // Platform-gated buffer helpers
@@ -227,4 +233,19 @@ pub(crate) fn buffer_host_ptr(buf: &GpuBuffer) -> *mut u8 {
 #[cfg(target_os = "macos")]
 pub(crate) fn default_device() -> anyhow::Result<GpuDevice> {
     ::metal::Device::system_default().ok_or_else(|| anyhow::anyhow!("no Metal device available"))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn alloc_shared_buffer(_device: &GpuDevice, size: usize) -> GpuBuffer {
+    cuda::alloc_shared_buffer(_device, size)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn buffer_host_ptr(buf: &GpuBuffer) -> *mut u8 {
+    cuda::buffer_host_ptr(buf)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn default_device() -> anyhow::Result<GpuDevice> {
+    cuda::default_device()
 }

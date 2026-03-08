@@ -5,7 +5,7 @@ use crate::args::WordlistArgs;
 use crate::gpu::{AesKwVariant, CrackVariant, HmacVariant};
 
 #[derive(Debug, Parser)]
-#[command(name = "jotcrack", about = "GPU-assisted JWT/JWE cracking with Metal")]
+#[command(name = "jotcrack", about = "GPU-assisted JWT/JWE cracking with Metal/CUDA")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

@@ -4,10 +4,11 @@ use anyhow::{Context, anyhow, bail};
 
 use super::args::{WordlistArgs, DEFAULT_PIPELINE_DEPTH};
 use super::batch::APPROX_WORD_BATCH_BUFFER_BYTES;
-use super::gpu::{
-    CrackVariant, GpuBruteForcer, GpuCommandHandle,
-    metal::{MetalAesKwBruteForcer, MetalBruteForcer},
-};
+use super::gpu::{CrackVariant, GpuBruteForcer, GpuCommandHandle};
+#[cfg(target_os = "macos")]
+use super::gpu::metal::{MetalAesKwBruteForcer, MetalBruteForcer};
+#[cfg(target_os = "linux")]
+use super::gpu::cuda::{CudaAesKwBruteForcer, CudaBruteForcer};
 use super::jwt::{parse_jwe_aes_kw, parse_jwt};
 use super::producer::{ProducerMessage, WordlistProducer};
 use super::stats::{
@@ -68,13 +69,19 @@ pub(crate) fn run_wordlist_crack(
     match variant {
         CrackVariant::Hmac(hv) => {
             let (signing_input, target_signature) = parse_jwt(hv, &args.jwt)?;
+            #[cfg(target_os = "macos")]
             let gpu = MetalBruteForcer::new(hv, &signing_input)?;
+            #[cfg(target_os = "linux")]
+            let gpu = CudaBruteForcer::new(hv, &signing_input)?;
             run_gpu_crack(variant, gpu, &target_signature, args)
         }
         CrackVariant::JweAesKw(akv) => {
             let encrypted_key = parse_jwe_aes_kw(akv, &args.jwt)?;
             let n = encrypted_key.len() / 8 - 1;
+            #[cfg(target_os = "macos")]
             let gpu = MetalAesKwBruteForcer::new(akv, &encrypted_key, n)?;
+            #[cfg(target_os = "linux")]
+            let gpu = CudaAesKwBruteForcer::new(akv, &encrypted_key, n)?;
             run_gpu_crack(variant, gpu, &encrypted_key, args)
         }
     }
