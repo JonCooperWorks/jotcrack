@@ -628,6 +628,7 @@ impl WordBatch {
     /// offsets and does not copy candidate bytes into `word_bytes`. This
     /// method reads from the original source (the mmap) using those absolute
     /// offsets.
+    #[allow(dead_code)] // Used on Linux and in tests
     pub(crate) fn word_from_source<'a>(&self, local_index: usize, source: &'a [u8]) -> Option<&'a [u8]> {
         let start = *self.offsets_slice().get(local_index)? as usize;
         let len = *self.lengths_slice().get(local_index)? as usize;
@@ -643,6 +644,7 @@ impl WordBatch {
 
     /// Reconstruct a candidate string from an external source (mmap).
     /// Used on Linux (zero-copy path) for match reporting.
+    #[allow(dead_code)] // Used on Linux
     pub(crate) fn word_string_lossy_from_source(&self, local_index: usize, source: &[u8]) -> Option<String> {
         Some(String::from_utf8_lossy(self.word_from_source(local_index, source)?).into_owned())
     }
