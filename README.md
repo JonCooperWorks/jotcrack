@@ -28,7 +28,7 @@ JWE tokens encrypted with A128KW/A192KW/A256KW wrap the Content Encryption Key (
 - Rust toolchain (`cargo`)
 
 **Linux:**
-- NVIDIA GPU with CUDA 11.4+ (tested on RTX PRO 6000 with CUDA 13.1)
+- NVIDIA GPU with CUDA 11.4+ (tested on RTX PRO 6000 with CUDA 13.1 on [vast.ai](https://cloud.vast.ai/?ref_id=394548))
 - NVIDIA driver with CUDA runtime and NVRTC libraries
 - Rust toolchain (`cargo`)
 
