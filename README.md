@@ -111,15 +111,15 @@ Exit codes:
 
 ### HMAC-SHA (JWT)
 
-**NVIDIA RTX PRO 6000** (Blackwell, 96 GB VRAM, CUDA 13.1) with breach.txt (~347M candidates):
+**NVIDIA RTX PRO 6000** (Blackwell, 96 GB VRAM, CUDA 13.1) with ~12 billion candidates:
 
 | Algorithm | End-to-End | GPU-Only |
 |-----------|-----------|----------|
-| **HS256** | **645 M/s** | 4.94 B/s |
-| **HS384** | **645 M/s** | 2.73 B/s |
-| **HS512** | **642 M/s** | 2.19 B/s |
+| **HS256** | **793 M/s** | 16.0 B/s |
+| **HS384** | **795 M/s** | 5.18 B/s |
+| **HS512** | **795 M/s** | 5.10 B/s |
 
-All three HMAC algorithms hit the same ~645 M/s end-to-end because the pipeline is CPU-bound — the GPU finishes each batch before the next one is ready. GPU-only rates show NVIDIA's native 64-bit ALUs handle SHA-512 much better than Apple Silicon's 32-bit emulation.
+All three HMAC algorithms hit the same ~795 M/s end-to-end because the pipeline is CPU-bound — the GPU finishes each batch before the next one is ready. GPU-only rates show NVIDIA's native 64-bit ALUs handle SHA-512 much better than Apple Silicon's 32-bit emulation.
 
 **Apple M4 Max** (40-core GPU, 64 GB RAM) with a 112 GB wordlist (16.4 billion candidates):
 
@@ -133,13 +133,13 @@ All three HMAC algorithms hit the same ~645 M/s end-to-end because the pipeline 
 
 ### AES Key Wrap (JWE)
 
-**NVIDIA RTX PRO 6000** with breach.txt (~347M candidates):
+**NVIDIA RTX PRO 6000** with ~13.2 billion candidates:
 
 | Algorithm | End-to-End | GPU-Only | AES Rounds | Key Size |
 |-----------|-----------|----------|------------|----------|
-| **A128KW** | **107 M/s** | 114 M/s | 10 | 16 bytes |
-| **A192KW** | **91.0 M/s** | 95.8 M/s | 12 | 24 bytes |
-| **A256KW** | **78.3 M/s** | 82.1 M/s | 14 | 32 bytes |
+| **A128KW** | **145 M/s** | 146 M/s | 10 | 16 bytes |
+| **A192KW** | **120 M/s** | 121 M/s | 12 | 24 bytes |
+| **A256KW** | **104 M/s** | 104 M/s | 14 | 32 bytes |
 
 **Apple M4 Max** with breach.txt (~296M candidates):
 
