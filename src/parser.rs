@@ -927,6 +927,134 @@ impl ParallelMmapWordlistBatchReader {
         }
     }
 
+    /// Fill the next GPU batch directly, merging plan + pack into one pass.
+    ///
+    /// This eliminates the intermediate `BatchPlan` allocation and avoids
+    /// a second iteration over the parsed chunk metadata. The same block-
+    /// level capacity checks are used, but segments are packed into the
+    /// `WordBatch` immediately as they are determined.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn fill_next_batch(
+        &mut self,
+        mmap: &memmap2::Mmap,
+        batch: &mut WordBatch,
+    ) -> anyhow::Result<Option<ParserStats>> {
+        batch.reset_for_reuse(self.next_index);
+        let mut candidate_count = 0usize;
+        let mut word_bytes_len = 0usize;
+        let mut max_word_len = 0u16;
+
+        loop {
+            if !self.ensure_active_chunk()? {
+                break;
+            }
+
+            let chunk = self
+                .active_chunk
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| anyhow!("parser active chunk missing"))?;
+            let segment_start = self.active_chunk_line_cursor;
+            let mut line_cursor = segment_start;
+
+            // Phase 1 (coarse): Skip entire blocks using precomputed summaries.
+            if candidate_count > 0 {
+                let mut block_idx = line_cursor / PLANNER_BLOCK_STRIDE;
+                let mut block_line_start = block_idx * PLANNER_BLOCK_STRIDE;
+                if block_line_start < line_cursor {
+                    block_idx += 1;
+                    block_line_start = block_idx * PLANNER_BLOCK_STRIDE;
+                }
+                while line_cursor < block_line_start && line_cursor < chunk.lengths.len() {
+                    let line_len = chunk.lengths[line_cursor] as usize;
+                    if !batch_shape_can_fit(candidate_count, word_bytes_len, line_len) {
+                        break;
+                    }
+                    candidate_count += 1;
+                    word_bytes_len += line_len;
+                    max_word_len = max_word_len.max(line_len as u16);
+                    line_cursor += 1;
+                    self.next_index = self
+                        .next_index
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("candidate index overflow"))?;
+                }
+                if line_cursor == block_line_start {
+                    while block_idx < chunk.block_summaries.len() {
+                        let summary = chunk.block_summaries[block_idx];
+                        if !batch_shape_can_fit_block(
+                            candidate_count,
+                            word_bytes_len,
+                            summary.line_count as usize,
+                            summary.total_bytes as usize,
+                        ) {
+                            break;
+                        }
+                        candidate_count += summary.line_count as usize;
+                        word_bytes_len += summary.total_bytes as usize;
+                        max_word_len = max_word_len.max(summary.max_len);
+                        line_cursor += summary.line_count as usize;
+                        self.next_index = self
+                            .next_index
+                            .checked_add(summary.line_count as u64)
+                            .ok_or_else(|| anyhow!("candidate index overflow"))?;
+                        block_idx += 1;
+                    }
+                }
+            }
+
+            // Phase 2 (fine): Per-line scan for the remainder / boundary block.
+            while line_cursor < chunk.lengths.len() {
+                let line_len = chunk.lengths[line_cursor] as usize;
+                if !batch_shape_can_fit(candidate_count, word_bytes_len, line_len) {
+                    break;
+                }
+                candidate_count += 1;
+                word_bytes_len += line_len;
+                max_word_len = max_word_len.max(line_len as u16);
+                line_cursor += 1;
+                self.next_index = self
+                    .next_index
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("candidate index overflow"))?;
+            }
+
+            // Inline pack: copy this segment directly to the batch.
+            if line_cursor > segment_start {
+                batch.push_segment_bulk(
+                    mmap.as_ref(),
+                    chunk.chunk_start,
+                    &chunk.offsets_rel,
+                    &chunk.lengths,
+                    segment_start,
+                    line_cursor,
+                );
+            }
+
+            self.active_chunk_line_cursor = line_cursor;
+            let chunk_exhausted = self.active_chunk_line_cursor >= chunk.lengths.len();
+
+            if chunk_exhausted {
+                self.active_chunk = None;
+                self.active_chunk_line_cursor = 0;
+                self.next_chunk_to_emit = self
+                    .next_chunk_to_emit
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("parser chunk index overflow"))?;
+                continue;
+            }
+
+            break;
+        }
+
+        if candidate_count == 0 {
+            Ok(None)
+        } else {
+            batch.set_plan_metadata(word_bytes_len, max_word_len);
+            Ok(Some(self.parser_stats()))
+        }
+    }
+
     // Build the next GPU batch by first planning deterministic boundaries and
     // then materializing the planned payload into a `WordBatch`.
     #[cfg(test)]

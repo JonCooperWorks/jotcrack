@@ -115,9 +115,11 @@ Exit codes:
 
 | Algorithm | End-to-End | GPU-Only |
 |-----------|-----------|----------|
-| **HS256** | **355 M/s** | 2.74 B/s |
+| **HS256** | **645 M/s** | 4.94 B/s |
+| **HS384** | **645 M/s** | 2.73 B/s |
+| **HS512** | **642 M/s** | 2.19 B/s |
 
-GPU-only throughput is massively faster than end-to-end because the GPU finishes each batch in ~1ms while CPU-side packing takes ~20ms. The pipeline is CPU-bound.
+All three HMAC algorithms hit the same ~645 M/s end-to-end because the pipeline is CPU-bound — the GPU finishes each batch before the next one is ready. GPU-only rates show NVIDIA's native 64-bit ALUs handle SHA-512 much better than Apple Silicon's 32-bit emulation.
 
 **Apple M4 Max** (40-core GPU, 64 GB RAM) with a 112 GB wordlist (16.4 billion candidates):
 
@@ -127,11 +129,19 @@ GPU-only throughput is massively faster than end-to-end because the GPU finishes
 | **HS384** | **70 M/s** | 96 M/s | 6.3x slower |
 | **HS512** | **73 M/s** | 91 M/s | 6.1x slower |
 
-**Why HS384/HS512 are slower on Apple Silicon**: SHA-512 uses 64-bit words, but Apple GPUs have 32-bit ALUs — every 64-bit operation is emulated as multiple 32-bit instructions. SHA-512 also uses 128-byte blocks and 80 rounds (vs SHA-256's 64-byte blocks and 64 rounds). NVIDIA GPUs have native 64-bit integer support, so the gap is smaller on CUDA.
+**Why HS384/HS512 are slower on Apple Silicon**: SHA-512 uses 64-bit words, but Apple GPUs have 32-bit ALUs — every 64-bit operation is emulated as multiple 32-bit instructions. SHA-512 also uses 128-byte blocks and 80 rounds (vs SHA-256's 64-byte blocks and 64 rounds). NVIDIA GPUs have native 64-bit integer support, so all three variants are CPU-bound at the same rate.
 
 ### AES Key Wrap (JWE)
 
-Benchmarked on Apple M4 Max with breach.txt (~296M candidates):
+**NVIDIA RTX PRO 6000** with breach.txt (~347M candidates):
+
+| Algorithm | End-to-End | GPU-Only | AES Rounds | Key Size |
+|-----------|-----------|----------|------------|----------|
+| **A128KW** | **107 M/s** | 114 M/s | 10 | 16 bytes |
+| **A192KW** | **91.0 M/s** | 95.8 M/s | 12 | 24 bytes |
+| **A256KW** | **78.3 M/s** | 82.1 M/s | 14 | 32 bytes |
+
+**Apple M4 Max** with breach.txt (~296M candidates):
 
 | Algorithm | End-to-End | GPU-Only | AES Rounds | Key Size |
 |-----------|-----------|----------|------------|----------|

@@ -321,6 +321,7 @@ pub(crate) fn batch_shape_can_fit(
 // candidate byte-cap exemption (allowing a single large candidate to
 // form its own batch) is handled by falling through to the per-line
 // path in the planner.
+#[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
 pub(crate) fn batch_shape_can_fit_block(
     candidate_count: usize,
     word_bytes_len: usize,
@@ -567,7 +568,33 @@ impl WordBatch {
     /// scans for these values since the BatchPlan already computed them during
     /// planning. This method is called once after all segments are packed.
     #[cfg(target_os = "linux")]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn set_plan_metadata(&mut self, word_bytes_len: usize, max_word_len: u16) {
+        self.word_bytes_len = word_bytes_len;
+        self.max_word_len = max_word_len;
+    }
+
+    /// Raw mutable pointer to the offsets buffer for direct bulk writes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn word_offsets_ptr_mut(&mut self) -> *mut u32 {
+        self.word_offsets_ptr
+    }
+
+    /// Raw mutable pointer to the lengths buffer for direct bulk writes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn word_lengths_ptr_mut(&mut self) -> *mut u16 {
+        self.word_lengths_ptr
+    }
+
+    /// Update counts after a bulk write of pre-staged metadata.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_staged_counts(
+        &mut self,
+        count: usize,
+        word_bytes_len: usize,
+        max_word_len: u16,
+    ) {
+        self.candidate_count += count;
         self.word_bytes_len = word_bytes_len;
         self.max_word_len = max_word_len;
     }
@@ -658,6 +685,7 @@ impl WordBatch {
     /// - `chunk_offsets_rel[i] + chunk_start` and `chunk_lengths[i]` are valid
     ///   mmap byte ranges for all `i` in `line_start..line_end`
     /// - The total bytes fit in the batch (checked here via debug_assert)
+    #[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
     pub(crate) fn push_segment_bulk(
         &mut self,
         mmap: &[u8],

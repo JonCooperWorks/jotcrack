@@ -56,6 +56,7 @@ pub(crate) struct ParserConfig {
     /// How many parsed batches can be queued before the parser threads block.
     /// Sized as a multiple of `parser_threads` so each thread can have several
     /// batches in flight, smoothing out variance in batch-build time.
+    #[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
     pub(crate) queue_capacity: usize,
 }
 

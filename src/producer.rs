@@ -1,46 +1,19 @@
 //! # Producer pipeline for GPU batch dispatch
 //!
 //! This module implements the **producer/consumer pattern** that keeps the GPU
-//! fed with batches of password candidates while the CPU parses the wordlist
-//! in parallel.
+//! fed with batches of password candidates while the CPU parses the wordlist.
 //!
-//! ## The core problem: CPU and GPU are independent processors
+//! ## Architecture
 //!
-//! Without pipelining, the workflow would be:
+//! On **macOS** (Metal, unified memory), the producer uses a multi-stage pipeline:
+//! parser threads scan the mmap in parallel, a planner thread groups lines into
+//! `BatchPlan` objects, and a coordinator packs them into `WordBatch` GPU buffers.
 //!
-//! ```text
-//! CPU: [parse batch 1]                  [parse batch 2]                  [parse batch 3]
-//! GPU:                 [hash batch 1]                  [hash batch 2]                  ...
-//!                      ↑ GPU idle here                 ↑ GPU idle here
-//! ```
-//!
-//! Each processor waits for the other. With pipelining:
-//!
-//! ```text
-//! CPU: [parse batch 1][parse batch 2][parse batch 3][parse batch 4]...
-//! GPU:                [hash batch 1][hash batch 2][hash batch 3]...
-//!                     ↑ overlapped! No idle time (ideally)
-//! ```
-//!
-//! The producer thread parses batches ahead of what the GPU is currently
-//! processing. A bounded channel (`sync_channel`) connects them, with a
-//! configurable depth (how many batches can be "in flight" between producer
-//! and consumer). Deeper pipelines tolerate more variance in batch processing
-//! time, at the cost of more memory (each in-flight batch holds GPU buffers).
-//!
-//! ## Two-stage pipeline: Planner -> Coordinator (inline pack)
-//!
-//! The producer uses two stages:
-//!
-//! 1. **Planner thread** — Scans the memory-mapped wordlist and determines
-//!    batch boundaries (which lines go in which batch) without copying data.
-//!    Produces `BatchPlan` objects.
-//!
-//! 2. **Coordinator** (runs on the producer thread) — Receives plans, packs
-//!    them inline into `WordBatch` buffers, and sends filled batches to the
-//!    consumer (GPU dispatch thread) via the output channel. Packing is done
-//!    inline because it's fast enough (metadata memcpy + offset adjustment)
-//!    that the overhead of a separate thread pool outweighs the work itself.
+//! On **Linux** (CUDA, discrete GPU), the entire mmap is uploaded to GPU VRAM
+//! once at startup, so "packing" is just writing offset/length metadata to pinned
+//! host memory. Multiple worker threads each scan a newline-aligned region of the
+//! mmap with SIMD `memchr` and write offset/length metadata directly to GPU batch
+//! buffers — no intermediate `ParsedChunk`, `BatchPlan`, or coordinator thread.
 //!
 //! ## WordBatch recycling (object pool pattern)
 //!
@@ -58,28 +31,35 @@
 //! fills it with new data. This keeps the steady-state allocation count
 //! equal to `pipeline_depth` — no garbage collection, no allocator churn.
 
+#[cfg(not(target_os = "linux"))]
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail};
+use anyhow::anyhow;
+#[cfg(not(target_os = "linux"))]
+use anyhow::bail;
 
 use super::gpu::GpuDevice;
 
 use super::args::ParserConfig;
 use super::batch::WordBatch;
-use super::parser::{AnyWordlistBatchReader, BatchPlan, ParserStats, pack_batch_plan_into_batch};
+use super::parser::ParserStats;
 
-/// Messages sent from the planner thread to the coordinator.
-///
-/// Three variants model the planner's lifecycle:
-/// - `Plan` — "here's the next batch of work"
-/// - `Eof` — "I've reached the end of the wordlist" (with final stats)
-/// - `Error` — "something went wrong during parsing"
+#[cfg(not(target_os = "linux"))]
+use std::sync::mpsc::TryRecvError;
+#[cfg(not(target_os = "linux"))]
+use super::parser::{AnyWordlistBatchReader, BatchPlan, pack_batch_plan_into_batch};
+
+// ---------------------------------------------------------------------------
+// macOS: multi-stage pipeline (parser threads → planner → coordinator)
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_os = "linux"))]
 #[derive(Debug)]
 enum PlannerWorkerMessage {
     Plan(BatchPlan),
@@ -87,16 +67,7 @@ enum PlannerWorkerMessage {
     Error(String),
 }
 
-/// Main loop for the planner thread.
-///
-/// The planner scans the memory-mapped wordlist and determines batch boundaries
-/// (which ranges of lines form each batch) without copying any candidate data.
-///
-/// ## Cooperative shutdown via `AtomicBool`
-///
-/// The `stop` flag is checked between batches. `Ordering::Relaxed` is sufficient
-/// here because we don't need happens-before guarantees — we just need the
-/// planner to eventually see the flag.
+#[cfg(not(target_os = "linux"))]
 fn planner_worker_main(
     mut reader: AnyWordlistBatchReader,
     stop: Arc<AtomicBool>,
@@ -134,10 +105,7 @@ fn planner_worker_main(
     }
 }
 
-/// Process a single message from the planner thread.
-///
-/// Each planner message is handled exactly once — `Plan` is queued for packing,
-/// `Eof` sets a flag, and `Error` short-circuits the coordinator.
+#[cfg(not(target_os = "linux"))]
 fn handle_planner_message(
     message: PlannerWorkerMessage,
     pending_plans: &mut VecDeque<BatchPlan>,
@@ -160,10 +128,6 @@ fn handle_planner_message(
 }
 
 /// Messages sent from the producer pipeline to the consumer (GPU dispatch thread).
-///
-/// - **`Batch`** — A filled `WordBatch` ready for GPU dispatch, with timing metadata.
-/// - **`Eof`** — End of the wordlist. All candidates have been dispatched.
-/// - **`Error`** — An unrecoverable error occurred in the producer pipeline.
 pub(crate) enum ProducerMessage {
     Batch {
         batch: WordBatch,
@@ -189,11 +153,6 @@ pub(crate) struct WordlistProducer {
 
 impl WordlistProducer {
     /// Start the producer pipeline.
-    ///
-    /// Uses a bounded `sync_channel(pipeline_depth)` to limit memory usage.
-    /// The producer packs batches inline (no separate packer threads) — the
-    /// packing work (metadata memcpy + offset adjustment) is fast enough
-    /// that thread synchronization overhead would be a net negative.
     pub(crate) fn spawn(
         wordlist_path: PathBuf,
         device: GpuDevice,
@@ -263,11 +222,375 @@ impl WordlistProducer {
     }
 }
 
-/// Producer-thread main loop: plan batches, pack inline, and emit to consumer.
-///
-/// The coordinator receives plans from the planner thread, packs them inline
-/// into `WordBatch` buffers (no separate packer threads), and sends filled
-/// batches to the consumer via the output channel.
+// ---------------------------------------------------------------------------
+// Linux: parallel direct-write producer (no coordinator bottleneck)
+//
+// Multiple worker threads each scan a newline-aligned region of the mmap
+// with memchr and write offset/length metadata directly to GPU batch
+// buffers (pinned host memory). This eliminates all intermediate data
+// structures (ParsedChunk, BatchPlan, block summaries) and avoids
+// cross-core cache transfers — each thread reads its mmap region and
+// writes to its own batch without touching other threads' data.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+fn run_wordlist_producer(
+    wordlist_path: PathBuf,
+    device: GpuDevice,
+    parser_config: ParserConfig,
+    pipeline_depth: usize,
+    stop: Arc<AtomicBool>,
+    tx: SyncSender<ProducerMessage>,
+    recycle_rx: Receiver<WordBatch>,
+) -> anyhow::Result<()> {
+    use memmap2::{Advice, MmapOptions};
+
+    let pipeline_depth = pipeline_depth.max(1);
+    let num_workers = parser_config.parser_threads;
+
+    // Preallocate the steady-state batch pool into a shared channel.
+    let (batch_pool_tx, batch_pool_rx) =
+        crossbeam_channel::bounded::<WordBatch>(pipeline_depth + num_workers);
+    for _ in 0..pipeline_depth {
+        batch_pool_tx
+            .send(WordBatch::new(&device, 0))
+            .map_err(|_| anyhow!("batch pool send failed"))?;
+    }
+
+    // Open and mmap the wordlist.
+    let file = std::fs::File::open(&wordlist_path)
+        .map_err(|e| anyhow!("failed to open wordlist {:?}: {e}", wordlist_path))?;
+    let mmap = Arc::new(
+        unsafe { MmapOptions::new().map(&file) }
+            .map_err(|e| anyhow!("failed to mmap wordlist {:?}: {e}", wordlist_path))?,
+    );
+    let _ = mmap.advise(Advice::Sequential);
+
+    // Plan newline-aligned regions (reuse the same logic as plan_mmap_chunks).
+    let bytes: &[u8] = &mmap;
+    let region_size = if num_workers == 0 {
+        bytes.len()
+    } else {
+        (bytes.len() / num_workers).max(1)
+    };
+    let mut regions: Vec<(usize, usize)> = Vec::with_capacity(num_workers);
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let target_end = (start + region_size).min(bytes.len());
+        let end = if target_end >= bytes.len() {
+            bytes.len()
+        } else {
+            match memchr::memchr(b'\n', &bytes[target_end..]) {
+                Some(rel) => target_end + rel + 1,
+                None => bytes.len(),
+            }
+        };
+        regions.push((start, end));
+        start = end;
+    }
+
+    let total_workers = regions.len();
+    let workers_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    // Spawn worker threads.
+    let mut handles = Vec::with_capacity(total_workers);
+    for (region_start, region_end) in regions {
+        let mmap_ref = Arc::clone(&mmap);
+        let stop_w = Arc::clone(&stop);
+        let tx_w = tx.clone();
+        let pool_rx = batch_pool_rx.clone();
+        let done_counter = Arc::clone(&workers_done);
+        let total = total_workers;
+        let file_len = bytes.len();
+
+        handles.push(thread::spawn(move || {
+            let result = scan_region_direct(
+                &mmap_ref,
+                region_start,
+                region_end,
+                file_len,
+                &stop_w,
+                &tx_w,
+                &pool_rx,
+            );
+
+            // If this is the last worker, send EOF.
+            let finished = done_counter.fetch_add(1, Ordering::AcqRel) + 1;
+            if finished == total {
+                let _ = tx_w.send(ProducerMessage::Eof {
+                    parser_stats: ParserStats {
+                        parser_threads: total,
+                        parser_chunk_bytes: file_len,
+                        parser_chunks: total as u64,
+                        parser_skipped_oversize: 0,
+                    },
+                });
+            }
+
+            if let Err(e) = result {
+                let _ = tx_w.send(ProducerMessage::Error(format!("{e:#}")));
+            }
+        }));
+    }
+
+    // Drop our copies so channels close when workers finish.
+    drop(tx);
+    drop(batch_pool_rx);
+
+    // This thread forwards recycled batches from the consumer back to the
+    // worker pool. It exits when either all workers finish (pool receivers
+    // dropped → send fails) or the stop signal is set.
+    loop {
+        if workers_done.load(Ordering::Acquire) >= total_workers {
+            break;
+        }
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // Use recv_timeout to avoid blocking forever when the consumer
+        // stops recycling (e.g., after finding a match).
+        match recycle_rx.recv_timeout(Duration::from_millis(5)) {
+            Ok(b) => {
+                // Best-effort: if all pool receivers are gone, just drop the batch.
+                let _ = batch_pool_tx.try_send(b);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    drop(batch_pool_tx);
+
+    for h in handles {
+        if h.join().is_err() {
+            return Err(anyhow!("producer worker thread panicked"));
+        }
+    }
+
+    Ok(())
+}
+
+/// One worker thread: scan a region of the mmap and write batches directly.
+#[cfg(target_os = "linux")]
+fn scan_region_direct(
+    mmap: &[u8],
+    region_start: usize,
+    region_end: usize,
+    _file_len: usize,
+    stop: &AtomicBool,
+    tx: &SyncSender<ProducerMessage>,
+    pool_rx: &crossbeam_channel::Receiver<WordBatch>,
+) -> anyhow::Result<()> {
+    use super::batch::{MAX_CANDIDATES_PER_BATCH, MAX_WORD_BYTES_PER_BATCH};
+
+    let region = &mmap[region_start..region_end];
+
+    // Local staging buffers — accumulate in L1-cached memory, bulk-flush
+    // to pinned GPU memory when a batch boundary is hit.
+    let mut local_offsets: Vec<u32> = Vec::with_capacity(MAX_CANDIDATES_PER_BATCH);
+    let mut local_lengths: Vec<u16> = Vec::with_capacity(MAX_CANDIDATES_PER_BATCH);
+    let mut batch_word_bytes_len: usize = 0;
+    let mut batch_max_word_len: u16 = 0;
+
+    let mut batch = match pool_rx.recv() {
+        Ok(b) => b,
+        Err(_) => return Ok(()),
+    };
+    batch.reset_for_reuse(0);
+    let mut batch_start = Instant::now();
+
+    let mut next_line_start: usize = 0;
+    for newline_pos in memchr::memchr_iter(b'\n', region) {
+        let this_line_start = next_line_start;
+        next_line_start = newline_pos + 1;
+
+        // Trim trailing \r for CRLF.
+        let trimmed_end = if newline_pos > this_line_start && region[newline_pos - 1] == b'\r' {
+            newline_pos - 1
+        } else {
+            newline_pos
+        };
+        let line_len = trimmed_end - this_line_start;
+
+        if line_len == 0 || line_len > u16::MAX as usize {
+            continue;
+        }
+
+        // Check batch boundary.
+        let count = local_offsets.len();
+        if count > 0
+            && (count >= MAX_CANDIDATES_PER_BATCH
+                || batch_word_bytes_len + line_len > MAX_WORD_BYTES_PER_BATCH)
+        {
+            // Flush and send.
+            flush_staged_to_batch(
+                &mut batch,
+                &local_offsets,
+                &local_lengths,
+                batch_word_bytes_len,
+                batch_max_word_len,
+            );
+            let build_time = batch_start.elapsed();
+            if tx
+                .send(ProducerMessage::Batch {
+                    batch,
+                    build_time,
+                    plan_time: Duration::ZERO,
+                    pack_time: Duration::ZERO,
+                    parser_stats: ParserStats {
+                        parser_threads: 1,
+                        parser_chunk_bytes: region.len(),
+                        parser_chunks: 1,
+                        parser_skipped_oversize: 0,
+                    },
+                })
+                .is_err()
+            {
+                return Ok(());
+            }
+
+            if stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+
+            batch = match pool_rx.recv() {
+                Ok(b) => b,
+                Err(_) => return Ok(()),
+            };
+            batch.reset_for_reuse(0);
+            batch_start = Instant::now();
+            local_offsets.clear();
+            local_lengths.clear();
+            batch_word_bytes_len = 0;
+            batch_max_word_len = 0;
+        }
+
+        // Stage: absolute mmap offset.
+        local_offsets.push((region_start + this_line_start) as u32);
+        local_lengths.push(line_len as u16);
+        batch_word_bytes_len += line_len;
+        batch_max_word_len = batch_max_word_len.max(line_len as u16);
+    }
+
+    // Handle final line without trailing newline.
+    if next_line_start < region.len() {
+        let this_line_start = next_line_start;
+        let trimmed_end = if region[region.len() - 1] == b'\r' {
+            region.len() - 1
+        } else {
+            region.len()
+        };
+        let line_len = trimmed_end - this_line_start;
+        if line_len > 0 && line_len <= u16::MAX as usize {
+            let count = local_offsets.len();
+            if count > 0
+                && (count >= MAX_CANDIDATES_PER_BATCH
+                    || batch_word_bytes_len + line_len > MAX_WORD_BYTES_PER_BATCH)
+            {
+                flush_staged_to_batch(
+                    &mut batch,
+                    &local_offsets,
+                    &local_lengths,
+                    batch_word_bytes_len,
+                    batch_max_word_len,
+                );
+                let build_time = batch_start.elapsed();
+                if tx
+                    .send(ProducerMessage::Batch {
+                        batch,
+                        build_time,
+                        plan_time: Duration::ZERO,
+                        pack_time: Duration::ZERO,
+                        parser_stats: ParserStats {
+                            parser_threads: 1,
+                            parser_chunk_bytes: region.len(),
+                            parser_chunks: 1,
+                            parser_skipped_oversize: 0,
+                        },
+                    })
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                batch = match pool_rx.recv() {
+                    Ok(b) => b,
+                    Err(_) => return Ok(()),
+                };
+                batch.reset_for_reuse(0);
+                batch_start = Instant::now();
+                local_offsets.clear();
+                local_lengths.clear();
+                batch_word_bytes_len = 0;
+                batch_max_word_len = 0;
+            }
+            local_offsets.push((region_start + this_line_start) as u32);
+            local_lengths.push(line_len as u16);
+            batch_word_bytes_len += line_len;
+            batch_max_word_len = batch_max_word_len.max(line_len as u16);
+        }
+    }
+
+    // Emit final partial batch.
+    if !local_offsets.is_empty() {
+        flush_staged_to_batch(
+            &mut batch,
+            &local_offsets,
+            &local_lengths,
+            batch_word_bytes_len,
+            batch_max_word_len,
+        );
+        let build_time = batch_start.elapsed();
+        let _ = tx.send(ProducerMessage::Batch {
+            batch,
+            build_time,
+            plan_time: Duration::ZERO,
+            pack_time: Duration::ZERO,
+            parser_stats: ParserStats {
+                parser_threads: 1,
+                parser_chunk_bytes: region.len(),
+                parser_chunks: 1,
+                parser_skipped_oversize: 0,
+            },
+        });
+    }
+
+    Ok(())
+}
+
+/// Bulk-copy staged offsets/lengths from local (cached) buffers to pinned
+/// GPU memory. Offsets are already absolute mmap positions.
+#[cfg(target_os = "linux")]
+fn flush_staged_to_batch(
+    batch: &mut WordBatch,
+    offsets: &[u32],
+    lengths: &[u16],
+    word_bytes_len: usize,
+    max_word_len: u16,
+) {
+    let count = offsets.len();
+    if count == 0 {
+        return;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            offsets.as_ptr(),
+            batch.word_offsets_ptr_mut().add(batch.candidate_count()),
+            count,
+        );
+        std::ptr::copy_nonoverlapping(
+            lengths.as_ptr(),
+            batch.word_lengths_ptr_mut().add(batch.candidate_count()),
+            count,
+        );
+    }
+    batch.set_staged_counts(count, word_bytes_len, max_word_len);
+}
+
+// ---------------------------------------------------------------------------
+// macOS: multi-stage pipeline (planner → coordinator with inline pack)
+// ---------------------------------------------------------------------------
+
+#[cfg(not(target_os = "linux"))]
 fn run_wordlist_producer(
     wordlist_path: PathBuf,
     device: GpuDevice,
@@ -435,6 +758,25 @@ mod tests {
     use super::super::test_support::{test_device, test_parser_config, write_temp_wordlist};
     use super::*;
 
+    /// Drain all batches from the producer, returning the total candidate count.
+    fn drain_all_batches(producer: &mut WordlistProducer) -> (usize, usize) {
+        let mut total_candidates = 0usize;
+        let mut batch_count = 0usize;
+        loop {
+            let msg = producer.recv().expect("producer message");
+            match msg {
+                ProducerMessage::Batch { batch, .. } => {
+                    total_candidates += batch.candidate_count();
+                    batch_count += 1;
+                    producer.recycle(batch);
+                }
+                ProducerMessage::Eof { .. } => break,
+                ProducerMessage::Error(err) => panic!("unexpected producer error: {err}"),
+            }
+        }
+        (total_candidates, batch_count)
+    }
+
     #[test]
     fn wordlist_producer_parallel_path_emits_batches_and_joins_cleanly() {
         let path = write_temp_wordlist(b"alpha\nbeta\n");
@@ -445,29 +787,9 @@ mod tests {
             DEFAULT_PIPELINE_DEPTH,
         );
 
-        let first = producer.recv().expect("producer batch");
-        match first {
-            ProducerMessage::Batch {
-                batch,
-                parser_stats,
-                ..
-            } => {
-                assert_eq!(batch.candidate_count(), 2);
-                assert!(parser_stats.parser_threads >= 1);
-                producer.recycle(batch);
-            }
-            ProducerMessage::Eof { .. } => panic!("unexpected EOF before first batch"),
-            ProducerMessage::Error(err) => panic!("unexpected producer error: {err}"),
-        }
-
-        let second = producer.recv().expect("producer eof");
-        match second {
-            ProducerMessage::Eof { parser_stats } => {
-                assert!(parser_stats.parser_chunks >= 1);
-            }
-            ProducerMessage::Batch { .. } => panic!("unexpected second batch"),
-            ProducerMessage::Error(err) => panic!("unexpected producer error: {err}"),
-        }
+        let (total, batch_count) = drain_all_batches(&mut producer);
+        assert_eq!(total, 2, "expected 2 total candidates");
+        assert!(batch_count >= 1, "expected at least 1 batch");
 
         producer.stop();
         producer.close_receiver();
@@ -481,24 +803,9 @@ mod tests {
         let mut producer =
             WordlistProducer::spawn(path.clone(), test_device(), test_parser_config(2, 8), 4);
 
-        let first = producer.recv().expect("producer first message");
-        match first {
-            ProducerMessage::Batch { batch, .. } => {
-                assert_eq!(batch.candidate_count(), 4);
-                producer.recycle(batch);
-            }
-            ProducerMessage::Eof { .. } => panic!("unexpected eof before batch"),
-            ProducerMessage::Error(err) => panic!("unexpected producer error: {err}"),
-        }
-
-        let second = producer.recv().expect("producer second message");
-        match second {
-            ProducerMessage::Eof { parser_stats } => {
-                assert!(parser_stats.parser_chunks >= 1);
-            }
-            ProducerMessage::Batch { .. } => panic!("unexpected extra batch"),
-            ProducerMessage::Error(err) => panic!("unexpected producer error: {err}"),
-        }
+        let (total, batch_count) = drain_all_batches(&mut producer);
+        assert_eq!(total, 4, "expected 4 total candidates");
+        assert!(batch_count >= 1, "expected at least 1 batch");
 
         producer.stop();
         producer.close_receiver();
