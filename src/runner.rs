@@ -2,18 +2,24 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, anyhow, bail};
 
-use super::args::{WordlistArgs, DEFAULT_PIPELINE_DEPTH};
+use super::args::{MarkovArgs, WordlistArgs, DEFAULT_PIPELINE_DEPTH};
 use super::batch::APPROX_WORD_BATCH_BUFFER_BYTES;
-use super::gpu::{CrackVariant, GpuBruteForcer, GpuCommandHandle};
+use super::gpu::{CrackVariant, GpuBruteForcer, GpuCommandHandle, GpuMarkovBruteForcer};
 #[cfg(target_os = "macos")]
-use super::gpu::metal::{MetalAesKwBruteForcer, MetalBruteForcer};
+use super::gpu::metal::{
+    MetalAesKwBruteForcer, MetalBruteForcer, MetalMarkovAesKwBruteForcer,
+    MetalMarkovHmacBruteForcer,
+};
 #[cfg(target_os = "linux")]
-use super::gpu::cuda::{CudaAesKwBruteForcer, CudaBruteForcer};
+use super::gpu::cuda::{
+    CudaAesKwBruteForcer, CudaBruteForcer, CudaMarkovAesKwBruteForcer,
+    CudaMarkovHmacBruteForcer,
+};
 use super::jwt::{parse_jwe_aes_kw, parse_jwt};
 use super::producer::{ProducerMessage, WordlistProducer};
 use super::stats::{
-    RateReportSnapshot, RunTimings, format_duration_millis, format_human_count, print_final_stats,
-    rate_per_second,
+    RateReportSnapshot, RunTimings, format_duration_millis, format_eta, format_human_count,
+    print_final_stats, rate_per_second,
 };
 
 #[cfg(target_os = "linux")]
@@ -120,6 +126,200 @@ pub(crate) fn run_wordlist_crack(
 }
 
 // ---------------------------------------------------------------------------
+// Markov GPU crack path
+// ---------------------------------------------------------------------------
+
+/// Run the Markov chain cracking pipeline for any supported token type.
+///
+/// Trains (or loads cached) an order-1 Markov model from the wordlist, then
+/// enumerates candidates on the GPU using fused generate+hash kernels.
+pub(crate) fn run_markov_crack(
+    variant: CrackVariant,
+    args: MarkovArgs,
+) -> anyhow::Result<bool> {
+    if args.min_len > args.max_len {
+        bail!("--min-len ({}) must be <= --max-len ({})", args.min_len, args.max_len);
+    }
+
+    let counts = super::markov::load_or_train(&args.wordlist, args.max_len, args.retrain)?;
+    let model = super::markov::MarkovModel::from_counts(&counts, args.threshold, args.max_len);
+
+    let total_keyspace = model.keyspace(args.min_len, args.max_len);
+    eprintln!(
+        "MARKOV threshold={} min_len={} max_len={} keyspace={}",
+        args.threshold,
+        args.min_len,
+        args.max_len,
+        format_human_count(total_keyspace as f64),
+    );
+
+    match variant {
+        CrackVariant::Hmac(hv) => {
+            let (signing_input, target_signature) = parse_jwt(hv, &args.jwt)?;
+            #[cfg(target_os = "macos")]
+            let gpu = MetalMarkovHmacBruteForcer::new(hv, &signing_input, model.table_bytes())?;
+            #[cfg(target_os = "linux")]
+            let gpu = CudaMarkovHmacBruteForcer::new(hv, &signing_input, model.table_bytes())?;
+            run_markov_dispatch(variant, gpu, &target_signature, &model, &args)
+        }
+        CrackVariant::JweAesKw(akv) => {
+            let encrypted_key = parse_jwe_aes_kw(akv, &args.jwt)?;
+            let n = encrypted_key.len() / 8 - 1;
+            #[cfg(target_os = "macos")]
+            let gpu = MetalMarkovAesKwBruteForcer::new(akv, &encrypted_key, n, model.table_bytes())?;
+            #[cfg(target_os = "linux")]
+            let gpu = CudaMarkovAesKwBruteForcer::new(akv, &encrypted_key, n, model.table_bytes())?;
+            run_markov_dispatch(variant, gpu, &encrypted_key, &model, &args)
+        }
+    }
+}
+
+/// Markov keyspace enumeration loop — dispatches GPU batches by (length, offset).
+///
+/// Unlike the wordlist dispatch loop (`run_gpu_crack`), there is no producer
+/// pipeline or double-buffering. The Markov keyspace is fully deterministic:
+/// for each candidate length L, the keyspace is T^L candidates, dispatched in
+/// 6M-candidate batches. Each batch is parameterised by (length, offset, count)
+/// and dispatched synchronously — host prep is just writing a ~32-byte params
+/// struct, so there is no GPU idle time to hide.
+///
+/// ## Progress reporting
+///
+/// Because the total keyspace is known upfront, the periodic RATE lines include
+/// progress percentage and estimated time remaining (ETA).
+///
+/// ## Autotune
+///
+/// If `--autotune` is set, a small sample dispatch (16K candidates) is run at
+/// several threadgroup/block widths before the main loop to find the optimal
+/// configuration for the current device.
+fn run_markov_dispatch<B: GpuMarkovBruteForcer>(
+    variant: CrackVariant,
+    mut gpu: B,
+    target_data: &[u8],
+    model: &super::markov::MarkovModel,
+    args: &MarkovArgs,
+) -> anyhow::Result<bool> {
+    const BATCH_SIZE: u64 = 6_000_000;
+
+    if let Some(tpg) = args.threads_per_group {
+        gpu.set_threadgroup_width(tpg)?;
+    }
+
+    eprintln!(
+        "GPU device={} tew={} max_tpg={} selected_tpg={}",
+        gpu.device_name(),
+        gpu.thread_execution_width(),
+        gpu.max_total_threads_per_threadgroup(),
+        gpu.current_threadgroup_width(),
+    );
+
+    let threshold = model.threshold() as u32;
+
+    if args.autotune && args.threads_per_group.is_none() {
+        let tune_length = args.min_len.max(1).min(args.max_len) as u32;
+        gpu.autotune_markov(target_data, tune_length, threshold)?;
+    }
+
+    let started_at = Instant::now();
+    let mut candidates_tested: u64 = 0;
+    let mut timings = RunTimings::default();
+    let mut last_rate_report =
+        RateReportSnapshot::capture(started_at, candidates_tested, &timings);
+    let total_keyspace = model.keyspace(args.min_len, args.max_len);
+
+    for length in args.min_len..=args.max_len.min(model.max_positions()) {
+        let total_for_length: u128 = (model.threshold() as u128)
+            .checked_pow(length as u32)
+            .unwrap_or(u128::MAX);
+        if total_for_length > u64::MAX as u128 {
+            eprintln!(
+                "MARKOV skipping length {}: keyspace exceeds u64 ({:.2e})",
+                length, total_for_length as f64
+            );
+            continue;
+        }
+        let total_for_length = total_for_length as u64;
+        let mut offset: u64 = 0;
+
+        eprintln!(
+            "MARKOV length={} keyspace={}",
+            length,
+            format_human_count(total_for_length as f64),
+        );
+
+        while offset < total_for_length {
+            let count = std::cmp::min(BATCH_SIZE, total_for_length - offset);
+            let count_u32 =
+                u32::try_from(count).context("Markov batch count overflow")?;
+
+            let (handle, host_prep, cmd_encode) = gpu.encode_and_commit_markov(
+                target_data,
+                length as u32,
+                threshold,
+                offset,
+                count_u32,
+            )?;
+            timings.host_prep += host_prep;
+            timings.command_encode += cmd_encode;
+            timings.dispatch_total += host_prep + cmd_encode;
+
+            let (maybe_match, gpu_wait, readback) = gpu.wait_and_readback(&handle);
+            timings.gpu_wait += gpu_wait;
+            timings.result_readback += readback;
+            timings.dispatch_total += gpu_wait + readback;
+            candidates_tested = candidates_tested.saturating_add(count);
+            timings.batch_count = timings.batch_count.saturating_add(1);
+            timings.total_batch_candidates = timings
+                .total_batch_candidates
+                .saturating_add(count);
+
+            if let Some(local_index) = maybe_match {
+                let global_index = offset + local_index as u64;
+                let candidate = model.candidate_from_index(length, global_index);
+                let secret = String::from_utf8_lossy(&candidate);
+                let elapsed = started_at.elapsed();
+                let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
+                let rate_compute_only = rate_per_second(candidates_tested, timings.gpu_wait);
+                print_final_stats(
+                    candidates_tested,
+                    elapsed,
+                    rate_end_to_end,
+                    rate_compute_only,
+                    &timings,
+                );
+                println!("{} key: {secret}", variant.label());
+                return Ok(true);
+            }
+
+            report_rate_if_due(
+                &mut last_rate_report,
+                candidates_tested,
+                started_at,
+                &timings,
+                Some(gpu.current_threadgroup_width()),
+                Some(total_keyspace),
+            );
+
+            offset += count;
+        }
+    }
+
+    let elapsed = started_at.elapsed();
+    let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
+    let rate_gpu_only = rate_per_second(candidates_tested, timings.gpu_wait);
+    print_final_stats(
+        candidates_tested,
+        elapsed,
+        rate_end_to_end,
+        rate_gpu_only,
+        &timings,
+    );
+    println!("NOT FOUND");
+    Ok(false)
+}
+
+// ---------------------------------------------------------------------------
 // Generic GPU crack path
 // ---------------------------------------------------------------------------
 
@@ -216,6 +416,7 @@ fn run_gpu_crack<B: GpuBruteForcer>(
                     started_at,
                     &timings,
                     Some(gpu.current_threadgroup_width()),
+                    None,
                 );
 
                 producer.recycle(flight.batch);
@@ -330,6 +531,7 @@ fn report_rate_if_due(
     started_at: Instant,
     timings: &RunTimings,
     tpg: Option<usize>,
+    total_keyspace: Option<u128>,
 ) {
     let now = Instant::now();
     let elapsed_since_last = now
@@ -344,10 +546,29 @@ fn report_rate_if_due(
     let rate_compute = rate_per_second(delta.candidates_tested, delta.gpu_wait);
     let elapsed_total = now.duration_since(started_at);
 
+    // Build progress suffix for Markov mode (where total keyspace is known).
+    let progress_suffix = match total_keyspace {
+        Some(total) if total > 0 => {
+            let pct = (candidates_tested as f64 / total as f64) * 100.0;
+            let eta = if rate_end_to_end > 0.0 {
+                let remaining = (total as f64 - candidates_tested as f64) / rate_end_to_end;
+                format!(
+                    " progress={:.2}% eta={}",
+                    pct,
+                    format_eta(Duration::from_secs_f64(remaining))
+                )
+            } else {
+                format!(" progress={pct:.2}%")
+            };
+            eta
+        }
+        _ => String::new(),
+    };
+
     match tpg {
         Some(tpg_val) => {
             eprintln!(
-                "RATE end_to_end={}/s gpu_only={}/s idle_wait={}ms build={}ms (delta={} in {:.2}s, total={} in {:.2}s, tpg={})",
+                "RATE end_to_end={}/s gpu_only={}/s idle_wait={}ms build={}ms (delta={} in {:.2}s, total={} in {:.2}s, tpg={}){progress_suffix}",
                 format_human_count(rate_end_to_end),
                 format_human_count(rate_compute),
                 format_duration_millis(delta.consumer_idle_wait),
@@ -361,7 +582,7 @@ fn report_rate_if_due(
         }
         None => {
             eprintln!(
-                "RATE end_to_end={}/s compute_only={}/s idle_wait={}ms build={}ms (delta={} in {:.2}s, total={} in {:.2}s)",
+                "RATE end_to_end={}/s compute_only={}/s idle_wait={}ms build={}ms (delta={} in {:.2}s, total={} in {:.2}s){progress_suffix}",
                 format_human_count(rate_end_to_end),
                 format_human_count(rate_compute),
                 format_duration_millis(delta.consumer_idle_wait),
@@ -592,5 +813,154 @@ mod tests {
         let result = run_wordlist_crack(variant, make_args(&jwe, path.clone())).unwrap();
         assert!(result, "autocrack should find 'password' via A256KW");
         let _ = std::fs::remove_file(path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Markov integration tests
+    // -----------------------------------------------------------------------
+
+    fn make_markov_args(token: &str, wordlist: PathBuf) -> MarkovArgs {
+        MarkovArgs {
+            jwt: token.to_string(),
+            wordlist,
+            threshold: 30,
+            min_len: 1,
+            max_len: 8,
+            threads_per_group: None,
+            autotune: false,
+            retrain: true, // always retrain in tests to avoid stale caches
+        }
+    }
+
+    /// Markov mode cracks a known HS256 secret that appears in the training wordlist.
+    /// The secret "abc" is short and has high bigram frequency when the training
+    /// data contains it, so it should appear within the Markov keyspace.
+    #[test]
+    fn markov_hs256_cracks_known_secret() {
+        let jwt = make_test_jwt("HS256", r#"{"sub":"markov"}"#, b"abc");
+        // Training wordlist with "abc" and similar patterns.
+        let path = write_temp_wordlist(b"abc\nabc\nabc\nabd\nabe\nabf\nxyz\n");
+        let mut args = make_markov_args(&jwt, path.clone());
+        args.threshold = 10;
+        args.max_len = 4;
+        let result = run_markov_crack(
+            CrackVariant::Hmac(HmacVariant::Hs256),
+            args,
+        )
+        .unwrap();
+        assert!(result, "Markov HS256 should find 'abc'");
+        let _ = std::fs::remove_file(&path);
+        // Clean up cache file.
+        let cache = super::super::markov::cache_path_for(&path);
+        let _ = std::fs::remove_file(cache);
+    }
+
+    /// Markov mode reports not-found when the secret is not in the keyspace.
+    #[test]
+    fn markov_hs256_reports_not_found() {
+        let jwt = make_test_jwt("HS256", r#"{"sub":"markov"}"#, b"zzzzzzzzzzz");
+        let path = write_temp_wordlist(b"abc\ndef\nghi\n");
+        let mut args = make_markov_args(&jwt, path.clone());
+        args.threshold = 3;
+        args.max_len = 3;
+        let result = run_markov_crack(
+            CrackVariant::Hmac(HmacVariant::Hs256),
+            args,
+        )
+        .unwrap();
+        assert!(!result, "Markov HS256 should report not found");
+        let _ = std::fs::remove_file(&path);
+        let cache = super::super::markov::cache_path_for(&path);
+        let _ = std::fs::remove_file(cache);
+    }
+
+    #[test]
+    fn markov_hs384_cracks_known_secret() {
+        let jwt = make_test_jwt("HS384", r#"{"sub":"markov"}"#, b"abc");
+        let path = write_temp_wordlist(b"abc\nabc\nabc\nabd\nabe\nabf\nxyz\n");
+        let mut args = make_markov_args(&jwt, path.clone());
+        args.threshold = 10;
+        args.max_len = 4;
+        let result = run_markov_crack(
+            CrackVariant::Hmac(HmacVariant::Hs384),
+            args,
+        )
+        .unwrap();
+        assert!(result, "Markov HS384 should find 'abc'");
+        let _ = std::fs::remove_file(&path);
+        let cache = super::super::markov::cache_path_for(&path);
+        let _ = std::fs::remove_file(cache);
+    }
+
+    #[test]
+    fn markov_hs512_cracks_known_secret() {
+        let jwt = make_test_jwt("HS512", r#"{"sub":"markov"}"#, b"abc");
+        let path = write_temp_wordlist(b"abc\nabc\nabc\nabd\nabe\nabf\nxyz\n");
+        let mut args = make_markov_args(&jwt, path.clone());
+        args.threshold = 10;
+        args.max_len = 4;
+        let result = run_markov_crack(
+            CrackVariant::Hmac(HmacVariant::Hs512),
+            args,
+        )
+        .unwrap();
+        assert!(result, "Markov HS512 should find 'abc'");
+        let _ = std::fs::remove_file(&path);
+        let cache = super::super::markov::cache_path_for(&path);
+        let _ = std::fs::remove_file(cache);
+    }
+
+    #[test]
+    fn markov_jwe_a128kw_cracks_known_secret() {
+        let jwe = make_test_jwe(AesKwVariant::A128kw, b"abc");
+        let path = write_temp_wordlist(b"abc\nabc\nabc\nabd\nabe\nabf\nxyz\n");
+        let mut args = make_markov_args(&jwe, path.clone());
+        args.threshold = 10;
+        args.max_len = 4;
+        let result = run_markov_crack(
+            CrackVariant::JweAesKw(AesKwVariant::A128kw),
+            args,
+        )
+        .unwrap();
+        assert!(result, "Markov A128KW should find 'abc'");
+        let _ = std::fs::remove_file(&path);
+        let cache = super::super::markov::cache_path_for(&path);
+        let _ = std::fs::remove_file(cache);
+    }
+
+    #[test]
+    fn markov_jwe_a192kw_cracks_known_secret() {
+        let jwe = make_test_jwe(AesKwVariant::A192kw, b"abc");
+        let path = write_temp_wordlist(b"abc\nabc\nabc\nabd\nabe\nabf\nxyz\n");
+        let mut args = make_markov_args(&jwe, path.clone());
+        args.threshold = 10;
+        args.max_len = 4;
+        let result = run_markov_crack(
+            CrackVariant::JweAesKw(AesKwVariant::A192kw),
+            args,
+        )
+        .unwrap();
+        assert!(result, "Markov A192KW should find 'abc'");
+        let _ = std::fs::remove_file(&path);
+        let cache = super::super::markov::cache_path_for(&path);
+        let _ = std::fs::remove_file(cache);
+    }
+
+    #[test]
+    fn markov_jwe_a256kw_cracks_known_secret() {
+        let jwe = make_test_jwe(AesKwVariant::A256kw, b"abc");
+        let path = write_temp_wordlist(b"abc\nabc\nabc\nabd\nabe\nabf\nxyz\n");
+        let mut args = make_markov_args(&jwe, path.clone());
+        args.threshold = 10;
+        args.max_len = 4;
+        let result = run_markov_crack(
+            CrackVariant::JweAesKw(AesKwVariant::A256kw),
+            args,
+        )
+        .unwrap();
+        assert!(result, "Markov A256KW should find 'abc'");
+        let _ = std::fs::remove_file(&path);
+        let cache = super::super::markov::cache_path_for(&path);
+        let _ = std::fs::remove_file(cache);
     }
 }

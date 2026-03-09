@@ -991,3 +991,78 @@ extern "C" __global__ void hs512_wordlist_short_keys(
         atomicMin(result_index, gid);
     }
 }
+
+// ===========================================================================
+// Markov chain candidate generation + HMAC-SHA384/512 (fused kernels).
+// ===========================================================================
+
+struct Hs512MarkovParams {
+    uint64 target_signature[8];
+    uint32 message_length;
+    uint32 candidate_count;
+    uint32 pw_length;
+    uint32 threshold;
+    uint64 offset;
+};
+
+extern "C" __global__ void hs384_markov(
+    const Hs512MarkovParams* __restrict__ params,
+    const uint8* __restrict__ message_bytes,
+    const uint8* __restrict__ markov_table,
+    uint32* __restrict__ result_index
+) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= params->candidate_count) return;
+
+    const uint32 T = params->threshold;
+    const uint32 len = params->pw_length;
+    uint64 idx = params->offset + (uint64)(gid);
+
+    uint8 candidate[128];
+    uint8 prev = 0;
+    for (uint32 pos = 0; pos < len; ++pos) {
+        uint32 rank = (uint32)(idx % (uint64)(T));
+        idx /= (uint64)(T);
+        uint32 table_idx = (pos * 256u + (uint32)(prev)) * T + rank;
+        candidate[pos] = markov_table[table_idx];
+        prev = candidate[pos];
+    }
+
+    uint64 kw[16];
+    load_key_words_64(candidate, len, kw);
+    if (hmac_sha384_from_key_words(kw, message_bytes, params->message_length,
+                                    params->target_signature)) {
+        atomicMin(result_index, gid);
+    }
+}
+
+extern "C" __global__ void hs512_markov(
+    const Hs512MarkovParams* __restrict__ params,
+    const uint8* __restrict__ message_bytes,
+    const uint8* __restrict__ markov_table,
+    uint32* __restrict__ result_index
+) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= params->candidate_count) return;
+
+    const uint32 T = params->threshold;
+    const uint32 len = params->pw_length;
+    uint64 idx = params->offset + (uint64)(gid);
+
+    uint8 candidate[128];
+    uint8 prev = 0;
+    for (uint32 pos = 0; pos < len; ++pos) {
+        uint32 rank = (uint32)(idx % (uint64)(T));
+        idx /= (uint64)(T);
+        uint32 table_idx = (pos * 256u + (uint32)(prev)) * T + rank;
+        candidate[pos] = markov_table[table_idx];
+        prev = candidate[pos];
+    }
+
+    uint64 kw[16];
+    load_key_words_64(candidate, len, kw);
+    if (hmac_sha512_from_key_words(kw, message_bytes, params->message_length,
+                                    params->target_signature)) {
+        atomicMin(result_index, gid);
+    }
+}

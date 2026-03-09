@@ -922,3 +922,61 @@ extern "C" __global__ void aeskw_wordlist_short_keys(
         atomicMin(result_index, gid);
     }
 }
+
+// ===========================================================================
+// Markov chain candidate generation + AES Key Wrap (fused kernel).
+// ===========================================================================
+
+struct AesKwMarkovParams {
+    unsigned int encrypted_key_len;
+    unsigned int n_blocks;
+    unsigned int candidate_count;
+    unsigned int pw_length;
+    unsigned int threshold;
+    unsigned int _pad;
+    uint64_t offset;
+};
+
+extern "C" __global__ void aeskw_markov(
+    const AesKwMarkovParams* __restrict__ params,
+    const unsigned char* __restrict__ encrypted_key,
+    const unsigned char* __restrict__ markov_table,
+    unsigned int* __restrict__ result_index
+) {
+    unsigned int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gid >= params->candidate_count) return;
+
+    const unsigned int T = params->threshold;
+    const unsigned int len = params->pw_length;
+    uint64_t idx = params->offset + (uint64_t)(gid);
+
+    // Generate candidate in thread-local registers.
+    unsigned char candidate[64];
+    unsigned char prev = 0;
+    for (unsigned int pos = 0; pos < len; ++pos) {
+        unsigned int rank = (unsigned int)(idx % (uint64_t)(T));
+        idx /= (uint64_t)(T);
+        unsigned int table_idx = (pos * 256u + (unsigned int)(prev)) * T + rank;
+        candidate[pos] = markov_table[table_idx];
+        prev = candidate[pos];
+    }
+
+    // Derive AES key from candidate.
+    unsigned char aes_key[AES_KEY_BYTES];
+    if (len <= (unsigned int)(AES_KEY_BYTES)) {
+        #pragma unroll
+        for (unsigned int i = 0; i < AES_KEY_BYTES; ++i) aes_key[i] = 0u;
+        for (unsigned int i = 0; i < len; ++i)
+            aes_key[i] = candidate[i];
+    } else {
+        sha256_derive_key(candidate, len, aes_key);
+    }
+
+    // Expand and try unwrap.
+    unsigned int round_keys[AES_RK_WORDS];
+    aes_key_expand(aes_key, round_keys);
+
+    if (try_key_unwrap(round_keys, encrypted_key, params->n_blocks)) {
+        atomicMin(result_index, gid);
+    }
+}

@@ -188,6 +188,65 @@ pub(crate) trait GpuBruteForcer {
 }
 
 // ---------------------------------------------------------------------------
+// GpuMarkovBruteForcer trait
+// ---------------------------------------------------------------------------
+
+/// GPU dispatch interface for Markov chain candidate generation.
+///
+/// Unlike `GpuBruteForcer` which receives pre-packed candidate buffers from a
+/// wordlist producer, this trait dispatches fused generate+hash kernels where
+/// the GPU generates candidates from a Markov model and immediately hashes them.
+///
+/// Separate from `GpuBruteForcer` because there is no `WordBatch` — the Markov
+/// keyspace is enumerated directly by (length, offset, count) parameters.
+pub(crate) trait GpuMarkovBruteForcer {
+    /// Human-readable GPU device name.
+    fn device_name(&self) -> &str;
+
+    /// SIMD lane count (Metal thread execution width / CUDA warp size).
+    fn thread_execution_width(&self) -> usize;
+
+    /// Hardware maximum threads per threadgroup / block.
+    fn max_total_threads_per_threadgroup(&self) -> usize;
+
+    /// Current threadgroup width setting.
+    fn current_threadgroup_width(&self) -> usize;
+
+    /// Validate and apply a threadgroup width override.
+    fn set_threadgroup_width(&mut self, requested: usize) -> anyhow::Result<()>;
+
+    /// Dispatch a Markov batch: generate `count` candidates of `length` bytes
+    /// starting from `offset` in the keyspace, hash each, compare to target.
+    ///
+    /// `threshold` is the Markov T parameter (ranked successors per context).
+    ///
+    /// Returns command handle plus (host_prep, encode) durations.
+    fn encode_and_commit_markov(
+        &self,
+        target_data: &[u8],
+        length: u32,
+        threshold: u32,
+        offset: u64,
+        count: u32,
+    ) -> anyhow::Result<(GpuCommandHandle, Duration, Duration)>;
+
+    /// Block until the command completes and read the result.
+    /// Returns `Some(batch_local_index)` on match, `None` otherwise.
+    fn wait_and_readback(
+        &self,
+        handle: &GpuCommandHandle,
+    ) -> (Option<u32>, Duration, Duration);
+
+    /// Benchmark threadgroup widths on a small Markov dispatch and keep the fastest.
+    fn autotune_markov(
+        &mut self,
+        target_data: &[u8],
+        length: u32,
+        threshold: u32,
+    ) -> anyhow::Result<()>;
+}
+
+// ---------------------------------------------------------------------------
 // Platform type aliases
 //
 // Shared code (batch.rs, producer.rs, parser.rs) uses these aliases instead

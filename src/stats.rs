@@ -233,6 +233,29 @@ pub(crate) fn format_duration_millis(duration: Duration) -> String {
     format!("{:.1}", duration.as_secs_f64() * 1_000.0)
 }
 
+/// Format a duration as a compact human-readable ETA string.
+///
+/// Examples: "0s", "42s", "3m 12s", "1h 5m", "2d 3h".
+pub(crate) fn format_eta(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    if total_secs < 60 {
+        return format!("{total_secs}s");
+    }
+    let minutes = total_secs / 60;
+    let secs = total_secs % 60;
+    if minutes < 60 {
+        return format!("{minutes}m {secs}s");
+    }
+    let hours = minutes / 60;
+    let mins = minutes % 60;
+    if hours < 24 {
+        return format!("{hours}h {mins}m");
+    }
+    let days = hours / 24;
+    let hrs = hours % 24;
+    format!("{days}d {hrs}h")
+}
+
 /// Render large counts/rates in a stable human-readable format so benchmark logs
 /// remain easy to scan while still preserving approximate magnitude.
 ///
@@ -412,5 +435,14 @@ mod tests {
             saturating_duration_sub(Duration::from_millis(10), Duration::from_millis(25)),
             Duration::ZERO
         );
+    }
+
+    #[test]
+    fn format_eta_covers_all_ranges() {
+        assert_eq!(format_eta(Duration::from_secs(0)), "0s");
+        assert_eq!(format_eta(Duration::from_secs(42)), "42s");
+        assert_eq!(format_eta(Duration::from_secs(192)), "3m 12s");
+        assert_eq!(format_eta(Duration::from_secs(3900)), "1h 5m");
+        assert_eq!(format_eta(Duration::from_secs(97200)), "1d 3h");
     }
 }

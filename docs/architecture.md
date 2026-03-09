@@ -1,8 +1,10 @@
 # Jotcrack Architecture: GPU Abstraction & Pipeline
 
-Jotcrack is a GPU-accelerated JWT/JWE secret cracker for macOS (Metal) and Linux (CUDA). It processes massive wordlists (100+ GB) by memory-mapping files, parsing in parallel, and double-buffering GPU dispatch so the CPU and GPU never wait on each other.
+Jotcrack is a GPU-accelerated JWT/JWE secret cracker for macOS (Metal) and Linux (CUDA). Two attack modes: **wordlist** — processes massive wordlists (100+ GB) by memory-mapping files, parsing in parallel, and double-buffering GPU dispatch; **Markov** — trains a character-level bigram model and enumerates candidates directly on the GPU with fused generate+hash kernels.
 
-**Performance:** 793M candidates/s for HS256 on NVIDIA RTX PRO 6000 (CUDA), 446M/s on Apple M4 Max (Metal). 145M/s for A128KW on RTX PRO 6000, 120M/s on M4 Max.
+**Wordlist performance:** 793M candidates/s for HS256 on NVIDIA RTX PRO 6000 (CUDA), 446M/s on Apple M4 Max (Metal). 145M/s for A128KW on RTX PRO 6000, 120M/s on M4 Max.
+
+**Markov performance (M4 Max, T=30):** 394M/s for HS256, 128M/s for A128KW. Expands guess space ~47,000× beyond rockyou.txt while remaining feasible in minutes.
 
 ---
 
@@ -103,6 +105,30 @@ pub(crate) trait GpuBruteForcer {
 | `wait_and_readback()` | Block until the GPU finishes, then read the result buffer. Returns `Some(match_index)` if a candidate matched, or `None`. Also returns (gpu_wait, readback) durations. |
 | `autotune_threadgroup_width()` | Benchmark different threadgroup/block widths on the first batch to find the optimal configuration for the current device. |
 
+### The `GpuMarkovBruteForcer` Trait
+
+The Markov mode uses a separate trait because there's no `WordBatch` — candidates are generated on the GPU from keyspace indices:
+
+```rust
+pub(crate) trait GpuMarkovBruteForcer {
+    fn device_name(&self) -> &str;
+    fn current_threadgroup_width(&self) -> usize;
+    fn set_threadgroup_width(&mut self, requested: usize) -> anyhow::Result<()>;
+    fn encode_and_commit_markov(
+        &self, target: &[u8], length: u32, offset: u64, count: u32,
+    ) -> anyhow::Result<(GpuCommandHandle, Duration, Duration)>;
+    fn wait_and_readback(&self, handle: &GpuCommandHandle) -> (Option<u32>, Duration, Duration);
+    fn autotune_markov(
+        &mut self, target_data: &[u8], length: u32, threshold: u32,
+    ) -> anyhow::Result<()>;
+}
+```
+
+| Method | Purpose |
+|--------|---------|
+| `encode_and_commit_markov()` | Dispatch a batch of `count` candidates starting at `offset` in the keyspace for a given `length`. Each GPU thread decodes its index, walks the Markov chain, hashes, and compares. |
+| `autotune_markov()` | Benchmark threadgroup/block widths on a small 16K-candidate Markov dispatch. |
+
 ### Platform Type Aliases
 
 ```rust
@@ -179,6 +205,12 @@ pub(crate) struct MetalAesKwBruteForcer {
 }
 ```
 
+### MetalMarkovHmacBruteForcer / MetalMarkovAesKwBruteForcer
+
+Markov mode backends for Metal. Each holds a single compiled pipeline (one Markov entry point per algorithm) plus a `markov_table_buf` containing the pre-trained lookup table uploaded once at init. No word batch buffers are needed — candidates are generated in-kernel from keyspace indices.
+
+The dispatch loop passes `(length, offset, count)` parameters. Each GPU thread decodes `batch_offset + gid` into per-position rank selections via repeated `idx % threshold` / `idx / threshold`, walks the Markov chain in registers, and immediately hashes the result.
+
 ### Buffer Slot Assignments (Metal)
 
 Both Metal backends bind six Metal buffers to fixed slot indices:
@@ -209,6 +241,10 @@ Uses NVRTC to compile embedded `.cu` kernel sources to PTX at startup. The wordl
 ### CudaAesKwBruteForcer (JWE AES Key Wrap)
 
 Same architecture as `CudaBruteForcer`, but for AES Key Wrap. The kernel source is compiled three times with different `AES_KEY_BYTES` defines, producing specialised kernels for each key size.
+
+### CudaMarkovHmacBruteForcer / CudaMarkovAesKwBruteForcer
+
+CUDA Markov backends. Same fused-kernel architecture as Metal — each thread decodes a keyspace index, walks the Markov chain, hashes, and compares. The Markov table is uploaded to global memory with `const __restrict__` (L2 cache handles it; the table may exceed the 64 KB `__constant__` limit). Uses `UnsafeCell` for interior mutability (same pattern as `CudaBruteForcer`).
 
 ### Two-Kernel Strategy (Both Backends)
 
@@ -498,11 +534,23 @@ Compiled three times with different `#define AES_KEY_BYTES` values (16, 24, 32):
 - S-boxes in `constant` (Metal) / `__constant__` (CUDA) address space (hardware-cached, broadcast across SIMD groups/warps)
 - GF(2^8) arithmetic via `xtime` helper avoids extra lookup tables
 
+### Markov Kernels (fused entry points in the same `.metal`/`.cu` files)
+
+Each kernel file contains both wordlist and Markov entry points. The Markov kernels reuse the same hash/unwrap primitives but replace the wordlist-lookup candidate loading with in-register Markov chain generation:
+
+1. Decode global keyspace index via repeated `idx % T` / `idx / T`
+2. Walk the Markov chain: `candidate[pos] = table[(pos*256 + prev)*T + rank]`
+3. Load key words (using a `thread`-address-space variant of `load_key_words` on Metal — the only new helper needed)
+4. Hash/unwrap and compare — same as wordlist kernels from this point
+
+The Markov table (200 KB for T=50, L=16) is bound as a separate buffer. On Metal it uses `device const` address space; on CUDA it uses global memory with `const __restrict__` for L2 caching.
+
 ### CUDA-Specific Details
 
 - **Unified address space**: CUDA's flat global memory model eliminates the need for Metal-style duplicate helper functions across `device`/`constant`/`threadgroup` address spaces.
 - **`__constant__` memory**: SHA round constants and AES S-box tables use CUDA's dedicated 64KB constant cache, which broadcasts reads to all 32 threads in a warp simultaneously.
 - **NVRTC runtime compilation**: Kernel sources are compiled to PTX at startup via NVIDIA's Runtime Compilation library. Compute capability is auto-detected for architecture-specific codegen.
+- **Markov table in global memory**: The table may exceed the 64 KB `__constant__` limit, so it uses global memory with `const __restrict__` — L2 cache handles the repeated lookups efficiently.
 
 ---
 
@@ -524,6 +572,62 @@ Windowed rate reporting prints throughput every second. The final report shows b
 
 ---
 
+## 10. Markov Chain Mode (`src/markov.rs`, `src/runner.rs`)
+
+The Markov mode bypasses the entire wordlist pipeline (parser, producer, batch system, double-buffering) and instead enumerates candidates directly on the GPU.
+
+### Markov Model (Order-1 Bigram)
+
+**Training** (`train_from_file`): Single pass over the wordlist counting `freq[position][prev_char][next_char]`. Position 0 uses `prev_char=0` as the start-of-word sentinel. The raw frequency counts are stored as a flat `u32[max_positions][256][256]` array.
+
+**Auto-caching**: On first run, raw frequency counts are saved to `<wordlist>.markov` (4 MB for max_len=16). Subsequent runs load the cache in ~0ms. Changing `--threshold` or `--max-len` re-derives the ranked table from cached counts — no retraining needed. `--retrain` forces a re-scan.
+
+**GPU table**: `ranked_table(threshold)` sorts each (position, prev_char) bucket by frequency, keeps the top-T characters, and packs them into a flat `u8` array indexed as `table[(pos * 256 + prev_char) * T + rank]`. For T=50, max_len=16: 200 KB — fits easily in GPU cache.
+
+### Fused Generate+Hash Kernels
+
+Each GPU thread generates and evaluates one candidate entirely in registers:
+
+```
+gid → global keyspace index
+prev = 0  (start-of-word sentinel)
+for each position:
+    rank = idx % threshold
+    idx /= threshold
+    candidate[pos] = table[(pos*256 + prev)*T + rank]
+    prev = candidate[pos]
+→ hash candidate → compare with target → atomic write on match
+```
+
+No intermediate candidate buffer, no memory traffic for generated passwords. The only GPU memory reads are the Markov table lookups (cached in L2/constant cache) and the algorithm-specific constants (SHA round constants, AES S-boxes).
+
+### Dispatch Loop
+
+Unlike wordlist mode's double-buffered producer-consumer pipeline, Markov dispatch is a simple synchronous loop:
+
+```rust
+for length in min_len..=max_len {
+    let total = threshold.pow(length);
+    for offset in (0..total).step_by(6_000_000) {
+        let count = min(6M, total - offset);
+        gpu.encode_and_commit_markov(target, length, offset, count);
+        gpu.wait_and_readback();
+    }
+}
+```
+
+Host prep is ~32 bytes (params struct), taking microseconds — so double-buffering would add complexity without meaningful benefit.
+
+### Progress Reporting
+
+Because the total keyspace is known upfront (`T^min_len + T^(min_len+1) + ... + T^max_len`), Markov mode reports real-time progress percentage and ETA alongside the windowed rate. The wordlist path passes `None` for `total_keyspace` since the wordlist size isn't known in the streaming pipeline.
+
+### Result Reconstruction
+
+On a GPU match, the CPU calls `model.candidate_from_index(length, offset + local_index)` to recover the password string — the same Markov walk logic as the kernel, just in Rust instead of shader code.
+
+---
+
 ## Summary: Why It's Fast
 
 | Technique | Benefit |
@@ -542,3 +646,7 @@ Windowed rate reporting prints throughput every second. The final report shows b
 | **Bounded backpressure** | Memory usage capped at `pipeline_depth × ~80 MiB` |
 | **Compile-time shader specialization** | Dead-code elimination and exact register allocation per algorithm |
 | **Autotune threadgroup/block width** | Benchmark optimal GPU parallelism on first batch |
+| **Fused Markov kernels** | Generate + hash + compare in registers — no memory traffic for candidates |
+| **Markov model auto-caching** | 4 MB binary cache loads in ~0ms; re-derive ranked tables for any threshold without retraining |
+| **Synchronous Markov dispatch** | Zero host overhead (32-byte params struct) eliminates need for pipeline complexity |
+| **Known keyspace → progress/ETA** | Real-time completion tracking since T^L is computed upfront |

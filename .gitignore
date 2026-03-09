@@ -18,3 +18,4 @@ jwe_*
 # Wordlist metadata
 wordlists.txt
 bench_results
+*.markov

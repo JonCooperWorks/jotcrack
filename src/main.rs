@@ -20,6 +20,7 @@ mod batch;
 mod commands;
 mod gpu;
 mod jwt;
+mod markov;
 #[cfg_attr(all(target_os = "linux", not(test)), allow(dead_code))]
 mod parser;
 mod producer;

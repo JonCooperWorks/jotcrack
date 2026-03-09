@@ -706,3 +706,77 @@ kernel void hs256_wordlist_short_keys(
         atomic_fetch_min_explicit(result_index, gid, memory_order_relaxed);
     }
 }
+
+// ===========================================================================
+// Markov chain candidate generation + HMAC-SHA256 (fused kernel).
+//
+// Each GPU thread decodes a global keyspace index into per-position rank
+// selections via modular arithmetic, walks an order-1 Markov chain using a
+// pre-trained lookup table, and immediately computes HMAC-SHA256 on the
+// generated candidate — no intermediate candidate buffer or memory traffic.
+//
+// The Markov table is in `constant` address space: all threads read the same
+// table, and Metal's constant cache broadcasts reads efficiently.
+// ===========================================================================
+
+struct Hs256MarkovParams {
+    uint32_t target_signature[8];
+    uint32_t message_length;
+    uint32_t candidate_count;
+    uint32_t pw_length;        // password length for this batch (all candidates same length)
+    uint32_t threshold;        // T: number of ranked successors per (pos, prev_char) context
+    uint64_t offset;           // starting index in the keyspace for this batch
+};
+
+// Thread-address-space variant of load_key_words.
+// Identical logic to load_key_words but reads from `thread` instead of `device`.
+static inline void load_key_words_thread(thread const uint8_t* key, uint32_t key_len, thread uint32_t kw[16]) {
+    #pragma unroll
+    for (uint i = 0; i < 16; ++i) kw[i] = 0u;
+
+    const uint32_t full_words = key_len >> 2;
+    for (uint32_t i = 0; i < full_words; ++i)
+        kw[i] = load_be_u32(key + i * 4u);
+
+    const uint32_t remaining = key_len & 3u;
+    if (remaining > 0u) {
+        uint32_t val = 0u;
+        thread const uint8_t* tail = key + (full_words * 4u);
+        for (uint32_t i = 0; i < remaining; ++i)
+            val |= uint32_t(tail[i]) << (24u - 8u * i);
+        kw[full_words] = val;
+    }
+}
+
+kernel void hs256_markov(
+    constant Hs256MarkovParams& params [[buffer(0)]],
+    constant const uint8_t* message_bytes [[buffer(1)]],
+    constant const uint8_t* markov_table [[buffer(2)]],
+    device atomic_uint* result_index [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.candidate_count) return;
+
+    const uint32_t T = params.threshold;
+    const uint32_t len = params.pw_length;
+    uint64_t idx = params.offset + uint64_t(gid);
+
+    // Generate candidate in thread-local registers.
+    uint8_t candidate[64];
+    uint8_t prev = 0; // start-of-word sentinel
+    for (uint32_t pos = 0; pos < len; ++pos) {
+        uint32_t rank = uint32_t(idx % uint64_t(T));
+        idx /= uint64_t(T);
+        uint32_t table_idx = (pos * 256u + uint32_t(prev)) * T + rank;
+        candidate[pos] = markov_table[table_idx];
+        prev = candidate[pos];
+    }
+
+    // Hash and compare using the flat HMAC path (always short-key since len <= 64).
+    uint32_t kw[16];
+    load_key_words_thread(candidate, len, kw);
+    if (hmac_sha256_from_key_words(kw, message_bytes, params.message_length,
+                                    params.target_signature)) {
+        atomic_fetch_min_explicit(result_index, gid, memory_order_relaxed);
+    }
+}

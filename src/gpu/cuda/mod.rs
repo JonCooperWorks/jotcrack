@@ -60,7 +60,7 @@ use cudarc::nvrtc::{self, CompileOptions};
 use crate::batch::{MAX_CANDIDATES_PER_BATCH, WordBatch};
 use crate::stats::{BatchDispatchTimings, format_human_count};
 
-use super::{AesKwVariant, GpuBruteForcer, HmacVariant};
+use super::{AesKwVariant, GpuBruteForcer, GpuMarkovBruteForcer, HmacVariant};
 
 // ---------------------------------------------------------------------------
 // Embedded kernel sources
@@ -135,6 +135,43 @@ struct AesKwBruteForceParams {
     candidate_count: u32,
 }
 unsafe impl DeviceRepr for AesKwBruteForceParams {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Hs256MarkovParams {
+    target_signature: [u32; 8],
+    message_length: u32,
+    candidate_count: u32,
+    pw_length: u32,
+    threshold: u32,
+    offset: u64,
+}
+unsafe impl DeviceRepr for Hs256MarkovParams {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Hs512MarkovParams {
+    target_signature: [u64; 8],
+    message_length: u32,
+    candidate_count: u32,
+    pw_length: u32,
+    threshold: u32,
+    offset: u64,
+}
+unsafe impl DeviceRepr for Hs512MarkovParams {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct AesKwMarkovParams {
+    encrypted_key_len: u32,
+    n_blocks: u32,
+    candidate_count: u32,
+    pw_length: u32,
+    threshold: u32,
+    _pad: u32,
+    offset: u64,
+}
+unsafe impl DeviceRepr for AesKwMarkovParams {}
 
 // ---------------------------------------------------------------------------
 // Platform types — used by batch.rs, producer.rs via type aliases
@@ -317,6 +354,34 @@ fn compile_and_load(
         .load_function(fn_short)
         .map_err(|e| anyhow!("failed to load CUDA function '{fn_short}': {e}"))?;
     Ok((module, func_mixed, func_short))
+}
+
+/// Compile CUDA source to PTX and load a single named kernel function.
+/// Used for Markov kernels which have only one entry point (no mixed/short split).
+fn compile_and_load_single(
+    ctx: &Arc<CudaContext>,
+    source: &str,
+    fn_name: &str,
+    extra_opts: &[String],
+) -> anyhow::Result<(Arc<cudarc::driver::CudaModule>, CudaFunction)> {
+    let mut opts = CompileOptions {
+        options: extra_opts.to_vec(),
+        ..Default::default()
+    };
+    if let Ok((major, minor)) = ctx.compute_capability() {
+        opts.arch = None;
+        opts.options
+            .push(format!("--gpu-architecture=compute_{major}{minor}"));
+    }
+    let ptx = nvrtc::compile_ptx_with_opts(source, opts)
+        .map_err(|e| anyhow!("NVRTC compilation failed: {e}"))?;
+    let module = ctx
+        .load_module(ptx)
+        .map_err(|e| anyhow!("failed to load CUDA module: {e}"))?;
+    let func = module
+        .load_function(fn_name)
+        .map_err(|e| anyhow!("failed to load CUDA function '{fn_name}': {e}"))?;
+    Ok((module, func))
 }
 
 // ---------------------------------------------------------------------------
@@ -1193,6 +1258,386 @@ impl GpuBruteForcer for CudaAesKwBruteForcer {
                 best_width,
                 format_human_count(best_rate)
             );
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CudaMarkovHmacBruteForcer — Markov + HMAC-SHA
+// ---------------------------------------------------------------------------
+
+/// CUDA compute backend for Markov chain + HMAC-SHA cracking.
+///
+/// Each GPU thread decodes a global keyspace index into per-position rank
+/// selections, walks an order-1 Markov chain using the pre-trained lookup
+/// table, and immediately computes HMAC-SHA on the generated candidate.
+/// The candidate never leaves registers — no intermediate buffer is needed.
+///
+/// ## Interior mutability via `UnsafeCell`
+///
+/// Same pattern as `CudaBruteForcer`: the `GpuMarkovBruteForcer` trait's
+/// `encode_and_commit_markov` takes `&self`, but CUDA dispatch requires
+/// mutable access to device buffers (for `memcpy_htod`). Safety is
+/// guaranteed by the runner's single-dispatch-at-a-time invariant.
+pub(crate) struct CudaMarkovHmacBruteForcer {
+    variant: HmacVariant,
+    #[allow(dead_code)]
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    _module: Arc<cudarc::driver::CudaModule>,
+    func: CudaFunction,
+    d_params: UnsafeCell<CudaSlice<u8>>,
+    d_message: CudaSlice<u8>,
+    d_markov_table: CudaSlice<u8>,
+    d_result: UnsafeCell<CudaSlice<u32>>,
+    message_length: u32,
+    threadgroup_width: usize,
+    device_name: String,
+    max_threads_per_block: usize,
+}
+
+unsafe impl Send for CudaMarkovHmacBruteForcer {}
+
+impl CudaMarkovHmacBruteForcer {
+    pub(crate) fn new(
+        variant: HmacVariant,
+        signing_input: &[u8],
+        markov_table: &[u8],
+    ) -> anyhow::Result<Self> {
+        let ctx = CudaContext::new(0)
+            .map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
+        let stream = ctx
+            .new_stream()
+            .map_err(|e| anyhow!("failed to create CUDA stream: {e}"))?;
+        let device_name = ctx
+            .name()
+            .unwrap_or_else(|_| "unknown CUDA device".into());
+
+        let (source, fn_name) = match variant {
+            HmacVariant::Hs256 => (CUDA_SOURCE_HS256, "hs256_markov"),
+            HmacVariant::Hs384 => (CUDA_SOURCE_HS512, "hs384_markov"),
+            HmacVariant::Hs512 => (CUDA_SOURCE_HS512, "hs512_markov"),
+        };
+        let (module, func) = compile_and_load_single(&ctx, source, fn_name, &[])?;
+
+        let max_threads_per_block = ctx
+            .attribute(cudarc::driver::sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)
+            .map(|v| v as usize)
+            .unwrap_or(1024);
+        let threadgroup_width = 256usize.min(max_threads_per_block.max(1));
+        let message_length =
+            u32::try_from(signing_input.len()).context("JWT signing input too long")?;
+
+        let params_size = match variant {
+            HmacVariant::Hs256 => std::mem::size_of::<Hs256MarkovParams>(),
+            HmacVariant::Hs384 | HmacVariant::Hs512 => std::mem::size_of::<Hs512MarkovParams>(),
+        };
+        let d_params = stream.alloc_zeros::<u8>(params_size)
+            .map_err(|e| anyhow!("failed to alloc params buffer: {e}"))?;
+        let d_message = stream.clone_htod(signing_input)
+            .map_err(|e| anyhow!("failed to copy signing input to device: {e}"))?;
+        let d_markov_table = stream.clone_htod(markov_table)
+            .map_err(|e| anyhow!("failed to copy Markov table to device: {e}"))?;
+        let d_result = stream.alloc_zeros::<u32>(1)
+            .map_err(|e| anyhow!("failed to alloc result buffer: {e}"))?;
+
+        Ok(Self {
+            variant, ctx, stream, _module: module, func,
+            d_params: UnsafeCell::new(d_params),
+            d_message, d_markov_table,
+            d_result: UnsafeCell::new(d_result),
+            message_length, threadgroup_width, device_name, max_threads_per_block,
+        })
+    }
+
+    fn write_markov_params(&self, target_signature: &[u8], candidate_count: u32,
+                           pw_length: u32, threshold: u32, offset: u64) -> anyhow::Result<()> {
+        let d_params = unsafe { &mut *self.d_params.get() };
+        match self.variant {
+            HmacVariant::Hs256 => {
+                let mut target_words = [0u32; 8];
+                for i in 0..8 {
+                    let off = i * 4;
+                    target_words[i] = u32::from_be_bytes(target_signature[off..off + 4].try_into().unwrap());
+                }
+                let params = Hs256MarkovParams {
+                    target_signature: target_words, message_length: self.message_length,
+                    candidate_count, pw_length, threshold, offset,
+                };
+                self.stream.memcpy_htod(bytes_of(&params), d_params)
+                    .map_err(|e| anyhow!("failed to copy Markov params: {e}"))?;
+            }
+            HmacVariant::Hs384 | HmacVariant::Hs512 => {
+                let wc = if self.variant == HmacVariant::Hs384 { 6 } else { 8 };
+                let mut target_words = [0u64; 8];
+                for i in 0..wc {
+                    let off = i * 8;
+                    target_words[i] = u64::from_be_bytes(target_signature[off..off + 8].try_into().unwrap());
+                }
+                let params = Hs512MarkovParams {
+                    target_signature: target_words, message_length: self.message_length,
+                    candidate_count, pw_length, threshold, offset,
+                };
+                self.stream.memcpy_htod(bytes_of(&params), d_params)
+                    .map_err(|e| anyhow!("failed to copy Markov params: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GpuMarkovBruteForcer for CudaMarkovHmacBruteForcer {
+    fn device_name(&self) -> &str { &self.device_name }
+    fn thread_execution_width(&self) -> usize { 32 }
+    fn max_total_threads_per_threadgroup(&self) -> usize { self.max_threads_per_block }
+    fn current_threadgroup_width(&self) -> usize { self.threadgroup_width }
+
+    fn set_threadgroup_width(&mut self, requested: usize) -> anyhow::Result<()> {
+        if requested == 0 { bail!("--threads-per-group must be > 0"); }
+        if requested > self.max_threads_per_block {
+            bail!("--threads-per-group {} exceeds max {}", requested, self.max_threads_per_block);
+        }
+        self.threadgroup_width = requested;
+        Ok(())
+    }
+
+    fn encode_and_commit_markov(&self, target_data: &[u8], length: u32, threshold: u32,
+                                 offset: u64, count: u32)
+        -> anyhow::Result<(super::GpuCommandHandle, Duration, Duration)>
+    {
+        if count == 0 { bail!("cannot encode empty Markov batch"); }
+        let prep_started = Instant::now();
+        self.write_markov_params(target_data, count, length, threshold, offset)?;
+        let d_result = unsafe { &mut *self.d_result.get() };
+        self.stream.memcpy_htod(&[RESULT_NOT_FOUND_SENTINEL], d_result)
+            .map_err(|e| anyhow!("failed to reset result: {e}"))?;
+        let host_prep = prep_started.elapsed();
+
+        let encode_started = Instant::now();
+        let grid_dim = (count + self.threadgroup_width as u32 - 1) / self.threadgroup_width as u32;
+        let config = LaunchConfig {
+            grid_dim: (grid_dim.max(1), 1, 1),
+            block_dim: (self.threadgroup_width as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let d_params = unsafe { &*self.d_params.get() };
+        let d_result = unsafe { &mut *self.d_result.get() };
+        unsafe {
+            self.stream.launch_builder(&self.func)
+                .arg(d_params).arg(&self.d_message)
+                .arg(&self.d_markov_table).arg(d_result)
+                .launch(config)?;
+        }
+        let command_encode = encode_started.elapsed();
+        Ok((CudaCommandHandle, host_prep, command_encode))
+    }
+
+    fn wait_and_readback(&self, _handle: &super::GpuCommandHandle) -> (Option<u32>, Duration, Duration) {
+        let gpu_wait_started = Instant::now();
+        let _ = self.stream.synchronize();
+        let gpu_wait = gpu_wait_started.elapsed();
+        let readback_started = Instant::now();
+        let d_result = unsafe { &*self.d_result.get() };
+        let result_vec = self.stream.clone_dtoh(d_result)
+            .unwrap_or_else(|_| vec![RESULT_NOT_FOUND_SENTINEL]);
+        let result = result_vec.first().copied().unwrap_or(RESULT_NOT_FOUND_SENTINEL);
+        let _ = self.stream.synchronize();
+        let result_readback = readback_started.elapsed();
+        let maybe_match = if result == RESULT_NOT_FOUND_SENTINEL { None } else { Some(result) };
+        (maybe_match, gpu_wait, result_readback)
+    }
+
+    fn autotune_markov(&mut self, target_data: &[u8], length: u32, threshold: u32) -> anyhow::Result<()> {
+        const SAMPLE_COUNT: u32 = 16_384;
+        let max_threads = self.max_threads_per_block;
+        let mut candidates = vec![32, 64, 128, 256, 512, 1024];
+        candidates.retain(|&v| v > 0 && v <= max_threads);
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() { return Ok(()); }
+
+        eprintln!("AUTOTUNE: benchmarking {} Markov candidates across {} block sizes", SAMPLE_COUNT, candidates.len());
+        let mut best: Option<(usize, f64)> = None;
+        for width in &candidates {
+            self.threadgroup_width = *width;
+            let (handle, _, _) = self.encode_and_commit_markov(target_data, length, threshold, 0, SAMPLE_COUNT)?;
+            let (_, gpu_wait, _) = self.wait_and_readback(&handle);
+            if gpu_wait.is_zero() { continue; }
+            let rate = SAMPLE_COUNT as f64 / gpu_wait.as_secs_f64();
+            match best {
+                Some((_, best_rate)) if rate <= best_rate => {}
+                _ => best = Some((*width, rate)),
+            }
+        }
+        if let Some((best_width, best_rate)) = best {
+            self.threadgroup_width = best_width;
+            eprintln!("AUTOTUNE: selected --threads-per-group {} ({}/s sample)", best_width, format_human_count(best_rate));
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CudaMarkovAesKwBruteForcer — Markov + AES Key Wrap
+// ---------------------------------------------------------------------------
+
+/// CUDA compute backend for Markov chain + AES Key Wrap cracking.
+///
+/// Same fused-kernel approach as `CudaMarkovHmacBruteForcer` but for JWE
+/// tokens using A128KW/A192KW/A256KW. The shader is compiled with
+/// `-DAES_KEY_BYTES=N` for compile-time specialisation per variant.
+///
+/// The encrypted key is uploaded once at construction. Subsequent dispatches
+/// only update the params struct (length, offset, count, threshold).
+pub(crate) struct CudaMarkovAesKwBruteForcer {
+    #[allow(dead_code)]
+    ctx: Arc<CudaContext>,
+    stream: Arc<CudaStream>,
+    _module: Arc<cudarc::driver::CudaModule>,
+    func: CudaFunction,
+    d_params: UnsafeCell<CudaSlice<u8>>,
+    d_encrypted_key: CudaSlice<u8>,
+    d_markov_table: CudaSlice<u8>,
+    d_result: UnsafeCell<CudaSlice<u32>>,
+    encrypted_key_len: u32,
+    n_blocks: u32,
+    threadgroup_width: usize,
+    device_name: String,
+    max_threads_per_block: usize,
+}
+
+unsafe impl Send for CudaMarkovAesKwBruteForcer {}
+
+impl CudaMarkovAesKwBruteForcer {
+    pub(crate) fn new(variant: AesKwVariant, encrypted_key: &[u8], n_blocks: usize,
+                      markov_table: &[u8]) -> anyhow::Result<Self> {
+        let ctx = CudaContext::new(0)
+            .map_err(|e| anyhow!("failed to create CUDA context: {e}"))?;
+        let stream = ctx.new_stream()
+            .map_err(|e| anyhow!("failed to create CUDA stream: {e}"))?;
+        let device_name = ctx.name().unwrap_or_else(|_| "unknown CUDA device".into());
+        let key_bytes_define = format!("-DAES_KEY_BYTES={}", variant.key_bytes());
+        let (module, func) = compile_and_load_single(&ctx, CUDA_SOURCE_AESKW, "aeskw_markov", &[key_bytes_define])?;
+        let max_threads_per_block = ctx
+            .attribute(cudarc::driver::sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)
+            .map(|v| v as usize).unwrap_or(1024);
+        let threadgroup_width = 256usize.min(max_threads_per_block.max(1));
+        let encrypted_key_len = u32::try_from(encrypted_key.len()).context("encrypted_key too long")?;
+        let n_blocks_u32 = u32::try_from(n_blocks).context("n_blocks exceeds u32")?;
+
+        let d_params = stream.alloc_zeros::<u8>(std::mem::size_of::<AesKwMarkovParams>())
+            .map_err(|e| anyhow!("failed to alloc params: {e}"))?;
+        let d_encrypted_key = stream.clone_htod(encrypted_key)
+            .map_err(|e| anyhow!("failed to copy encrypted_key: {e}"))?;
+        let d_markov_table = stream.clone_htod(markov_table)
+            .map_err(|e| anyhow!("failed to copy Markov table: {e}"))?;
+        let d_result = stream.alloc_zeros::<u32>(1)
+            .map_err(|e| anyhow!("failed to alloc result: {e}"))?;
+
+        Ok(Self {
+            ctx, stream, _module: module, func,
+            d_params: UnsafeCell::new(d_params), d_encrypted_key, d_markov_table,
+            d_result: UnsafeCell::new(d_result),
+            encrypted_key_len, n_blocks: n_blocks_u32,
+            threadgroup_width, device_name, max_threads_per_block,
+        })
+    }
+}
+
+impl GpuMarkovBruteForcer for CudaMarkovAesKwBruteForcer {
+    fn device_name(&self) -> &str { &self.device_name }
+    fn thread_execution_width(&self) -> usize { 32 }
+    fn max_total_threads_per_threadgroup(&self) -> usize { self.max_threads_per_block }
+    fn current_threadgroup_width(&self) -> usize { self.threadgroup_width }
+
+    fn set_threadgroup_width(&mut self, requested: usize) -> anyhow::Result<()> {
+        if requested == 0 { bail!("--threads-per-group must be > 0"); }
+        if requested > self.max_threads_per_block {
+            bail!("--threads-per-group {} exceeds max {}", requested, self.max_threads_per_block);
+        }
+        self.threadgroup_width = requested;
+        Ok(())
+    }
+
+    fn encode_and_commit_markov(&self, _target_data: &[u8], length: u32, threshold: u32,
+                                 offset: u64, count: u32)
+        -> anyhow::Result<(super::GpuCommandHandle, Duration, Duration)>
+    {
+        if count == 0 { bail!("cannot encode empty Markov batch"); }
+        let prep_started = Instant::now();
+        let params = AesKwMarkovParams {
+            encrypted_key_len: self.encrypted_key_len, n_blocks: self.n_blocks,
+            candidate_count: count, pw_length: length, threshold, _pad: 0, offset,
+        };
+        let d_params = unsafe { &mut *self.d_params.get() };
+        self.stream.memcpy_htod(bytes_of(&params), d_params)
+            .map_err(|e| anyhow!("failed to copy params: {e}"))?;
+        let d_result = unsafe { &mut *self.d_result.get() };
+        self.stream.memcpy_htod(&[RESULT_NOT_FOUND_SENTINEL], d_result)
+            .map_err(|e| anyhow!("failed to reset result: {e}"))?;
+        let host_prep = prep_started.elapsed();
+
+        let encode_started = Instant::now();
+        let grid_dim = (count + self.threadgroup_width as u32 - 1) / self.threadgroup_width as u32;
+        let config = LaunchConfig {
+            grid_dim: (grid_dim.max(1), 1, 1),
+            block_dim: (self.threadgroup_width as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let d_params = unsafe { &*self.d_params.get() };
+        let d_result = unsafe { &mut *self.d_result.get() };
+        unsafe {
+            self.stream.launch_builder(&self.func)
+                .arg(d_params).arg(&self.d_encrypted_key)
+                .arg(&self.d_markov_table).arg(d_result)
+                .launch(config)?;
+        }
+        let command_encode = encode_started.elapsed();
+        Ok((CudaCommandHandle, host_prep, command_encode))
+    }
+
+    fn wait_and_readback(&self, _handle: &super::GpuCommandHandle) -> (Option<u32>, Duration, Duration) {
+        let gpu_wait_started = Instant::now();
+        let _ = self.stream.synchronize();
+        let gpu_wait = gpu_wait_started.elapsed();
+        let readback_started = Instant::now();
+        let d_result = unsafe { &*self.d_result.get() };
+        let result_vec = self.stream.clone_dtoh(d_result)
+            .unwrap_or_else(|_| vec![RESULT_NOT_FOUND_SENTINEL]);
+        let result = result_vec.first().copied().unwrap_or(RESULT_NOT_FOUND_SENTINEL);
+        let _ = self.stream.synchronize();
+        let result_readback = readback_started.elapsed();
+        let maybe_match = if result == RESULT_NOT_FOUND_SENTINEL { None } else { Some(result) };
+        (maybe_match, gpu_wait, result_readback)
+    }
+
+    fn autotune_markov(&mut self, _target_data: &[u8], length: u32, threshold: u32) -> anyhow::Result<()> {
+        const SAMPLE_COUNT: u32 = 16_384;
+        let max_threads = self.max_threads_per_block;
+        let mut candidates = vec![32, 64, 128, 256, 512, 1024];
+        candidates.retain(|&v| v > 0 && v <= max_threads);
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() { return Ok(()); }
+
+        eprintln!("AUTOTUNE: benchmarking {} Markov candidates across {} block sizes", SAMPLE_COUNT, candidates.len());
+        let mut best: Option<(usize, f64)> = None;
+        let dummy_target: &[u8] = &[];
+        for width in &candidates {
+            self.threadgroup_width = *width;
+            let (handle, _, _) = self.encode_and_commit_markov(dummy_target, length, threshold, 0, SAMPLE_COUNT)?;
+            let (_, gpu_wait, _) = self.wait_and_readback(&handle);
+            if gpu_wait.is_zero() { continue; }
+            let rate = SAMPLE_COUNT as f64 / gpu_wait.as_secs_f64();
+            match best {
+                Some((_, best_rate)) if rate <= best_rate => {}
+                _ => best = Some((*width, rate)),
+            }
+        }
+        if let Some((best_width, best_rate)) = best {
+            self.threadgroup_width = best_width;
+            eprintln!("AUTOTUNE: selected --threads-per-group {} ({}/s sample)", best_width, format_human_count(best_rate));
         }
         Ok(())
     }

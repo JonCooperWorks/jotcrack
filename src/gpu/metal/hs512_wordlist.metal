@@ -894,3 +894,97 @@ kernel void hs512_wordlist_short_keys(
         atomic_fetch_min_explicit(result_index, gid, memory_order_relaxed);
     }
 }
+
+// ===========================================================================
+// Markov chain candidate generation + HMAC-SHA384/512 (fused kernels).
+// ===========================================================================
+
+struct Hs512MarkovParams {
+    uint64_t target_signature[8]; // HS384 uses first 6, HS512 uses all 8
+    uint32_t message_length;
+    uint32_t candidate_count;
+    uint32_t pw_length;
+    uint32_t threshold;
+    uint64_t offset;
+};
+
+// Thread-address-space variant of load_key_words_64.
+static inline void load_key_words_64_thread(thread const uint8_t* key, uint32_t key_len, thread uint64_t kw[16]) {
+    #pragma unroll
+    for (uint i = 0; i < 16; ++i) kw[i] = 0ULL;
+
+    const uint32_t full_words = key_len >> 3;
+    for (uint32_t i = 0; i < full_words; ++i)
+        kw[i] = load_be_u64(key + i * 8u);
+
+    const uint32_t remaining = key_len & 7u;
+    if (remaining > 0u) {
+        uint64_t val = 0ULL;
+        thread const uint8_t* tail = key + (full_words * 8u);
+        for (uint32_t i = 0; i < remaining; ++i)
+            val |= uint64_t(tail[i]) << (56u - 8u * i);
+        kw[full_words] = val;
+    }
+}
+
+kernel void hs384_markov(
+    constant Hs512MarkovParams& params [[buffer(0)]],
+    constant const uint8_t* message_bytes [[buffer(1)]],
+    constant const uint8_t* markov_table [[buffer(2)]],
+    device atomic_uint* result_index [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.candidate_count) return;
+
+    const uint32_t T = params.threshold;
+    const uint32_t len = params.pw_length;
+    uint64_t idx = params.offset + uint64_t(gid);
+
+    uint8_t candidate[128];
+    uint8_t prev = 0;
+    for (uint32_t pos = 0; pos < len; ++pos) {
+        uint32_t rank = uint32_t(idx % uint64_t(T));
+        idx /= uint64_t(T);
+        uint32_t table_idx = (pos * 256u + uint32_t(prev)) * T + rank;
+        candidate[pos] = markov_table[table_idx];
+        prev = candidate[pos];
+    }
+
+    uint64_t kw[16];
+    load_key_words_64_thread(candidate, len, kw);
+    if (hmac_sha384_from_key_words(kw, message_bytes, params.message_length,
+                                    params.target_signature)) {
+        atomic_fetch_min_explicit(result_index, gid, memory_order_relaxed);
+    }
+}
+
+kernel void hs512_markov(
+    constant Hs512MarkovParams& params [[buffer(0)]],
+    constant const uint8_t* message_bytes [[buffer(1)]],
+    constant const uint8_t* markov_table [[buffer(2)]],
+    device atomic_uint* result_index [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.candidate_count) return;
+
+    const uint32_t T = params.threshold;
+    const uint32_t len = params.pw_length;
+    uint64_t idx = params.offset + uint64_t(gid);
+
+    uint8_t candidate[128];
+    uint8_t prev = 0;
+    for (uint32_t pos = 0; pos < len; ++pos) {
+        uint32_t rank = uint32_t(idx % uint64_t(T));
+        idx /= uint64_t(T);
+        uint32_t table_idx = (pos * 256u + uint32_t(prev)) * T + rank;
+        candidate[pos] = markov_table[table_idx];
+        prev = candidate[pos];
+    }
+
+    uint64_t kw[16];
+    load_key_words_64_thread(candidate, len, kw);
+    if (hmac_sha512_from_key_words(kw, message_bytes, params.message_length,
+                                    params.target_signature)) {
+        atomic_fetch_min_explicit(result_index, gid, memory_order_relaxed);
+    }
+}

@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
-use crate::args::WordlistArgs;
+use crate::args::{MarkovArgs, WordlistArgs};
 use crate::gpu::{AesKwVariant, CrackVariant, HmacVariant};
 
 #[derive(Debug, Parser)]
@@ -42,6 +42,13 @@ enum Commands {
     /// Distinguishes JWT (3-part) from JWE (5-part) compact tokens,
     /// reads the `alg` header field, and routes to the appropriate backend.
     Autocrack(WordlistArgs),
+    /// Crack a JWT/JWE using Markov chain candidate generation.
+    ///
+    /// Trains an order-1 Markov model from a wordlist, then generates
+    /// candidates on the GPU using fused generate+hash kernels. The
+    /// `--threshold` and length range control the keyspace size.
+    /// Auto-detects the algorithm from the token header.
+    Markov(MarkovArgs),
 }
 
 /// Parse CLI arguments, dispatch the selected subcommand, and map the result
@@ -72,6 +79,13 @@ pub fn run() -> ExitCode {
             Ok(variant) => {
                 eprintln!("AUTODETECT: token algorithm is {}", variant.label());
                 crate::runner::run_wordlist_crack(variant, args)
+            }
+            Err(e) => Err(e),
+        },
+        Commands::Markov(args) => match crate::jwt::detect_token_variant(&args.jwt) {
+            Ok(variant) => {
+                eprintln!("AUTODETECT: token algorithm is {}", variant.label());
+                crate::runner::run_markov_crack(variant, args)
             }
             Err(e) => Err(e),
         },

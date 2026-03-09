@@ -1121,6 +1121,628 @@ impl GpuBruteForcer for MetalAesKwBruteForcer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// MetalMarkovHmacBruteForcer
+// ---------------------------------------------------------------------------
+
+/// Metal compute backend for Markov chain + HMAC-SHA cracking.
+///
+/// Each GPU thread decodes a global keyspace index into per-position rank
+/// selections, walks an order-1 Markov chain using a pre-trained lookup table,
+/// and immediately computes HMAC-SHA on the generated candidate.
+///
+/// No `WordBatch` is used — the Markov table is uploaded once, and subsequent
+/// dispatches only update the params struct (length, offset, count).
+///
+/// ## Buffer layout (Markov kernels)
+///
+/// | Slot | Purpose                                  |
+/// |------|------------------------------------------|
+/// | 0    | `Hs256MarkovParams` or `Hs512MarkovParams` |
+/// | 1    | JWT signing input bytes                  |
+/// | 2    | Markov lookup table (constant)           |
+/// | 3    | result (atomic u32)                      |
+pub(crate) struct MetalMarkovHmacBruteForcer {
+    variant: HmacVariant,
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    params_buf: metal::Buffer,
+    msg_buf: metal::Buffer,
+    markov_table_buf: metal::Buffer,
+    result_buf: metal::Buffer,
+    message_length: u32,
+    threadgroup_width: usize,
+}
+
+/// Markov buffer binding indices (different from the wordlist layout).
+const MARKOV_BUF_PARAMS: u64 = 0;
+const MARKOV_BUF_MESSAGE: u64 = 1;
+const MARKOV_BUF_TABLE: u64 = 2;
+const MARKOV_BUF_RESULT: u64 = 3;
+
+/// Host → GPU parameters for Markov + HMAC-SHA256.
+/// Must match the Metal struct `Hs256MarkovParams` field-for-field.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Hs256MarkovParams {
+    target_signature: [u32; 8],
+    message_length: u32,
+    candidate_count: u32,
+    pw_length: u32,
+    threshold: u32,
+    offset: u64,
+}
+
+/// Host → GPU parameters for Markov + HMAC-SHA384/512.
+/// Must match the Metal struct `Hs512MarkovParams` field-for-field.
+/// HS384 uses only the first 6 of 8 `u64` words (remaining zeroed).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct Hs512MarkovParams {
+    target_signature: [u64; 8],
+    message_length: u32,
+    candidate_count: u32,
+    pw_length: u32,
+    threshold: u32,
+    offset: u64,
+}
+
+/// Host → GPU parameters for Markov + AES Key Wrap.
+/// Must match the Metal struct `AesKwMarkovParams` field-for-field.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct AesKwMarkovParams {
+    encrypted_key_len: u32,
+    n_blocks: u32,
+    candidate_count: u32,
+    pw_length: u32,
+    threshold: u32,
+    _pad: u32,
+    offset: u64,
+}
+
+impl MetalMarkovHmacBruteForcer {
+    /// Compile the Metal shader, create the Markov pipeline, and allocate
+    /// persistent buffers.
+    pub(crate) fn new(
+        variant: HmacVariant,
+        signing_input: &[u8],
+        markov_table: &[u8],
+    ) -> anyhow::Result<Self> {
+        let device = default_device()?;
+        let compile_options = CompileOptions::new();
+
+        let (source, fn_name) = match variant {
+            HmacVariant::Hs256 => (METAL_SOURCE_HS256, "hs256_markov"),
+            HmacVariant::Hs384 => (METAL_SOURCE_HS512, "hs384_markov"),
+            HmacVariant::Hs512 => (METAL_SOURCE_HS512, "hs512_markov"),
+        };
+
+        let library = device
+            .new_library_with_source(source, &compile_options)
+            .map_err(|e| anyhow!("failed to compile Metal Markov kernel: {e}"))?;
+
+        let function = library
+            .get_function(fn_name, None)
+            .map_err(|e| anyhow!("failed to get Metal function {fn_name}: {e}"))?;
+
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|e| anyhow!("failed to create Markov compute pipeline: {e}"))?;
+
+        let queue = device.new_command_queue();
+        let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
+        let threadgroup_width = 256usize.min(max_threads.max(1));
+
+        let message_length =
+            u32::try_from(signing_input.len()).context("JWT signing input too long")?;
+
+        let options = metal::MTLResourceOptions::StorageModeShared;
+
+        let params_size = match variant {
+            HmacVariant::Hs256 => std::mem::size_of::<Hs256MarkovParams>(),
+            HmacVariant::Hs384 | HmacVariant::Hs512 => {
+                std::mem::size_of::<Hs512MarkovParams>()
+            }
+        };
+        let params_buf = device.new_buffer(params_size as u64, options);
+
+        let msg_buf = device.new_buffer(signing_input.len().max(1) as u64, options);
+        copy_bytes_to_buffer(&msg_buf, signing_input);
+
+        let markov_table_buf = device.new_buffer(markov_table.len().max(1) as u64, options);
+        copy_bytes_to_buffer(&markov_table_buf, markov_table);
+
+        let result_buf = device.new_buffer(std::mem::size_of::<u32>() as u64, options);
+        copy_value_to_buffer(&result_buf, &RESULT_NOT_FOUND_SENTINEL);
+
+        Ok(Self {
+            variant,
+            device,
+            queue,
+            pipeline,
+            params_buf,
+            msg_buf,
+            markov_table_buf,
+            result_buf,
+            message_length,
+            threadgroup_width,
+        })
+    }
+
+    /// Write Markov params into the GPU buffer.
+    fn write_markov_params(
+        &self,
+        target_signature: &[u8],
+        candidate_count: u32,
+        pw_length: u32,
+        threshold: u32,
+        offset: u64,
+    ) -> anyhow::Result<()> {
+        let expected_len = self.variant.signature_len();
+        if target_signature.len() != expected_len {
+            bail!(
+                "{} signature must be {} bytes, got {}",
+                self.variant.label(),
+                expected_len,
+                target_signature.len()
+            );
+        }
+
+        match self.variant {
+            HmacVariant::Hs256 => {
+                let mut target_words = [0u32; 8];
+                for i in 0..8 {
+                    let off = i * 4;
+                    target_words[i] =
+                        u32::from_be_bytes(target_signature[off..off + 4].try_into().unwrap());
+                }
+                let params = Hs256MarkovParams {
+                    target_signature: target_words,
+                    message_length: self.message_length,
+                    candidate_count,
+                    pw_length,
+                    threshold,
+                    offset,
+                };
+                copy_value_to_buffer(&self.params_buf, &params);
+            }
+            HmacVariant::Hs384 | HmacVariant::Hs512 => {
+                let word_count = match self.variant {
+                    HmacVariant::Hs384 => 6,
+                    _ => 8,
+                };
+                let mut target_words = [0u64; 8];
+                for i in 0..word_count {
+                    let off = i * 8;
+                    target_words[i] =
+                        u64::from_be_bytes(target_signature[off..off + 8].try_into().unwrap());
+                }
+                let params = Hs512MarkovParams {
+                    target_signature: target_words,
+                    message_length: self.message_length,
+                    candidate_count,
+                    pw_length,
+                    threshold,
+                    offset,
+                };
+                copy_value_to_buffer(&self.params_buf, &params);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl super::GpuMarkovBruteForcer for MetalMarkovHmacBruteForcer {
+    fn device_name(&self) -> &str {
+        self.device.name()
+    }
+
+    fn thread_execution_width(&self) -> usize {
+        self.pipeline.thread_execution_width() as usize
+    }
+
+    fn max_total_threads_per_threadgroup(&self) -> usize {
+        self.pipeline.max_total_threads_per_threadgroup() as usize
+    }
+
+    fn current_threadgroup_width(&self) -> usize {
+        self.threadgroup_width
+    }
+
+    fn set_threadgroup_width(&mut self, requested: usize) -> anyhow::Result<()> {
+        let max_threads = self.max_total_threads_per_threadgroup();
+        if requested == 0 {
+            bail!("--threads-per-group must be > 0");
+        }
+        if requested > max_threads {
+            bail!(
+                "--threads-per-group {} exceeds pipeline max {}",
+                requested,
+                max_threads
+            );
+        }
+        self.threadgroup_width = requested;
+        Ok(())
+    }
+
+    fn encode_and_commit_markov(
+        &self,
+        target_data: &[u8],
+        length: u32,
+        threshold: u32,
+        offset: u64,
+        count: u32,
+    ) -> anyhow::Result<(GpuCommandHandle, Duration, Duration)> {
+        if count == 0 {
+            bail!("cannot encode empty Markov batch");
+        }
+
+        let prep_started = Instant::now();
+        self.write_markov_params(target_data, count, length, threshold, offset)?;
+        copy_value_to_buffer(&self.result_buf, &RESULT_NOT_FOUND_SENTINEL);
+        let host_prep = prep_started.elapsed();
+
+        let encode_started = Instant::now();
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline);
+        encoder.set_buffer(MARKOV_BUF_PARAMS, Some(&self.params_buf), 0);
+        encoder.set_buffer(MARKOV_BUF_MESSAGE, Some(&self.msg_buf), 0);
+        encoder.set_buffer(MARKOV_BUF_TABLE, Some(&self.markov_table_buf), 0);
+        encoder.set_buffer(MARKOV_BUF_RESULT, Some(&self.result_buf), 0);
+
+        let threads_per_group = MTLSize::new(self.threadgroup_width as u64, 1, 1);
+        let threads_per_grid = MTLSize::new(count as u64, 1, 1);
+        encoder.dispatch_threads(threads_per_grid, threads_per_group);
+        encoder.end_encoding();
+        let command_encode = encode_started.elapsed();
+
+        command_buffer.commit();
+        let owned = command_buffer.to_owned();
+        Ok((owned, host_prep, command_encode))
+    }
+
+    fn wait_and_readback(
+        &self,
+        handle: &GpuCommandHandle,
+    ) -> (Option<u32>, Duration, Duration) {
+        let gpu_wait_started = Instant::now();
+        handle.wait_until_completed();
+        let gpu_wait = gpu_wait_started.elapsed();
+
+        let readback_started = Instant::now();
+        let result_ptr = self.result_buf.contents().cast::<u32>();
+        let result = unsafe { *result_ptr };
+        let result_readback = readback_started.elapsed();
+
+        let maybe_match = if result == RESULT_NOT_FOUND_SENTINEL {
+            None
+        } else {
+            Some(result)
+        };
+        (maybe_match, gpu_wait, result_readback)
+    }
+
+    fn autotune_markov(
+        &mut self,
+        target_data: &[u8],
+        length: u32,
+        threshold: u32,
+    ) -> anyhow::Result<()> {
+        const SAMPLE_COUNT: u32 = 16_384;
+
+        let tew = self.thread_execution_width();
+        let max_threads = self.max_total_threads_per_threadgroup();
+        let mut candidates = vec![
+            tew,
+            tew.saturating_mul(2),
+            tew.saturating_mul(4),
+            tew.saturating_mul(8),
+            64, 128, 256, 512, 1024,
+        ];
+        candidates.retain(|&v| v > 0 && v <= max_threads);
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!(
+            "AUTOTUNE: benchmarking {} Markov candidates across {} threadgroup widths",
+            SAMPLE_COUNT,
+            candidates.len()
+        );
+
+        let mut best: Option<(usize, f64)> = None;
+        for width in &candidates {
+            self.threadgroup_width = *width;
+            let (handle, _, _) =
+                self.encode_and_commit_markov(target_data, length, threshold, 0, SAMPLE_COUNT)?;
+            let (_, gpu_wait, _) = self.wait_and_readback(&handle);
+            if gpu_wait.is_zero() {
+                continue;
+            }
+            let rate = SAMPLE_COUNT as f64 / gpu_wait.as_secs_f64();
+            match best {
+                Some((_, best_rate)) if rate <= best_rate => {}
+                _ => best = Some((*width, rate)),
+            }
+        }
+
+        if let Some((best_width, best_rate)) = best {
+            self.threadgroup_width = best_width;
+            eprintln!(
+                "AUTOTUNE: selected --threads-per-group {} ({}/s sample)",
+                best_width,
+                format_human_count(best_rate)
+            );
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MetalMarkovAesKwBruteForcer
+// ---------------------------------------------------------------------------
+
+/// Metal compute backend for Markov chain + AES Key Wrap cracking.
+///
+/// Same fused-kernel approach as `MetalMarkovHmacBruteForcer` but for JWE
+/// tokens using A128KW/A192KW/A256KW. The shader is compiled with
+/// `#define AES_KEY_BYTES N` to specialise for each key size.
+///
+/// ## Buffer layout (Markov AES-KW kernels)
+///
+/// | Slot | Purpose                                  |
+/// |------|------------------------------------------|
+/// | 0    | `AesKwMarkovParams`                      |
+/// | 1    | encrypted_key bytes (pre-filled)          |
+/// | 2    | Markov lookup table (constant)           |
+/// | 3    | result (atomic u32)                      |
+pub(crate) struct MetalMarkovAesKwBruteForcer {
+    device: metal::Device,
+    queue: metal::CommandQueue,
+    pipeline: metal::ComputePipelineState,
+    params_buf: metal::Buffer,
+    enc_key_buf: metal::Buffer,
+    markov_table_buf: metal::Buffer,
+    result_buf: metal::Buffer,
+    encrypted_key_len: u32,
+    n_blocks: u32,
+    threadgroup_width: usize,
+}
+
+impl MetalMarkovAesKwBruteForcer {
+    pub(crate) fn new(
+        variant: AesKwVariant,
+        encrypted_key: &[u8],
+        n: usize,
+        markov_table: &[u8],
+    ) -> anyhow::Result<Self> {
+        let device = default_device()?;
+        let compile_options = CompileOptions::new();
+
+        let specialised_source = format!(
+            "#define AES_KEY_BYTES {}\n{}",
+            variant.key_bytes(),
+            METAL_SOURCE_AESKW
+        );
+
+        let label = variant.label();
+        let library = device
+            .new_library_with_source(&specialised_source, &compile_options)
+            .map_err(|e| anyhow!("failed to compile {label} Markov Metal kernel: {e}"))?;
+
+        let function = library
+            .get_function("aeskw_markov", None)
+            .map_err(|e| anyhow!("failed to get Metal function aeskw_markov: {e}"))?;
+
+        let pipeline = device
+            .new_compute_pipeline_state_with_function(&function)
+            .map_err(|e| anyhow!("failed to create {label} Markov compute pipeline: {e}"))?;
+
+        let queue = device.new_command_queue();
+        let max_threads = pipeline.max_total_threads_per_threadgroup() as usize;
+        let threadgroup_width = 256usize.min(max_threads.max(1));
+
+        let encrypted_key_len =
+            u32::try_from(encrypted_key.len()).context("encrypted_key too long")?;
+        let n_blocks = u32::try_from(n).context("n_blocks overflow")?;
+
+        let options = metal::MTLResourceOptions::StorageModeShared;
+
+        let params_buf = device.new_buffer(
+            std::mem::size_of::<AesKwMarkovParams>() as u64,
+            options,
+        );
+
+        let enc_key_buf = device.new_buffer(encrypted_key.len().max(1) as u64, options);
+        copy_bytes_to_buffer(&enc_key_buf, encrypted_key);
+
+        let markov_table_buf = device.new_buffer(markov_table.len().max(1) as u64, options);
+        copy_bytes_to_buffer(&markov_table_buf, markov_table);
+
+        let result_buf = device.new_buffer(std::mem::size_of::<u32>() as u64, options);
+        copy_value_to_buffer(&result_buf, &RESULT_NOT_FOUND_SENTINEL);
+
+        Ok(Self {
+            device,
+            queue,
+            pipeline,
+            params_buf,
+            enc_key_buf,
+            markov_table_buf,
+            result_buf,
+            encrypted_key_len,
+            n_blocks,
+            threadgroup_width,
+        })
+    }
+}
+
+impl super::GpuMarkovBruteForcer for MetalMarkovAesKwBruteForcer {
+    fn device_name(&self) -> &str {
+        self.device.name()
+    }
+
+    fn thread_execution_width(&self) -> usize {
+        self.pipeline.thread_execution_width() as usize
+    }
+
+    fn max_total_threads_per_threadgroup(&self) -> usize {
+        self.pipeline.max_total_threads_per_threadgroup() as usize
+    }
+
+    fn current_threadgroup_width(&self) -> usize {
+        self.threadgroup_width
+    }
+
+    fn set_threadgroup_width(&mut self, requested: usize) -> anyhow::Result<()> {
+        let max_threads = self.max_total_threads_per_threadgroup();
+        if requested == 0 {
+            bail!("--threads-per-group must be > 0");
+        }
+        if requested > max_threads {
+            bail!(
+                "--threads-per-group {} exceeds pipeline max {}",
+                requested,
+                max_threads
+            );
+        }
+        self.threadgroup_width = requested;
+        Ok(())
+    }
+
+    fn encode_and_commit_markov(
+        &self,
+        _target_data: &[u8],
+        length: u32,
+        threshold: u32,
+        offset: u64,
+        count: u32,
+    ) -> anyhow::Result<(GpuCommandHandle, Duration, Duration)> {
+        if count == 0 {
+            bail!("cannot encode empty Markov batch");
+        }
+
+        let prep_started = Instant::now();
+        let params = AesKwMarkovParams {
+            encrypted_key_len: self.encrypted_key_len,
+            n_blocks: self.n_blocks,
+            candidate_count: count,
+            pw_length: length,
+            threshold,
+            _pad: 0,
+            offset,
+        };
+        copy_value_to_buffer(&self.params_buf, &params);
+        copy_value_to_buffer(&self.result_buf, &RESULT_NOT_FOUND_SENTINEL);
+        let host_prep = prep_started.elapsed();
+
+        let encode_started = Instant::now();
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.pipeline);
+        encoder.set_buffer(MARKOV_BUF_PARAMS, Some(&self.params_buf), 0);
+        encoder.set_buffer(MARKOV_BUF_MESSAGE, Some(&self.enc_key_buf), 0);
+        encoder.set_buffer(MARKOV_BUF_TABLE, Some(&self.markov_table_buf), 0);
+        encoder.set_buffer(MARKOV_BUF_RESULT, Some(&self.result_buf), 0);
+
+        let threads_per_group = MTLSize::new(self.threadgroup_width as u64, 1, 1);
+        let threads_per_grid = MTLSize::new(count as u64, 1, 1);
+        encoder.dispatch_threads(threads_per_grid, threads_per_group);
+        encoder.end_encoding();
+        let command_encode = encode_started.elapsed();
+
+        command_buffer.commit();
+        let owned = command_buffer.to_owned();
+        Ok((owned, host_prep, command_encode))
+    }
+
+    fn wait_and_readback(
+        &self,
+        handle: &GpuCommandHandle,
+    ) -> (Option<u32>, Duration, Duration) {
+        let gpu_wait_started = Instant::now();
+        handle.wait_until_completed();
+        let gpu_wait = gpu_wait_started.elapsed();
+
+        let readback_started = Instant::now();
+        let result_ptr = self.result_buf.contents().cast::<u32>();
+        let result = unsafe { *result_ptr };
+        let result_readback = readback_started.elapsed();
+
+        let maybe_match = if result == RESULT_NOT_FOUND_SENTINEL {
+            None
+        } else {
+            Some(result)
+        };
+        (maybe_match, gpu_wait, result_readback)
+    }
+
+    fn autotune_markov(
+        &mut self,
+        _target_data: &[u8],
+        length: u32,
+        threshold: u32,
+    ) -> anyhow::Result<()> {
+        const SAMPLE_COUNT: u32 = 16_384;
+
+        let tew = self.thread_execution_width();
+        let max_threads = self.max_total_threads_per_threadgroup();
+        let mut candidates = vec![
+            tew,
+            tew.saturating_mul(2),
+            tew.saturating_mul(4),
+            tew.saturating_mul(8),
+            64, 128, 256, 512, 1024,
+        ];
+        candidates.retain(|&v| v > 0 && v <= max_threads);
+        candidates.sort_unstable();
+        candidates.dedup();
+        if candidates.is_empty() {
+            return Ok(());
+        }
+
+        eprintln!(
+            "AUTOTUNE: benchmarking {} Markov candidates across {} threadgroup widths",
+            SAMPLE_COUNT,
+            candidates.len()
+        );
+
+        let mut best: Option<(usize, f64)> = None;
+        // target_data is not used for AES-KW (encrypted key is pre-loaded),
+        // but we need a dummy slice for the trait signature.
+        let dummy_target: &[u8] = &[];
+        for width in &candidates {
+            self.threadgroup_width = *width;
+            let (handle, _, _) =
+                self.encode_and_commit_markov(dummy_target, length, threshold, 0, SAMPLE_COUNT)?;
+            let (_, gpu_wait, _) = self.wait_and_readback(&handle);
+            if gpu_wait.is_zero() {
+                continue;
+            }
+            let rate = SAMPLE_COUNT as f64 / gpu_wait.as_secs_f64();
+            match best {
+                Some((_, best_rate)) if rate <= best_rate => {}
+                _ => best = Some((*width, rate)),
+            }
+        }
+
+        if let Some((best_width, best_rate)) = best {
+            self.threadgroup_width = best_width;
+            eprintln!(
+                "AUTOTUNE: selected --threads-per-group {} ({}/s sample)",
+                best_width,
+                format_human_count(best_rate)
+            );
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

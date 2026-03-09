@@ -92,6 +92,39 @@ impl ParserConfig {
     }
 }
 
+/// Shared CLI arguments for Markov chain attack subcommands.
+///
+/// The Markov attack trains an order-1 bigram model on the wordlist, then
+/// enumerates candidates on the GPU using fused generate+hash kernels.
+/// The `--threshold` and length range control the keyspace size.
+#[derive(Debug, Clone, Args)]
+pub struct MarkovArgs {
+    /// JWT or JWE token in compact form.
+    pub jwt: String,
+    /// Wordlist file path to train the Markov model from.
+    #[arg(long, default_value = DEFAULT_WORDLIST_PATH)]
+    pub wordlist: PathBuf,
+    /// Markov threshold T: number of ranked successors per context.
+    /// Higher = more candidates. Total keyspace ≈ T^max_len.
+    #[arg(long, default_value = "30", value_parser = parse_positive_usize)]
+    pub threshold: usize,
+    /// Minimum password length to generate.
+    #[arg(long, default_value = "1", value_parser = parse_positive_usize)]
+    pub min_len: usize,
+    /// Maximum password length to generate.
+    #[arg(long, default_value = "8", value_parser = parse_positive_usize)]
+    pub max_len: usize,
+    /// Fixed GPU threadgroup/block width override (default picks a safe value).
+    #[arg(long)]
+    pub threads_per_group: Option<usize>,
+    /// Benchmark several threadgroup widths on the first batch before steady-state dispatch.
+    #[arg(long)]
+    pub autotune: bool,
+    /// Force re-scan of the wordlist even if a cached Markov model exists.
+    #[arg(long)]
+    pub retrain: bool,
+}
+
 /// Custom clap `value_parser` that rejects zero.
 ///
 /// ## Why a custom parser instead of clap's `value_parser!(1..)`?

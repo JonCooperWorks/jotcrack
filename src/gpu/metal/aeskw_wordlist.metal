@@ -821,3 +821,128 @@ kernel void aeskw_wordlist_short_keys(
         atomic_fetch_min_explicit(result_index, gid, memory_order_relaxed);
     }
 }
+
+// ===========================================================================
+// Markov chain candidate generation + AES Key Wrap (fused kernel).
+//
+// Each GPU thread decodes a global keyspace index into per-position rank
+// selections via modular arithmetic, walks an order-1 Markov chain using a
+// pre-trained lookup table, derives the AES key, expands it, and attempts
+// an RFC 3394 unwrap — no intermediate candidate buffer or memory traffic.
+// ===========================================================================
+
+struct AesKwMarkovParams {
+    uint32_t encrypted_key_len;
+    uint32_t n_blocks;
+    uint32_t candidate_count;
+    uint32_t pw_length;        // password length for this batch
+    uint32_t threshold;        // T: ranked successors per (pos, prev_char)
+    uint32_t _pad;             // alignment padding to 8-byte boundary for offset
+    uint64_t offset;           // starting index in the keyspace
+};
+
+// Thread-address-space load_be_u32 for Markov-generated candidates.
+static inline uint32_t load_be_u32_thread(thread const uint8_t* p) {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+}
+
+// Thread-address-space SHA-256 key derivation (same algorithm as sha256_derive_key
+// but reads from thread memory instead of device memory).
+static inline void sha256_derive_key_thread(
+    thread const uint8_t* data,
+    uint32_t len,
+    thread uint8_t key_out[AES_KEY_BYTES]
+) {
+    uint32_t state[8] = {
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    };
+
+    uint32_t off = 0u;
+    while ((len - off) >= 64u) {
+        uint32_t w[16];
+        for (uint i = 0; i < 16; ++i)
+            w[i] = load_be_u32_thread(data + off + i * 4u);
+        sha256_compress_rolling(state, w);
+        off += 64u;
+    }
+
+    uint32_t rem = len - off;
+    uint64_t bit_len = uint64_t(len) * 8ull;
+    {
+        uint32_t w[16];
+        #pragma unroll
+        for (uint i = 0; i < 16; ++i) w[i] = 0u;
+
+        uint32_t full_words = rem >> 2;
+        for (uint32_t i = 0; i < full_words; ++i)
+            w[i] = load_be_u32_thread(data + off + i * 4u);
+
+        uint32_t tail = rem & 3u;
+        uint32_t pad_word = 0u;
+        for (uint32_t i = 0; i < tail; ++i)
+            pad_word |= uint32_t(data[off + full_words * 4u + i]) << (24u - 8u * i);
+        pad_word |= 0x80u << (24u - 8u * tail);
+        w[full_words] = pad_word;
+
+        if (rem > 55u) {
+            sha256_compress_rolling(state, w);
+            #pragma unroll
+            for (uint i = 0; i < 16; ++i) w[i] = 0u;
+        }
+        w[14] = uint32_t((bit_len >> 32u) & 0xffffffffull);
+        w[15] = uint32_t(bit_len & 0xffffffffull);
+        sha256_compress_rolling(state, w);
+    }
+
+    for (uint i = 0; i < SHA256_KEY_WORDS; ++i) {
+        key_out[i * 4 + 0] = uint8_t((state[i] >> 24) & 0xffu);
+        key_out[i * 4 + 1] = uint8_t((state[i] >> 16) & 0xffu);
+        key_out[i * 4 + 2] = uint8_t((state[i] >> 8)  & 0xffu);
+        key_out[i * 4 + 3] = uint8_t( state[i]        & 0xffu);
+    }
+}
+
+kernel void aeskw_markov(
+    constant AesKwMarkovParams& params [[buffer(0)]],
+    constant const uint8_t* encrypted_key [[buffer(1)]],
+    constant const uint8_t* markov_table [[buffer(2)]],
+    device atomic_uint* result_index [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.candidate_count) return;
+
+    const uint32_t T = params.threshold;
+    const uint32_t len = params.pw_length;
+    uint64_t idx = params.offset + uint64_t(gid);
+
+    // Generate candidate in thread-local registers.
+    uint8_t candidate[64];
+    uint8_t prev = 0;
+    for (uint32_t pos = 0; pos < len; ++pos) {
+        uint32_t rank = uint32_t(idx % uint64_t(T));
+        idx /= uint64_t(T);
+        uint32_t table_idx = (pos * 256u + uint32_t(prev)) * T + rank;
+        candidate[pos] = markov_table[table_idx];
+        prev = candidate[pos];
+    }
+
+    // Derive AES key from candidate.
+    uint8_t aes_key[AES_KEY_BYTES];
+    if (len <= uint32_t(AES_KEY_BYTES)) {
+        #pragma unroll
+        for (uint i = 0; i < AES_KEY_BYTES; ++i) aes_key[i] = 0u;
+        for (uint i = 0; i < len; ++i)
+            aes_key[i] = candidate[i];
+    } else {
+        sha256_derive_key_thread(candidate, len, aes_key);
+    }
+
+    // Expand and try unwrap.
+    uint32_t round_keys[AES_RK_WORDS];
+    aes_key_expand(aes_key, round_keys);
+
+    if (try_key_unwrap(round_keys, encrypted_key, params.n_blocks)) {
+        atomic_fetch_min_explicit(result_index, gid, memory_order_relaxed);
+    }
+}
