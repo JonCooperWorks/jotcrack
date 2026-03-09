@@ -1,8 +1,8 @@
 # Jotcrack Architecture: GPU Abstraction & Pipeline
 
-Jotcrack is a GPU-accelerated JWT/JWE secret cracker for macOS using Apple Metal compute shaders. It processes massive wordlists (100+ GB) by memory-mapping files, parsing in parallel, and double-buffering GPU dispatch so the CPU and GPU never wait on each other.
+Jotcrack is a GPU-accelerated JWT/JWE secret cracker for macOS (Metal) and Linux (CUDA). It processes massive wordlists (100+ GB) by memory-mapping files, parsing in parallel, and double-buffering GPU dispatch so the CPU and GPU never wait on each other.
 
-**Performance:** 446M candidates/s for HS256, 120M/s for A128KW on Apple M4 Max.
+**Performance:** 793M candidates/s for HS256 on NVIDIA RTX PRO 6000 (CUDA), 446M/s on Apple M4 Max (Metal). 145M/s for A128KW on RTX PRO 6000, 120M/s on M4 Max.
 
 ---
 
@@ -16,25 +16,36 @@ Jotcrack is a GPU-accelerated JWT/JWE secret cracker for macOS using Apple Metal
   │  Memory-Map   │  mmap() — zero-copy, OS manages paging
   └──────┬───────┘
          │
-         ▼
-  ┌──────────────────────┐
-  │  Parser Threads (N)  │  Scan ~16 MiB chunks for line boundaries
-  │  (parser.rs)         │  Produce MmapChunk metadata (offsets + lengths)
-  └──────┬───────────────┘
-         │
-         ▼
-  ┌──────────────────┐
-  │  Planner Thread  │  Group lines into BatchPlans respecting GPU limits
-  │  (producer.rs)   │  (~6.2M candidates / 32 MiB per batch)
-  └──────┬───────────┘
-         │
-         ▼
-  ┌──────────────────────┐
-  │  Packer Threads (N)  │  Copy candidate bytes from mmap into Metal buffers
-  │  (producer.rs)       │  Direct raw memcpy — no intermediate allocations
-  └──────┬───────────────┘
-         │
-         ▼
+         ├──────────────────────────────────────────────┐
+         │  macOS (Metal)                               │  Linux (CUDA)
+         │                                              │
+         ▼                                              ▼
+  ┌──────────────────────┐                  ┌─────────────────────────┐
+  │  Parser Threads (N)  │                  │  Worker Threads (N)     │
+  │  (parser.rs)         │                  │  (producer.rs)          │
+  │  Scan ~16 MiB chunks │                  │  Scan newline-aligned   │
+  │  for line boundaries │                  │  regions with memchr    │
+  └──────┬───────────────┘                  │  Write offset/length    │
+         │                                  │  metadata directly to   │
+         ▼                                  │  pinned host memory     │
+  ┌──────────────────┐                      └──────┬──────────────────┘
+  │  Planner Thread  │                             │
+  │  (producer.rs)   │                             │
+  │  Group lines     │                             │
+  │  into BatchPlans │                             │
+  └──────┬───────────┘                             │
+         │                                         │
+         ▼                                         │
+  ┌──────────────────────┐                         │
+  │  Coordinator         │                         │
+  │  (producer.rs)       │                         │
+  │  Inline-pack plans   │                         │
+  │  into GPU buffers    │                         │
+  └──────┬───────────────┘                         │
+         │                                         │
+         └────────────────┬────────────────────────┘
+                          │
+                          ▼
   ┌──────────────────────────────┐
   │  Consumer Loop (runner.rs)   │  Double-buffered dispatch:
   │                              │    While GPU runs batch N,
@@ -43,8 +54,8 @@ Jotcrack is a GPU-accelerated JWT/JWE secret cracker for macOS using Apple Metal
          │
          ▼
   ┌──────────────────────────────┐
-  │  GPU Kernel (Metal shaders)  │  One thread per candidate:
-  │  HMAC-SHA or AES Key Wrap   │    compute hash/unwrap → compare → atomic write
+  │  GPU Kernel                  │  One thread per candidate:
+  │  (Metal / CUDA)              │    compute hash/unwrap → compare → atomic write
   └──────────────────────────────┘
 ```
 
@@ -52,39 +63,63 @@ Jotcrack is a GPU-accelerated JWT/JWE secret cracker for macOS using Apple Metal
 
 ## 1. GPU Abstraction Layer (`src/gpu/mod.rs`)
 
-The GPU abstraction defines a **platform-agnostic trait** that decouples the cracking algorithm from the GPU backend. Today the only backend is Apple Metal, but the trait boundary makes it possible to add OpenCL, Vulkan, or CUDA backends.
+The GPU abstraction defines a **platform-agnostic trait** that decouples the cracking algorithm from the GPU backend. Two backends exist today: Apple Metal (macOS) and NVIDIA CUDA (Linux).
 
 ### The `GpuBruteForcer` Trait
 
 ```rust
 pub(crate) trait GpuBruteForcer {
     fn device(&self) -> &GpuDevice;
-    fn encode_and_commit(&mut self, target: &[u8], view: &DispatchBatchView)
-        -> Result<(GpuCommandHandle, Duration, Duration)>;
-    fn wait_and_readback(&self, handle: &GpuCommandHandle)
-        -> (Option<u32>, Duration, Duration);
-    fn autotune_threadgroup_width(&mut self, target: &[u8], batch: &WordBatch) -> Result<()>;
-    fn set_threadgroup_width(&mut self, width: usize);
+    fn device_name(&self) -> &str;
+    fn thread_execution_width(&self) -> usize;
+    fn max_total_threads_per_threadgroup(&self) -> usize;
     fn current_threadgroup_width(&self) -> usize;
+    fn set_threadgroup_width(&mut self, requested: usize) -> anyhow::Result<()>;
+    fn encode_and_commit(
+        &self,
+        target_signature: &[u8],
+        batch: &WordBatch,
+    ) -> anyhow::Result<(GpuCommandHandle, Duration, Duration)>;
+    fn wait_and_readback(
+        &self,
+        handle: &GpuCommandHandle,
+    ) -> (Option<u32>, Duration, Duration);
+    fn autotune_threadgroup_width(
+        &mut self,
+        target_signature: &[u8],
+        batch: &WordBatch,
+    ) -> anyhow::Result<()>;
 }
 ```
 
 | Method | Purpose |
 |--------|---------|
-| `encode_and_commit()` | Encode GPU commands and submit asynchronously. Returns a command handle and timing data. The GPU begins executing immediately. |
-| `wait_and_readback()` | Block until the GPU finishes, then read the result buffer. Returns `Some(match_index)` if a candidate matched, or `None`. |
-| `autotune_threadgroup_width()` | Benchmark different threadgroup widths on the first batch to find the optimal configuration for the current device. |
+| `device()` | Return the underlying GPU device handle (for buffer allocation by the producer). |
+| `device_name()` | Human-readable GPU name (e.g. "Apple M4 Max", "NVIDIA RTX PRO 6000"). |
+| `thread_execution_width()` | SIMD lane count — Metal thread execution width or CUDA warp size (always 32). |
+| `max_total_threads_per_threadgroup()` | Hardware maximum threads per threadgroup (Metal) or block (CUDA). |
+| `set_threadgroup_width()` | Validate and apply a threadgroup/block width override. Returns an error for invalid values. |
+| `encode_and_commit()` | Encode GPU commands and submit asynchronously. Returns a command handle and (host_prep, encode) timing data. The GPU begins executing immediately. |
+| `wait_and_readback()` | Block until the GPU finishes, then read the result buffer. Returns `Some(match_index)` if a candidate matched, or `None`. Also returns (gpu_wait, readback) durations. |
+| `autotune_threadgroup_width()` | Benchmark different threadgroup/block widths on the first batch to find the optimal configuration for the current device. |
 
 ### Platform Type Aliases
 
 ```rust
+// macOS (Metal)
 #[cfg(target_os = "macos")]
 pub(crate) type GpuDevice = ::metal::Device;
 pub(crate) type GpuBuffer = ::metal::Buffer;
 pub(crate) type GpuCommandHandle = ::metal::CommandBuffer;
+
+// Linux (CUDA)
+#[cfg(target_os = "linux")]
+pub(crate) type GpuBuffer = cuda::CudaBuffer;
+pub(crate) type GpuDevice = cuda::CudaDeviceHandle;
+pub(crate) type GpuCommandHandle = cuda::CudaCommandHandle;
 ```
 
-These aliases let all code outside `gpu/metal/` remain platform-independent.
+These aliases let all code outside `gpu/metal/` and `gpu/cuda/` remain platform-independent. The `alloc_shared_buffer()` and `buffer_host_ptr()` helper functions in `gpu/mod.rs` provide platform-gated wrappers for buffer allocation and host-pointer access.
 
 ### Algorithm Enums
 
@@ -103,7 +138,7 @@ pub(crate) enum CrackVariant {
 
 ## 2. Metal Backend (`src/gpu/metal/mod.rs`)
 
-Two structs implement `GpuBruteForcer`:
+Two structs implement `GpuBruteForcer` on macOS:
 
 ### MetalBruteForcer (HMAC-SHA JWT)
 
@@ -144,9 +179,9 @@ pub(crate) struct MetalAesKwBruteForcer {
 }
 ```
 
-### Buffer Slot Assignments (Both Backends)
+### Buffer Slot Assignments (Metal)
 
-Both backends bind six Metal buffers to fixed slot indices:
+Both Metal backends bind six Metal buffers to fixed slot indices:
 
 | Slot | Buffer | Contents |
 |------|--------|----------|
@@ -159,7 +194,41 @@ Both backends bind six Metal buffers to fixed slot indices:
 
 ---
 
-## 3. Batch System (`src/batch.rs`)
+## 3. CUDA Backend (`src/gpu/cuda/mod.rs`)
+
+Two structs implement `GpuBruteForcer` on Linux:
+
+### CudaBruteForcer (HMAC-SHA JWT)
+
+Uses NVRTC to compile embedded `.cu` kernel sources to PTX at startup. The wordlist mmap is uploaded to GPU VRAM once at construction, so per-batch dispatch only transfers offset/length metadata:
+
+- **Device memory**: Pre-allocated to maximum batch sizes and reused across dispatches.
+- **Pinned host memory**: Host-side batch buffers use `cuMemHostAlloc` (page-locked memory), enabling DMA transfers at full PCIe bandwidth without the driver's internal staging copy.
+- **Interior mutability via `UnsafeCell`**: The `GpuBruteForcer` trait's `encode_and_commit` method takes `&self`, but CUDA dispatch requires mutable access to device buffers (for `memcpy_htod`). Safety is guaranteed by the runner's double-buffer pattern — only one dispatch cycle is in flight at a time.
+
+### CudaAesKwBruteForcer (JWE AES Key Wrap)
+
+Same architecture as `CudaBruteForcer`, but for AES Key Wrap. The kernel source is compiled three times with different `AES_KEY_BYTES` defines, producing specialised kernels for each key size.
+
+### Two-Kernel Strategy (Both Backends)
+
+Each backend (Metal and CUDA) exposes two kernel entry points per algorithm:
+
+- **`mixed`** — handles keys of any length.
+- **`short_keys`** — optimised fast path for short keys (skips the key-hashing step when all candidates are shorter than the hash block size).
+
+### Memory Model Differences
+
+| Aspect | Metal (macOS) | CUDA (Linux) |
+|--------|--------------|--------------|
+| **Memory** | Unified — CPU and GPU share physical RAM | Discrete — explicit host→device copies across PCIe |
+| **Batch buffers** | `StorageModeShared` — zero-copy | Pinned host memory + `memcpy_htod` DMA |
+| **Wordlist data** | Candidate bytes copied into batch buffers by packer threads | Entire mmap uploaded to GPU VRAM once at startup; batches carry only offset/length metadata |
+| **Kernel compilation** | Metal runtime shader compilation at pipeline creation | NVRTC compiles `.cu` to PTX at startup (~200–500ms); compute capability is auto-detected |
+
+---
+
+## 4. Batch System (`src/batch.rs`)
 
 ### The Problem
 
@@ -167,7 +236,7 @@ The GPU needs flat, contiguous buffers. A naive `Vec<String>` causes per-candida
 
 ### The Solution: Struct-of-Arrays Packing
 
-`WordBatch` stores candidates in three parallel arrays packed into pre-allocated Metal shared buffers:
+`WordBatch` stores candidates in three parallel arrays packed into pre-allocated GPU buffers:
 
 ```
 Candidates: "alpha", "be", "cat"
@@ -180,10 +249,10 @@ word_lengths: [5, 2, 3]                          ← byte length of each candida
 ```rust
 pub(crate) struct WordBatch {
     candidate_index_base: u64,       // Global index of first candidate in this batch
-    word_bytes_buf: GpuBuffer,       // Metal shared buffer — visible to both CPU and GPU
+    word_bytes_buf: GpuBuffer,       // GPU buffer — visible to CPU for writing
     word_offsets_buf: GpuBuffer,
     word_lengths_buf: GpuBuffer,
-    word_bytes_ptr: *mut u8,         // Cached raw pointers (avoids ObjC message sends)
+    word_bytes_ptr: *mut u8,         // Cached raw pointers (avoids ObjC message sends on Metal)
     word_offsets_ptr: *mut u32,
     word_lengths_ptr: *mut u16,
     candidate_count: usize,
@@ -192,15 +261,17 @@ pub(crate) struct WordBatch {
 }
 ```
 
+On macOS, `GpuBuffer` is `metal::Buffer` with `StorageModeShared` (unified memory). On Linux, `GpuBuffer` is a pinned host memory allocation (`CudaBuffer`) backed by `cuMemHostAlloc`. In both cases, the cached raw pointers let the packer write candidate data without per-access FFI overhead.
+
 ### Batch Capacity Limits
 
 - **MAX_CANDIDATES_PER_BATCH**: 6,182,240 (~6.2M candidates)
 - **MAX_WORD_BYTES_PER_BATCH**: 32 MiB of packed candidate bytes
-- **APPROX_WORD_BATCH_BUFFER_BYTES**: ~67 MiB total memory per batch
+- **APPROX_WORD_BATCH_BUFFER_BYTES**: ~80 MiB total memory per batch
 
 ### Object Pool Recycling
 
-Allocating Metal buffers involves FFI calls and kernel VM operations. Instead of allocating/freeing per batch, jotcrack allocates a fixed number of batches (`pipeline_depth`, default 10) and recycles them:
+Allocating GPU buffers involves FFI calls and kernel VM operations. Instead of allocating/freeing per batch, jotcrack allocates a fixed number of batches (`pipeline_depth`, default 10) and recycles them:
 
 1. Consumer finishes with a batch → sends it back via `producer.recycle(batch)`
 2. Producer calls `batch.reset_for_reuse()` → clears logical cursors, keeps allocation
@@ -208,15 +279,19 @@ Allocating Metal buffers involves FFI calls and kernel VM operations. Instead of
 
 This amortizes allocation cost to near zero.
 
-### Zero-Copy GPU Dispatch
+### Zero-Copy GPU Dispatch (macOS)
 
 `WordBatch` allocates Metal `StorageModeShared` buffers, meaning the CPU and GPU share the same physical memory on Apple Silicon. When the packer writes candidate bytes into `word_bytes_ptr`, the GPU reads them directly — no copy or transfer step.
 
-`as_dispatch_view()` returns a `DispatchBatchView` — a zero-copy borrow of the batch's buffers and metadata — that gets passed to `gpu.encode_and_commit()`.
+### DMA GPU Dispatch (Linux)
+
+On CUDA, the wordlist mmap is uploaded to GPU VRAM once at construction. Each batch's offset/length metadata is written to pinned host memory buffers, then transferred to device memory via `memcpy_htod` at dispatch time. This achieves full PCIe bandwidth without intermediate staging copies.
+
+`as_dispatch_view()` (macOS) returns a `DispatchBatchView` — a zero-copy borrow of the batch's buffers and metadata — that gets passed to `gpu.encode_and_commit()`. On Linux, `encode_and_commit()` reads directly from the `WordBatch`.
 
 ---
 
-## 4. Parser System (`src/parser.rs`)
+## 5. Parser System (`src/parser.rs`)
 
 ### The Problem
 
@@ -249,43 +324,83 @@ pub(crate) fn batch_shape_can_fit_block(
 ) -> bool
 ```
 
-**Step 5: Pack into Metal buffers.** Packer threads receive a `BatchPlan` and call `pack_batch_plan_into_batch()`, which copies candidate bytes directly from the mmap into Metal shared buffers via `push_segment_bulk()`.
+**Step 5: Pack into GPU buffers.** Packer threads receive a `BatchPlan` and call `pack_batch_plan_into_batch()`, which copies candidate bytes directly from the mmap into GPU buffers via `push_segment_bulk()`.
+
+> **Note:** On Linux (CUDA), steps 3–5 are replaced by a simpler direct-write path — see [Producer Pipeline](#6-producer-pipeline-srcproducerrs) below.
 
 ---
 
-## 5. Producer Pipeline (`src/producer.rs`)
+## 6. Producer Pipeline (`src/producer.rs`)
 
-The producer orchestrates the parser, planner, and packer threads into a three-stage pipeline:
+The producer orchestrates wordlist parsing and batch preparation. Its implementation differs significantly between platforms.
+
+### macOS: Multi-Stage Pipeline
+
+On macOS (Metal, unified memory), the producer uses a three-stage pipeline:
 
 ```
 ┌──────────────────────────────────────────────────┐
 │              Producer Thread                      │
 │                                                  │
-│  ┌──────────┐    ┌───────────┐    ┌───────────┐ │
-│  │ Planner  │───→│ Job Queue │───→│ Packer 1  │ │
-│  │          │    │           │    │ Packer 2  │ │
-│  └──────────┘    └───────────┘    │ Packer N  │ │
-│                                   └─────┬─────┘ │
-│                                         │       │
-│  ┌──────────────┐                       │       │
-│  │ Batch Pool   │◄── recycle ───────────┤       │
-│  │ (recycled    │                       │       │
-│  │  WordBatches)│                       │       │
-│  └──────┬───────┘                       │       │
-│         │                               │       │
-│         └───► Coordinator ◄─────────────┘       │
-│                    │                             │
-│                    ▼                             │
-│              tx ──────────────────────────── rx  │
-└──────────────────────────────────────────────────┘
-                                              │
-                                              ▼
-                                    Consumer (runner.rs)
+│  ┌──────────┐    ┌───────────┐                   │
+│  │ Planner  │───→│ Job Queue │                   │
+│  │          │    │           │                   │
+│  └──────────┘    └─────┬─────┘                   │
+│                        │                         │
+│                        ▼                         │
+│                  ┌───────────┐                   │
+│                  │Coordinator│                   │
+│                  │(inline    │                   │
+│                  │ pack)     │                   │
+│                  └─────┬─────┘                   │
+│                        │                         │
+│  ┌──────────────┐      │                         │
+│  │ Batch Pool   │◄── recycle ────────────────┐   │
+│  │ (recycled    │                            │   │
+│  │  WordBatches)│                            │   │
+│  └──────────────┘                            │   │
+│                        │                     │   │
+│                        ▼                     │   │
+│              tx ─────────────────────── rx   │   │
+└──────────────────────────────────────────────┘   │
+                                          │        │
+                                          ▼        │
+                                Consumer (runner.rs)
+```
+
+Parser threads scan the mmap in parallel, a planner thread groups lines into `BatchPlan` objects, and a coordinator thread inline-packs them into `WordBatch` GPU buffers (Metal shared memory). The coordinator pulls recycled batches from the pool, packs the next plan, and sends the filled batch downstream.
+
+### Linux: Parallel Direct-Write
+
+On Linux (CUDA, discrete GPU), the entire mmap is uploaded to GPU VRAM once at startup. "Packing" is just writing offset/length metadata to pinned host memory — no candidate bytes need to be copied per batch.
+
+Multiple worker threads each scan a newline-aligned region of the mmap with SIMD `memchr` and write offset/length metadata directly to GPU batch buffers. This eliminates all intermediate data structures (`ParsedChunk`, `BatchPlan`, block summaries) and avoids the coordinator bottleneck:
+
+```
+┌──────────────────────────────────────────────┐
+│           Worker Threads (N)                  │
+│                                              │
+│  Worker 1: scan region → stage locally →     │
+│            flush offsets/lengths to batch     │
+│  Worker 2: scan region → stage locally →     │
+│            flush offsets/lengths to batch     │
+│  Worker N: ...                               │
+│                                              │
+│  Each worker:                                │
+│    1. Receives an empty batch from the pool  │
+│    2. Scans its mmap region with memchr      │
+│    3. Stages offsets/lengths in L1-cached     │
+│       local buffers                          │
+│    4. Bulk-flushes to pinned host memory     │
+│       when a batch boundary is hit           │
+│    5. Sends the filled batch to the consumer │
+│    6. Last worker to finish sends EOF        │
+└──────────────────────────────────────────────┘
 ```
 
 ### Bounded Channel Backpressure
 
-The producer-to-consumer channel uses `sync_channel(pipeline_depth)`. This prevents the producer from parsing the entire wordlist into memory while the GPU is still processing early batches. Memory usage is bounded to `pipeline_depth × 67 MiB`.
+The producer-to-consumer channel uses `sync_channel(pipeline_depth)`. This prevents the producer from parsing the entire wordlist into memory while the GPU is still processing early batches. Memory usage is bounded to `pipeline_depth × ~80 MiB`.
 
 ### ProducerMessage
 
@@ -299,7 +414,7 @@ pub(crate) enum ProducerMessage {
 
 ---
 
-## 6. Runner & Double-Buffered Dispatch (`src/runner.rs`)
+## 7. Runner & Double-Buffered Dispatch (`src/runner.rs`)
 
 The runner ties everything together with a generic dispatch loop:
 
@@ -309,8 +424,11 @@ fn run_gpu_crack<B: GpuBruteForcer>(
     mut gpu: B,
     target_data: &[u8],
     args: WordlistArgs,
+    #[cfg(target_os = "linux")] mmap_source: &[u8],
 ) -> anyhow::Result<bool>
 ```
+
+On Linux, the runner also opens its own mmap of the wordlist file (sharing OS page cache pages with the producer's mmap) for two purposes: uploading the wordlist to GPU VRAM, and reconstructing the matching candidate after the GPU finds a hit.
 
 ### Double-Buffering Pattern
 
@@ -345,9 +463,11 @@ Before the pipeline starts, the runner parses the input token:
 
 ---
 
-## 7. Metal Shader Kernels
+## 8. GPU Shader Kernels
 
-### HMAC-SHA Kernels (`hs256_wordlist.metal`, `hs512_wordlist.metal`)
+Both Metal and CUDA backends implement the same algorithmic structure. The CUDA ports preserve the same optimizations as the Metal originals.
+
+### HMAC-SHA Kernels (`hs256_wordlist.{metal,cu}`, `hs512_wordlist.{metal,cu}`)
 
 Each GPU thread (identified by `gid`) processes one candidate:
 
@@ -355,15 +475,15 @@ Each GPU thread (identified by `gid`) processes one candidate:
 2. Derive the HMAC key (zero-pad if short, SHA-hash if longer than block size)
 3. Compute HMAC: `SHA(key⊕opad ‖ SHA(key⊕ipad ‖ message))`
 4. Compare against `target_signature` (precomputed as native-endian words on the host)
-5. On match: `atomic_fetch_min(result_buf, gid)` — lowest matching index wins
+5. On match: `atomic_fetch_min(result_buf, gid)` / `atomicMin(result_buf, gid)` — lowest matching index wins
 
 **Optimizations:**
 - Rolling message schedule (`w[16]` instead of `w[64]`) reduces register pressure
 - Flat HMAC implementation avoids streaming context overhead
 - Host pre-converts signature to native-endian u32/u64 words
-- SHA-256 constant K values cached across SIMD groups
+- SHA-256 constant K values cached across SIMD groups/warps
 
-### AES Key Wrap Kernel (`aeskw_wordlist.metal`)
+### AES Key Wrap Kernel (`aeskw_wordlist.{metal,cu}`)
 
 Compiled three times with different `#define AES_KEY_BYTES` values (16, 24, 32):
 
@@ -374,27 +494,33 @@ Compiled three times with different `#define AES_KEY_BYTES` values (16, 24, 32):
 5. On match: atomic write to result buffer
 
 **Optimizations:**
-- Compile-time specialization lets Metal unroll key-size-dependent loops
-- S-boxes in `constant` address space (hardware-cached)
+- Compile-time specialization lets the compiler unroll key-size-dependent loops
+- S-boxes in `constant` (Metal) / `__constant__` (CUDA) address space (hardware-cached, broadcast across SIMD groups/warps)
 - GF(2^8) arithmetic via `xtime` helper avoids extra lookup tables
+
+### CUDA-Specific Details
+
+- **Unified address space**: CUDA's flat global memory model eliminates the need for Metal-style duplicate helper functions across `device`/`constant`/`threadgroup` address spaces.
+- **`__constant__` memory**: SHA round constants and AES S-box tables use CUDA's dedicated 64KB constant cache, which broadcasts reads to all 32 threads in a warp simultaneously.
+- **NVRTC runtime compilation**: Kernel sources are compiled to PTX at startup via NVIDIA's Runtime Compilation library. Compute capability is auto-detected for architecture-specific codegen.
 
 ---
 
-## 8. Statistics & Timing (`src/stats.rs`)
+## 9. Statistics & Timing (`src/stats.rs`)
 
 Every batch records a detailed timing breakdown:
 
 | Metric | What It Measures |
 |--------|-----------------|
 | `plan_time` | Planner grouping lines into a BatchPlan |
-| `pack_time` | Packer copying bytes into Metal buffers |
+| `pack_time` | Packer copying bytes into GPU buffers |
 | `host_prep` | Writing params, resetting sentinel |
-| `command_encode` | Metal API calls to encode GPU commands |
+| `command_encode` | GPU API calls to encode commands |
 | `gpu_wait` | Actual GPU compute time |
 | `result_readback` | Reading the result buffer |
 | `consumer_idle_wait` | Time consumer blocks waiting for the producer |
 
-Windowed rate reporting prints throughput every second. The final report shows both end-to-end and GPU-only throughput.
+Windowed rate reporting prints throughput every second. The final report shows both end-to-end and GPU-only throughput, highlighting whether the CPU or GPU is the bottleneck.
 
 ---
 
@@ -404,12 +530,15 @@ Windowed rate reporting prints throughput every second. The final report shows b
 |-----------|---------|
 | **Memory-mapped I/O** | Process 100+ GB files without loading into RAM |
 | **Parallel chunk parsing** | Multiple threads scan independent file regions concurrently |
-| **Block-level batch planning** | O(n/4000) capacity checks instead of O(n) per-line |
+| **Block-level batch planning** | O(n/4000) capacity checks instead of O(n) per-line (macOS) |
+| **Direct-write parsing** | Eliminate intermediate data structures entirely (Linux) |
 | **Struct-of-Arrays packing** | Minimal overhead, matches GPU memory layout exactly |
 | **Zero-copy shared buffers** | CPU writes directly to GPU-visible memory (Apple unified memory) |
-| **Cached raw pointers** | Avoids Objective-C message sends in the hot loop |
-| **Object pool recycling** | Allocate Metal buffers once, reuse indefinitely |
+| **Pinned host memory + DMA** | Full PCIe bandwidth transfers without staging copies (CUDA) |
+| **One-time VRAM upload** | Wordlist uploaded to GPU memory once; batches carry only metadata (CUDA) |
+| **Cached raw pointers** | Avoids Objective-C message sends in the hot loop (Metal) |
+| **Object pool recycling** | Allocate GPU buffers once, reuse indefinitely |
 | **Double-buffered dispatch** | GPU never idles — always processing while CPU prepares next batch |
-| **Bounded backpressure** | Memory usage capped at `pipeline_depth × 67 MiB` |
+| **Bounded backpressure** | Memory usage capped at `pipeline_depth × ~80 MiB` |
 | **Compile-time shader specialization** | Dead-code elimination and exact register allocation per algorithm |
-| **Autotune threadgroup width** | Benchmark optimal GPU parallelism on first batch |
+| **Autotune threadgroup/block width** | Benchmark optimal GPU parallelism on first batch |
