@@ -276,7 +276,7 @@ __device__ __forceinline__ void store_be_u64(uint8* p, uint64 v) {
 // Metal's `static inline`.  Both achieve the same effect: the function
 // is compiled for the GPU and inlined at every call site to avoid the
 // overhead of a function call in the hot compression loop.
-__device__ __forceinline__ void sha512_compress_rolling(uint64 state[8], uint64 w[16]) {
+__device__ __noinline__ void sha512_compress_rolling(uint64 state[8], uint64 w[16]) {
     uint64 a = state[0];
     uint64 b = state[1];
     uint64 c = state[2];
@@ -482,7 +482,7 @@ __device__ __forceinline__ void load_key_words_64(const uint8* key, uint32 key_l
 // Outer message = 128 (opad) + 48 (digest) = 176 bytes  ->  bit_len = 1408.
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ bool hmac_sha384_from_key_words(
+__device__ __noinline__ bool hmac_sha384_from_key_words(
     const uint64 kw[16],
     const uint8* message,
     uint32 message_len,
@@ -638,7 +638,7 @@ __device__ __forceinline__ bool hmac_sha384_from_key_words(
 // Outer message = 128 (opad) + 64 (digest) = 192 bytes  ->  bit_len = 1536.
 // ---------------------------------------------------------------------------
 
-__device__ __forceinline__ bool hmac_sha512_from_key_words(
+__device__ __noinline__ bool hmac_sha512_from_key_words(
     const uint64 kw[16],
     const uint8* message,
     uint32 message_len,

@@ -109,6 +109,13 @@
 // AES block cipher changes.
 // ===========================================================================
 
+// CUDA / NVRTC does not implicitly include <stdint.h>, so we define the
+// fixed-width integer types we need.  Matches hs256_wordlist.cu lines 89-92.
+typedef unsigned long long uint64_t;
+typedef unsigned int       uint32_t;
+typedef unsigned short     uint16_t;
+typedef unsigned char      uint8_t;
+
 // ---------------------------------------------------------------------------
 // Compile-time AES variant configuration
 //

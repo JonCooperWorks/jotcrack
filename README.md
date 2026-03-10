@@ -37,7 +37,7 @@ JWE tokens encrypted with A128KW/A192KW/A256KW wrap the Content Encryption Key (
 - Rust toolchain (`cargo`)
 
 **Linux:**
-- NVIDIA GPU with CUDA 11.4+ (tested on RTX PRO 6000 with CUDA 13.1 on [vast.ai](https://cloud.vast.ai/?ref_id=394548))
+- NVIDIA GPU with CUDA 11.4+ (tested on A100-SXM4-80GB with CUDA 13.0 and RTX PRO 6000 with CUDA 13.1 on [vast.ai](https://cloud.vast.ai/?ref_id=394548))
 - NVIDIA driver with CUDA runtime and NVRTC libraries
 - Rust toolchain (`cargo`)
 
@@ -180,6 +180,14 @@ All three HMAC algorithms hit the same ~795 M/s end-to-end because the pipeline 
 Performance scales linearly with AES round count — each additional 2 rounds adds ~12% overhead. The AES Key Wrap shader uses software AES with S-box lookup tables in GPU constant memory, broadcast-cached across SIMD groups/warps.
 
 ### Markov Mode
+
+**NVIDIA A100-SXM4-80GB** (80 GB VRAM, CUDA 13.0) with threshold=30, length=8:
+
+| Algorithm | End-to-End | GPU-Only | Keyspace (T=30, L=8) |
+|-----------|-----------|----------|----------------------|
+| **HS256** | **1.42 B/s** | 1.42 B/s | 656B candidates |
+| **HS384** | **612 M/s** | 613 M/s | 656B candidates |
+| **HS512** | **611 M/s** | 613 M/s | 656B candidates |
 
 **Apple M4 Max** (40-core GPU, 64 GB RAM) with threshold=30:
 
