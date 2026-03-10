@@ -517,11 +517,6 @@ pub(crate) fn pack_batch_plan_into_batch(
         );
     }
 
-    // On Linux (zero-copy), push_segment_bulk skips per-segment word_bytes_len
-    // and max_word_len computation. Set them from the plan's pre-computed values.
-    #[cfg(target_os = "linux")]
-    batch.set_plan_metadata(plan.word_bytes_len, plan.max_word_len);
-
     if batch.candidate_count() != plan.candidate_count {
         bail!(
             "batch plan candidate count mismatch: packed {} planned {}",
@@ -1254,21 +1249,10 @@ mod tests {
         assert_eq!(batch.candidate_count(), 3);
         assert_eq!(batch.lengths_slice(), &[5, 2, 7]);
         assert_eq!(batch.max_word_len(), 7);
-        // Per-candidate reconstruction is the semantic invariant we care about.
-        // On Linux (zero-copy), use word_from_source since offsets are absolute mmap positions.
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(batch.word_from_source(0, mmap.as_ref()).unwrap(), b"alpha");
-            assert_eq!(batch.word_from_source(1, mmap.as_ref()).unwrap(), b"be");
-            assert_eq!(batch.word_from_source(2, mmap.as_ref()).unwrap(), b"charlie");
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = &mmap;
-            assert_eq!(batch.word(0).unwrap(), b"alpha");
-            assert_eq!(batch.word(1).unwrap(), b"be");
-            assert_eq!(batch.word(2).unwrap(), b"charlie");
-        }
+        let _ = &mmap;
+        assert_eq!(batch.word(0).unwrap(), b"alpha");
+        assert_eq!(batch.word(1).unwrap(), b"be");
+        assert_eq!(batch.word(2).unwrap(), b"charlie");
         assert!(reader.next_batch_reusing(None).unwrap().is_none());
 
         let _ = fs::remove_file(path);
@@ -1281,17 +1265,9 @@ mod tests {
         let batch = reader.next_batch_reusing(None).unwrap().unwrap();
 
         assert_eq!(batch.candidate_count(), 2);
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(batch.word_from_source(0, mmap.as_ref()).unwrap(), b"alpha");
-            assert_eq!(batch.word_from_source(1, mmap.as_ref()).unwrap(), b"beta");
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = &mmap;
-            assert_eq!(batch.word(0).unwrap(), b"alpha");
-            assert_eq!(batch.word(1).unwrap(), b"beta");
-        }
+        let _ = &mmap;
+        assert_eq!(batch.word(0).unwrap(), b"alpha");
+        assert_eq!(batch.word(1).unwrap(), b"beta");
         assert!(reader.next_batch_reusing(None).unwrap().is_none());
 
         let _ = fs::remove_file(path);
@@ -1401,15 +1377,6 @@ mod tests {
                     assert_eq!(packed.max_word_len(), direct_batch.max_word_len());
                     assert_eq!(packed.lengths_slice(), direct_batch.lengths_slice());
                     for i in 0..packed.candidate_count() {
-                        // On Linux (zero-copy), use word_from_source since offsets are
-                        // absolute mmap positions.
-                        #[cfg(target_os = "linux")]
-                        assert_eq!(
-                            packed.word_from_source(i, mmap.as_ref()),
-                            direct_batch.word_from_source(i, mmap.as_ref()),
-                            "candidate {} mismatch", i
-                        );
-                        #[cfg(not(target_os = "linux"))]
                         assert_eq!(packed.word(i), direct_batch.word(i),
                             "candidate {} mismatch", i);
                     }

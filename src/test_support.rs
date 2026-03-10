@@ -360,28 +360,18 @@ fn generate_jwe_token_files() {
 /// Same as `collect_all_words_from_mmap_reader` but for the parallel reader.
 /// Having both variants avoids test code needing to know which reader type
 /// is being tested — each test picks the appropriate helper.
-///
-/// On Linux (zero-copy path), offsets are absolute mmap positions, so we
-/// reconstruct candidates from the mmap via `word_from_source`. On macOS,
-/// the batch's local word_bytes buffer is populated as usual.
 pub(crate) fn collect_all_words_from_parallel_reader(
     reader: &mut ParallelMmapWordlistBatchReader,
 ) -> Vec<Vec<u8>> {
-    let mmap = reader.shared_mmap();
     let mut out = Vec::new();
     while let Some(batch) = reader
         .next_batch_reusing(None)
         .expect("parallel mmap batch")
     {
         for i in 0..batch.candidate_count() {
-            #[cfg(target_os = "linux")]
-            let w = batch.word_from_source(i, mmap.as_ref()).expect("candidate");
-            #[cfg(not(target_os = "linux"))]
             let w = batch.word(i).expect("candidate");
             out.push(w.to_vec());
         }
     }
-    // Suppress unused variable warning on macOS.
-    let _ = &mmap;
     out
 }

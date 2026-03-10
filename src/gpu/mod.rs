@@ -185,6 +185,30 @@ pub(crate) trait GpuBruteForcer {
         target_signature: &[u8],
         batch: &WordBatch,
     ) -> anyhow::Result<()>;
+
+    /// Whether the entire wordlist mmap is pre-uploaded to GPU VRAM.
+    ///
+    /// ## Two dispatch modes
+    ///
+    /// When `true` (zero-copy), the entire wordlist file was uploaded to VRAM
+    /// at construction. Per-batch dispatch only copies the small metadata
+    /// arrays (offsets and lengths). The GPU kernel reads candidate bytes
+    /// directly from VRAM using absolute mmap offsets. This is the fast path.
+    ///
+    /// When `false` (per-batch copy), the wordlist was too large for VRAM.
+    /// Each batch copies its word bytes (~32 MiB) from pinned host memory to
+    /// a reusable device buffer before kernel launch. Offsets are batch-relative
+    /// (starting from 0) instead of absolute mmap positions. This is the
+    /// fallback path — slower due to PCIe transfers, but avoids OOM crashes.
+    ///
+    /// ## Default
+    ///
+    /// Returns `false`. Metal (macOS) always uses per-batch copies (unified
+    /// memory makes the distinction moot). CUDA implementations override this
+    /// to return the runtime decision from `new()`.
+    fn zero_copy(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------

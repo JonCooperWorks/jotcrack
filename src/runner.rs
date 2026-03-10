@@ -33,14 +33,24 @@ struct InFlightBatch {
 
 /// Print match result after a successful crack.
 ///
-/// Shared by both the GPU (HMAC) and CPU (JWE) paths. Takes the
-/// `WordBatch` directly rather than an `InFlightBatch` so it works
-/// regardless of whether the batch came from GPU dispatch or CPU
-/// processing.
+/// ## Candidate reconstruction: two paths
 ///
-/// On Linux (zero-copy path), `mmap_source` provides the wordlist bytes
-/// for candidate reconstruction. On macOS, it is `None` and `word_string_lossy`
-/// reads from the batch's local word_bytes buffer.
+/// After the GPU finds a matching candidate, we need to reconstruct the
+/// actual password string from the batch. How we do this depends on the
+/// dispatch mode:
+///
+/// - **`mmap_source = Some(mmap)`** (zero-copy path): The batch contains
+///   absolute mmap offsets, and word bytes were NOT copied into the batch.
+///   We read the candidate directly from the mmap using
+///   `word_string_lossy_from_source(index, mmap)`.
+///
+/// - **`mmap_source = None`** (per-batch copy path): The batch contains
+///   batch-relative offsets, and word bytes ARE in the batch's buffer.
+///   We read the candidate from the batch itself using
+///   `word_string_lossy(index)`.
+///
+/// On macOS, `mmap_source` is always `None` (Metal uses unified memory,
+/// so all dispatch goes through the per-batch path).
 fn handle_match(
     variant: CrackVariant,
     batch: &super::batch::WordBatch,
@@ -48,7 +58,7 @@ fn handle_match(
     candidates_tested: u64,
     started_at: Instant,
     timings: &RunTimings,
-    #[cfg(target_os = "linux")] mmap_source: &[u8],
+    mmap_source: Option<&[u8]>,
 ) -> anyhow::Result<bool> {
     let elapsed = started_at.elapsed();
     let rate_end_to_end = rate_per_second(candidates_tested, elapsed);
@@ -56,14 +66,15 @@ fn handle_match(
     print_final_stats(candidates_tested, elapsed, rate_end_to_end, rate_compute_only, timings);
     let local_index = usize::try_from(local_match_index)
         .context("returned invalid result index")?;
-    #[cfg(target_os = "linux")]
-    let secret = batch
-        .word_string_lossy_from_source(local_index, mmap_source)
-        .ok_or_else(|| anyhow!("returned invalid local candidate index"))?;
-    #[cfg(not(target_os = "linux"))]
-    let secret = batch
-        .word_string_lossy(local_index)
-        .ok_or_else(|| anyhow!("returned invalid local candidate index"))?;
+    let secret = if let Some(mmap) = mmap_source {
+        batch
+            .word_string_lossy_from_source(local_index, mmap)
+            .ok_or_else(|| anyhow!("returned invalid local candidate index"))?
+    } else {
+        batch
+            .word_string_lossy(local_index)
+            .ok_or_else(|| anyhow!("returned invalid local candidate index"))?
+    };
     println!("{} key: {secret}", variant.label());
     Ok(true)
 }
@@ -85,11 +96,22 @@ pub(crate) fn run_wordlist_crack(
     variant: CrackVariant,
     args: WordlistArgs,
 ) -> anyhow::Result<bool> {
-    // On Linux (CUDA), open the mmap for two purposes:
-    //   1. Upload the entire wordlist to GPU VRAM once (zero-copy dispatch)
-    //   2. Reconstruct the matching candidate after GPU finds a hit
-    // This mmap shares the same OS page cache pages as the producer's mmap,
-    // so it costs virtually no extra physical memory.
+    // On Linux (CUDA), open the mmap for the GPU backend's VRAM upload.
+    //
+    // This mmap serves two purposes:
+    //   1. **GPU init**: Passed to CudaBruteForcer::new() / CudaAesKwBruteForcer::new()
+    //      for the VRAM capacity check. If the file fits, it's uploaded to VRAM.
+    //   2. **Match reconstruction** (zero-copy only): When the GPU reports a hit,
+    //      we read the matching candidate directly from this mmap using the
+    //      absolute offset stored in the batch.
+    //
+    // The mmap shares OS page cache pages with the producer's separate mmap,
+    // so it costs virtually no extra physical memory — the kernel maps the
+    // same file pages into both address ranges.
+    //
+    // In per-batch mode (file > VRAM), the mmap is still needed for step 1
+    // (the VRAM check), but `mmap_source` will be `None` because match
+    // reconstruction uses the batch's local word_bytes buffer instead.
     #[cfg(target_os = "linux")]
     let mmap = {
         let file = std::fs::File::open(&args.wordlist)
@@ -105,10 +127,20 @@ pub(crate) fn run_wordlist_crack(
             let gpu = MetalBruteForcer::new(hv, &signing_input)?;
             #[cfg(target_os = "linux")]
             let gpu = CudaBruteForcer::new(hv, &signing_input, &mmap)?;
+            // Wire the GPU's zero_copy decision through to:
+            //   - `mmap_source`: controls how handle_match reconstructs the key
+            //   - `zero_copy`: controls how the producer packs word bytes
+            //
+            // On macOS, both are always false/None — Metal uses unified memory
+            // and doesn't distinguish between zero-copy and per-batch modes.
             #[cfg(target_os = "linux")]
-            return run_gpu_crack(variant, gpu, &target_signature, args, &mmap);
+            {
+                let zc = gpu.zero_copy();
+                let mmap_source: Option<&[u8]> = if zc { Some(&mmap) } else { None };
+                return run_gpu_crack(variant, gpu, &target_signature, args, mmap_source, zc);
+            }
             #[cfg(not(target_os = "linux"))]
-            run_gpu_crack(variant, gpu, &target_signature, args)
+            run_gpu_crack(variant, gpu, &target_signature, args, None, false)
         }
         CrackVariant::JweAesKw(akv) => {
             let encrypted_key = parse_jwe_aes_kw(akv, &args.jwt)?;
@@ -117,10 +149,15 @@ pub(crate) fn run_wordlist_crack(
             let gpu = MetalAesKwBruteForcer::new(akv, &encrypted_key, n)?;
             #[cfg(target_os = "linux")]
             let gpu = CudaAesKwBruteForcer::new(akv, &encrypted_key, n, &mmap)?;
+            // Same zero_copy wiring as the HMAC path above.
             #[cfg(target_os = "linux")]
-            return run_gpu_crack(variant, gpu, &encrypted_key, args, &mmap);
+            {
+                let zc = gpu.zero_copy();
+                let mmap_source: Option<&[u8]> = if zc { Some(&mmap) } else { None };
+                return run_gpu_crack(variant, gpu, &encrypted_key, args, mmap_source, zc);
+            }
             #[cfg(not(target_os = "linux"))]
-            run_gpu_crack(variant, gpu, &encrypted_key, args)
+            run_gpu_crack(variant, gpu, &encrypted_key, args, None, false)
         }
     }
 }
@@ -326,23 +363,31 @@ fn run_markov_dispatch<B: GpuMarkovBruteForcer>(
 /// GPU-accelerated cracking pipeline, generic over the brute-forcer backend.
 ///
 /// This is the shared dispatch loop used by both HMAC-SHA (via
-/// `MetalBruteForcer`) and JWE A128KW (via `MetalAesKwBruteForcer`).
-/// The caller is responsible for parsing the token and constructing the
-/// appropriate GPU backend; this function handles the double-buffered
-/// GPU dispatch loop, timing, and result reporting.
+/// `MetalBruteForcer` / `CudaBruteForcer`) and JWE AES Key Wrap (via
+/// `MetalAesKwBruteForcer` / `CudaAesKwBruteForcer`). The caller is
+/// responsible for parsing the token and constructing the appropriate
+/// GPU backend; this function handles the double-buffered GPU dispatch
+/// loop, timing, and result reporting.
 ///
 /// ## Parameters
 ///
 /// - `target_data`: the bytes passed to `gpu.encode_and_commit()`. For
-///   HMAC, this is the JWT signature. For A128KW, the implementation
+///   HMAC, this is the JWT signature. For AES Key Wrap, the implementation
 ///   ignores it (encrypted_key is pre-loaded in the GPU buffer), but
 ///   we pass it through to satisfy the trait contract.
+/// - `mmap_source`: `Some(&mmap)` when zero-copy mode is active (the
+///   wordlist is in VRAM and match reconstruction needs the host mmap).
+///   `None` in per-batch mode or on macOS (candidates are in the batch).
+/// - `zero_copy`: passed to the producer so it knows whether to write
+///   absolute mmap offsets (true) or copy word bytes per-batch (false).
 fn run_gpu_crack<B: GpuBruteForcer>(
     variant: CrackVariant,
     mut gpu: B,
     target_data: &[u8],
     args: WordlistArgs,
-    #[cfg(target_os = "linux")] mmap_source: &[u8],
+    mmap_source: Option<&[u8]>,
+    #[cfg(target_os = "linux")] zero_copy: bool,
+    #[cfg(not(target_os = "linux"))] _zero_copy: bool,
 ) -> anyhow::Result<bool> {
     let parser_config = args.parser_config();
     let pipeline_depth = args.pipeline_depth.unwrap_or(DEFAULT_PIPELINE_DEPTH);
@@ -373,6 +418,8 @@ fn run_gpu_crack<B: GpuBruteForcer>(
         gpu.device().clone(),
         parser_config,
         pipeline_depth,
+        #[cfg(target_os = "linux")]
+        zero_copy,
     );
     let run_result = (|| -> anyhow::Result<bool> {
         let started_at = Instant::now();
@@ -406,7 +453,7 @@ fn run_gpu_crack<B: GpuBruteForcer>(
                     return handle_match(
                         variant, &flight.batch, local_match_index,
                         candidates_tested, started_at, &timings,
-                        #[cfg(target_os = "linux")] mmap_source,
+                        mmap_source,
                     );
                 }
 

@@ -149,6 +149,16 @@ Exit codes:
 
 All three HMAC algorithms hit the same ~795 M/s end-to-end because the pipeline is CPU-bound — the GPU finishes each batch before the next one is ready. GPU-only rates show NVIDIA's native 64-bit ALUs handle SHA-512 much better than Apple Silicon's 32-bit emulation.
 
+**NVIDIA A100-SXM4-80GB** (80 GB VRAM, CUDA 13.0) with a 109 GB wordlist (~13.8 billion candidates):
+
+| Algorithm | End-to-End | GPU-Only |
+|-----------|-----------|----------|
+| **HS256** | **502 M/s** | 2.95 B/s |
+| **HS384** | **463 M/s** | 818 M/s |
+| **HS512** | **448 M/s** | 874 M/s |
+
+With wordlists larger than VRAM (109 GB > 80 GB), jotcrack automatically falls back to per-batch word byte copies over PCIe instead of the zero-copy mmap path. End-to-end rates are lower than RTX PRO 6000 due to the PCIe transfer overhead.
+
 **Apple M4 Max** (40-core GPU, 64 GB RAM) with a 112 GB wordlist (16.4 billion candidates):
 
 | Algorithm | End-to-End | GPU-Only | vs HS256 |
@@ -168,6 +178,14 @@ All three HMAC algorithms hit the same ~795 M/s end-to-end because the pipeline 
 | **A128KW** | **145 M/s** | 146 M/s | 10 | 16 bytes |
 | **A192KW** | **120 M/s** | 121 M/s | 12 | 24 bytes |
 | **A256KW** | **104 M/s** | 104 M/s | 14 | 32 bytes |
+
+**NVIDIA A100-SXM4-80GB** with a 109 GB wordlist (~13.8 billion candidates):
+
+| Algorithm | End-to-End | GPU-Only | AES Rounds | Key Size |
+|-----------|-----------|----------|------------|----------|
+| **A128KW** | **47.0 M/s** | 47.1 M/s | 10 | 16 bytes |
+| **A192KW** | **39.3 M/s** | 39.4 M/s | 12 | 24 bytes |
+| **A256KW** | **33.8 M/s** | 33.8 M/s | 14 | 32 bytes |
 
 **Apple M4 Max** with breach.txt (~296M candidates):
 
@@ -265,7 +283,7 @@ src/
 - **GPU kernels are embedded** via `include_str!()` — the binary is fully self-contained. Metal shaders are compiled at pipeline creation; CUDA kernels are compiled to PTX at startup via NVRTC
 - **Platform abstraction**: the `GpuBruteForcer` trait and platform-gated type aliases (`GpuBuffer`, `GpuDevice`, `GpuCommandHandle`) keep Metal and CUDA concerns isolated — `runner.rs`, `batch.rs`, and `producer.rs` compile unchanged on both platforms
 - **Double-buffered dispatch**: the next batch is parsed and packed while the GPU processes the current one
-- **Zero-copy batches** (Metal): wordlist parser writes directly into Metal shared-memory buffers. On CUDA, **pinned (page-locked) host memory** enables DMA transfers at full PCIe bandwidth without intermediate staging copies
+- **Zero-copy batches** (Metal): wordlist parser writes directly into Metal shared-memory buffers. On CUDA, when the wordlist fits in VRAM, the entire mmap is uploaded once and the kernel reads candidate bytes directly — per-batch dispatch only copies small metadata arrays. When the wordlist exceeds VRAM, jotcrack automatically falls back to per-batch word byte copies over PCIe
 - **Two kernel variants per algorithm**: a "short-key" specialization avoids the long-key hash-first path
 - **Compile-time AES specialisation**: the AES Key Wrap kernel is compiled three times with different `#define AES_KEY_BYTES` values, producing fully specialised kernels per variant (no runtime branching, exact register allocation)
 - **Autotune**: `--autotune` benchmarks several threadgroup/block widths on the first batch and picks the fastest

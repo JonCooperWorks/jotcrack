@@ -362,16 +362,6 @@ impl WordBatch {
     // Allocate fixed-capacity shared buffers sized to the batch caps so parser
     // writes can go straight into memory later bound to the kernel.
     pub(crate) fn new(device: &GpuDevice, candidate_index_base: u64) -> Self {
-        // On Linux (zero-copy mmap dispatch), the GPU reads candidate bytes
-        // from the pre-uploaded mmap — word_bytes_buf is never written to
-        // by the production path (push_segment_bulk). Allocate just 1 byte
-        // to save ~44 MiB per batch (440 MiB total at pipeline_depth=10).
-        //
-        // In test mode, the sequential reader uses push_candidate which
-        // writes directly into word_bytes_buf, so we need the full allocation.
-        #[cfg(all(target_os = "linux", not(test)))]
-        let word_bytes_buf = alloc_shared_buffer(device, 1);
-        #[cfg(not(all(target_os = "linux", not(test))))]
         let word_bytes_buf = alloc_shared_buffer(device, WORD_BYTES_ALLOC_SIZE);
         let word_offsets_buf =
             alloc_shared_buffer(device, MAX_CANDIDATES_PER_BATCH * std::mem::size_of::<u32>());
@@ -562,32 +552,47 @@ impl WordBatch {
         Ok(())
     }
 
-    /// Set word_bytes_len and max_word_len from pre-computed BatchPlan values.
-    ///
-    /// On Linux (zero-copy), `push_segment_bulk` skips per-segment O(count)
-    /// scans for these values since the BatchPlan already computed them during
-    /// planning. This method is called once after all segments are packed.
-    #[cfg(target_os = "linux")]
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Set word_bytes_len and max_word_len from pre-computed values.
+    #[allow(dead_code)]
     pub(crate) fn set_plan_metadata(&mut self, word_bytes_len: usize, max_word_len: u16) {
         self.word_bytes_len = word_bytes_len;
         self.max_word_len = max_word_len;
     }
 
     /// Raw mutable pointer to the offsets buffer for direct bulk writes.
-    #[cfg(target_os = "linux")]
+    ///
+    /// Used by the Linux producer's `flush_staged_to_batch` to write
+    /// candidate offsets directly into pinned GPU memory via memcpy,
+    /// bypassing the per-candidate `push_candidate` path.
+    #[allow(dead_code)]
     pub(crate) fn word_offsets_ptr_mut(&mut self) -> *mut u32 {
         self.word_offsets_ptr
     }
 
     /// Raw mutable pointer to the lengths buffer for direct bulk writes.
-    #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     pub(crate) fn word_lengths_ptr_mut(&mut self) -> *mut u16 {
         self.word_lengths_ptr
     }
 
-    /// Update counts after a bulk write of pre-staged metadata.
-    #[cfg(target_os = "linux")]
+    /// Raw mutable pointer to the word_bytes buffer for direct bulk writes.
+    ///
+    /// Used in per-batch copy mode by the Linux producer to copy candidate
+    /// bytes from the mmap into the batch's pinned buffer.
+    #[allow(dead_code)]
+    pub(crate) fn word_bytes_ptr_mut(&mut self) -> *mut u8 {
+        self.word_bytes_ptr
+    }
+
+    /// Update logical cursors after a bulk write of pre-staged metadata.
+    ///
+    /// Called by `flush_staged_to_batch` after writing offsets, lengths,
+    /// and (in per-batch mode) word bytes directly into the batch's pinned
+    /// GPU memory. The arguments reflect the new state of the batch:
+    ///   - `count`: number of candidates just flushed
+    ///   - `word_bytes_len`: total word bytes in the batch after flush
+    ///   - `max_word_len`: longest candidate in the batch (for kernel selection)
+    #[allow(dead_code)]
     pub(crate) fn set_staged_counts(
         &mut self,
         count: usize,
@@ -731,11 +736,7 @@ impl WordBatch {
         );
 
         let base_idx = self.candidate_count;
-        #[cfg(not(target_os = "linux"))]
         let wb_cursor = self.word_bytes_len;
-        // On Linux (zero-copy), mmap bytes aren't copied — suppress unused warning.
-        #[cfg(target_os = "linux")]
-        let _ = mmap;
 
         // SAFETY: all capacity checks were performed at plan time via
         // `batch_shape_can_fit`. The plan guarantees candidate_count and
@@ -745,80 +746,44 @@ impl WordBatch {
             let lengths_base = self.word_lengths_ptr.add(base_idx);
 
             // BULK METADATA: copy lengths in one memcpy (contiguous u16 slice).
-            // Same on all platforms — the GPU always needs per-candidate lengths.
             std::ptr::copy_nonoverlapping(
                 chunk_lengths.as_ptr().add(line_start),
                 lengths_base,
                 count,
             );
 
-            // ---------- Platform-specific word_bytes + offsets handling ----------
-            //
-            // macOS (Metal): Unified memory — CPU and GPU share physical RAM.
-            //   Copy candidate bytes into the batch's word_bytes buffer (single
-            //   bulk memcpy including inter-candidate gaps), then write batch-
-            //   relative offsets into word_bytes.
-            //
-            // Linux (CUDA): Discrete GPU — the entire mmap is uploaded to GPU
-            //   VRAM once at startup. No per-batch byte copy needed. Offsets
-            //   are absolute mmap positions (chunk_start + relative_offset).
-            //   This eliminates the biggest CPU bottleneck: copying ~32MB of
-            //   candidate bytes per batch.
+            // Copy candidate bytes into the batch's word_bytes buffer (single
+            // bulk memcpy including inter-candidate gaps), then write batch-
+            // relative offsets.
+            let wb_base = self.word_bytes_ptr;
+            let seg_first_offset =
+                *chunk_offsets_rel.get_unchecked(line_start) as usize;
+            let last_idx = line_end - 1;
+            let seg_end_offset = *chunk_offsets_rel.get_unchecked(last_idx) as usize
+                + *chunk_lengths.get_unchecked(last_idx) as usize;
+            let seg_byte_range = seg_end_offset - seg_first_offset;
 
-            #[cfg(not(target_os = "linux"))]
-            {
-                let wb_base = self.word_bytes_ptr;
-                let seg_first_offset =
-                    *chunk_offsets_rel.get_unchecked(line_start) as usize;
-                let last_idx = line_end - 1;
-                let seg_end_offset = *chunk_offsets_rel.get_unchecked(last_idx) as usize
-                    + *chunk_lengths.get_unchecked(last_idx) as usize;
-                let seg_byte_range = seg_end_offset - seg_first_offset;
+            std::ptr::copy_nonoverlapping(
+                mmap.as_ptr().add(chunk_start + seg_first_offset),
+                wb_base.add(wb_cursor),
+                seg_byte_range,
+            );
 
-                // Single bulk copy of the entire segment from mmap to GPU buffer.
-                std::ptr::copy_nonoverlapping(
-                    mmap.as_ptr().add(chunk_start + seg_first_offset),
-                    wb_base.add(wb_cursor),
-                    seg_byte_range,
-                );
-
-                // Offsets: copy from chunk-relative, then adjust to batch-relative.
-                std::ptr::copy_nonoverlapping(
-                    chunk_offsets_rel.as_ptr().add(line_start),
-                    offsets_base,
-                    count,
-                );
-                let adjustment = (wb_cursor as u32).wrapping_sub(seg_first_offset as u32);
-                let offsets_slice = std::slice::from_raw_parts_mut(offsets_base, count);
-                for o in offsets_slice.iter_mut() {
-                    *o = o.wrapping_add(adjustment);
-                }
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                // ZERO-COPY: write absolute mmap offsets.
-                // offset[i] = chunk_start + chunk_offsets_rel[i]
-                std::ptr::copy_nonoverlapping(
-                    chunk_offsets_rel.as_ptr().add(line_start),
-                    offsets_base,
-                    count,
-                );
-                let chunk_start_u32 = chunk_start as u32;
-                let offsets_slice = std::slice::from_raw_parts_mut(offsets_base, count);
-                for o in offsets_slice.iter_mut() {
-                    *o = o.wrapping_add(chunk_start_u32);
-                }
+            // Offsets: copy from chunk-relative, then adjust to batch-relative.
+            std::ptr::copy_nonoverlapping(
+                chunk_offsets_rel.as_ptr().add(line_start),
+                offsets_base,
+                count,
+            );
+            let adjustment = (wb_cursor as u32).wrapping_sub(seg_first_offset as u32);
+            let offsets_slice = std::slice::from_raw_parts_mut(offsets_base, count);
+            for o in offsets_slice.iter_mut() {
+                *o = o.wrapping_add(adjustment);
             }
         }
 
         self.candidate_count += count;
 
-        // On macOS, track word_bytes_len and max_word_len per-segment.
-        // On Linux, these are set from the BatchPlan after all segments
-        // are packed (via set_plan_metadata), skipping per-segment O(count)
-        // scans that are redundant with the planner's pre-computed values.
-        #[cfg(not(target_os = "linux"))]
         {
             // Account for the bulk-copied bytes (including inter-candidate gaps).
             let seg_first_offset = chunk_offsets_rel[line_start] as usize;
@@ -860,6 +825,7 @@ impl WordBatch {
         DispatchBatchView {
             candidate_count: self.candidate_count,
             max_word_len: self.max_word_len(),
+            word_bytes_len: self.word_bytes_len,
             word_bytes_buf: self.word_bytes_buffer(),
             word_offsets_buf: self.offsets_buffer(),
             word_lengths_buf: self.lengths_buffer(),
@@ -892,6 +858,7 @@ impl WordBatch {
         Some(DispatchBatchView {
             candidate_count: sample_count,
             max_word_len,
+            word_bytes_len: self.word_bytes_len,
             word_bytes_buf: &self.word_bytes_buf,
             word_offsets_buf: &self.word_offsets_buf,
             word_lengths_buf: &self.word_lengths_buf,
@@ -926,6 +893,13 @@ impl WordBatch {
 pub(crate) struct DispatchBatchView<'a> {
     pub(crate) candidate_count: usize,
     pub(crate) max_word_len: u16,
+    /// Number of valid bytes in the word_bytes buffer.
+    ///
+    /// Used by the CUDA per-batch copy path to know how many bytes to
+    /// transfer from pinned host memory to the device word_bytes buffer.
+    /// In zero-copy mode this value is informational only (the kernel
+    /// reads from the pre-uploaded mmap, not from per-batch word_bytes).
+    pub(crate) word_bytes_len: usize,
     pub(crate) word_bytes_buf: &'a GpuBuffer,
     pub(crate) word_offsets_buf: &'a GpuBuffer,
     pub(crate) word_lengths_buf: &'a GpuBuffer,

@@ -153,11 +153,29 @@ pub(crate) struct WordlistProducer {
 
 impl WordlistProducer {
     /// Start the producer pipeline.
+    ///
+    /// ## `zero_copy` parameter (Linux only)
+    ///
+    /// Controls how the producer packs word bytes into batches:
+    ///
+    /// - `true`: the GPU already has the full mmap in VRAM. The producer
+    ///   writes **absolute** mmap offsets and skips copying word bytes.
+    ///   This is the fast path — each batch only contains ~30 MiB of
+    ///   metadata (offsets + lengths) instead of ~62 MiB (metadata + words).
+    ///
+    /// - `false`: the wordlist doesn't fit in VRAM. The producer copies
+    ///   word bytes from the mmap into the batch's pinned buffer and writes
+    ///   **batch-relative** offsets. The GPU dispatch path then copies these
+    ///   word bytes to a reusable device buffer before each kernel launch.
+    ///
+    /// This flag is set by `runner.rs` based on `gpu.zero_copy()`, which
+    /// is determined at GPU initialization time by the VRAM capacity check.
     pub(crate) fn spawn(
         wordlist_path: PathBuf,
         device: GpuDevice,
         parser_config: ParserConfig,
         pipeline_depth: usize,
+        #[cfg(target_os = "linux")] zero_copy: bool,
     ) -> Self {
         let pipeline_depth = pipeline_depth.max(1);
         let (tx, rx) = sync_channel(pipeline_depth);
@@ -174,6 +192,8 @@ impl WordlistProducer {
                 stop_for_thread,
                 tx,
                 recycle_rx,
+                #[cfg(target_os = "linux")]
+                zero_copy,
             ) {
                 let _ = tx_err.send(ProducerMessage::Error(format!("{err:#}")));
             }
@@ -242,6 +262,7 @@ fn run_wordlist_producer(
     stop: Arc<AtomicBool>,
     tx: SyncSender<ProducerMessage>,
     recycle_rx: Receiver<WordBatch>,
+    zero_copy: bool,
 ) -> anyhow::Result<()> {
     use memmap2::{Advice, MmapOptions};
 
@@ -312,6 +333,7 @@ fn run_wordlist_producer(
                 &stop_w,
                 &tx_w,
                 &pool_rx,
+                zero_copy,
             );
 
             // If this is the last worker, send EOF.
@@ -370,7 +392,15 @@ fn run_wordlist_producer(
     Ok(())
 }
 
-/// One worker thread: scan a region of the mmap and write batches directly.
+/// One worker thread: scan a newline-aligned region of the mmap, accumulate
+/// candidate metadata in thread-local buffers, and flush to GPU batches.
+///
+/// ## `zero_copy` controls offset semantics
+///
+/// When `zero_copy == true`, staged offsets are absolute mmap positions.
+/// When `zero_copy == false`, `flush_staged_to_batch` rewrites them as
+/// batch-relative positions and copies word bytes from the mmap. See
+/// `flush_staged_to_batch` for a detailed explanation.
 #[cfg(target_os = "linux")]
 fn scan_region_direct(
     mmap: &[u8],
@@ -380,6 +410,7 @@ fn scan_region_direct(
     stop: &AtomicBool,
     tx: &SyncSender<ProducerMessage>,
     pool_rx: &crossbeam_channel::Receiver<WordBatch>,
+    zero_copy: bool,
 ) -> anyhow::Result<()> {
     use super::batch::{MAX_CANDIDATES_PER_BATCH, MAX_WORD_BYTES_PER_BATCH};
 
@@ -429,6 +460,8 @@ fn scan_region_direct(
                 &local_lengths,
                 batch_word_bytes_len,
                 batch_max_word_len,
+                mmap,
+                zero_copy,
             );
             let build_time = batch_start.elapsed();
             if tx
@@ -465,7 +498,10 @@ fn scan_region_direct(
             batch_max_word_len = 0;
         }
 
-        // Stage: absolute mmap offset.
+        // Stage offset as an absolute mmap position. In zero-copy mode,
+        // this is the final offset the kernel will use. In per-batch mode,
+        // `flush_staged_to_batch` rewrites it to a batch-relative position
+        // after copying the word bytes from `mmap[abs_offset..+len]`.
         local_offsets.push((region_start + this_line_start) as u32);
         local_lengths.push(line_len as u16);
         batch_word_bytes_len += line_len;
@@ -493,6 +529,8 @@ fn scan_region_direct(
                     &local_lengths,
                     batch_word_bytes_len,
                     batch_max_word_len,
+                    mmap,
+                    zero_copy,
                 );
                 let build_time = batch_start.elapsed();
                 if tx
@@ -538,6 +576,8 @@ fn scan_region_direct(
             &local_lengths,
             batch_word_bytes_len,
             batch_max_word_len,
+            mmap,
+            zero_copy,
         );
         let build_time = batch_start.elapsed();
         let _ = tx.send(ProducerMessage::Batch {
@@ -558,7 +598,41 @@ fn scan_region_direct(
 }
 
 /// Bulk-copy staged offsets/lengths from local (cached) buffers to pinned
-/// GPU memory. Offsets are already absolute mmap positions.
+/// GPU memory.
+///
+/// ## Two modes: zero-copy vs per-batch copy
+///
+/// The producer accumulates candidate metadata (offsets and lengths) in
+/// thread-local `Vec`s for L1 cache locality. When a batch boundary is hit,
+/// this function flushes the staged data to the batch's pinned GPU memory.
+///
+/// **Zero-copy mode** (`zero_copy == true`):
+///   - The entire wordlist mmap is already in GPU VRAM.
+///   - Offsets are absolute mmap positions (e.g., byte 1,234,567 in the file).
+///   - Only the metadata arrays (offsets and lengths) are written to the
+///     batch's pinned memory. Word bytes are NOT copied — the kernel reads
+///     them directly from the VRAM-resident mmap.
+///
+/// **Per-batch copy mode** (`zero_copy == false`):
+///   - The wordlist is too large for VRAM, so word bytes must be copied
+///     per-batch from the mmap (host memory) into the batch's word_bytes
+///     buffer (pinned host memory). The GPU dispatch path will then copy
+///     this buffer to a reusable device buffer before kernel launch.
+///   - Offsets are rewritten from absolute mmap positions to batch-relative
+///     positions (starting at the current `word_bytes_len` cursor). This
+///     is necessary because the GPU only sees the batch's word_bytes buffer,
+///     not the full mmap.
+///
+/// ## Safety
+///
+/// The `unsafe` blocks use `copy_nonoverlapping` (memcpy) to write into
+/// pinned GPU memory via raw pointers. This is sound because:
+///   - The batch was allocated with capacity for MAX_CANDIDATES_PER_BATCH
+///     entries and WORD_BYTES_ALLOC_SIZE bytes
+///   - The caller (scan_region_direct) enforces batch size limits before
+///     flushing, so we never write past the end of the buffers
+///   - The batch is exclusively owned by this producer thread (no concurrent
+///     access until it's sent to the consumer via the channel)
 #[cfg(target_os = "linux")]
 fn flush_staged_to_batch(
     batch: &mut WordBatch,
@@ -566,24 +640,71 @@ fn flush_staged_to_batch(
     lengths: &[u16],
     word_bytes_len: usize,
     max_word_len: u16,
+    mmap: &[u8],
+    zero_copy: bool,
 ) {
     let count = offsets.len();
     if count == 0 {
         return;
     }
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            offsets.as_ptr(),
-            batch.word_offsets_ptr_mut().add(batch.candidate_count()),
-            count,
-        );
-        std::ptr::copy_nonoverlapping(
-            lengths.as_ptr(),
-            batch.word_lengths_ptr_mut().add(batch.candidate_count()),
-            count,
-        );
+
+    if zero_copy {
+        // Zero-copy: write absolute mmap offsets directly to pinned memory.
+        // The GPU kernel will read word_bytes from VRAM using these absolute
+        // positions. No word bytes are copied here — just metadata.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                offsets.as_ptr(),
+                batch.word_offsets_ptr_mut().add(batch.candidate_count()),
+                count,
+            );
+            std::ptr::copy_nonoverlapping(
+                lengths.as_ptr(),
+                batch.word_lengths_ptr_mut().add(batch.candidate_count()),
+                count,
+            );
+        }
+        batch.set_staged_counts(count, word_bytes_len, max_word_len);
+    } else {
+        // Per-batch copy: copy each candidate's bytes from the mmap into the
+        // batch's contiguous word_bytes buffer, and rewrite offsets as batch-
+        // relative positions.
+        //
+        // Example: if the mmap has candidates at absolute offsets [1000, 1005]
+        // with lengths [5, 3], and the batch's word_bytes cursor is at 100,
+        // we copy:
+        //   mmap[1000..1005] → word_bytes[100..105]  (offset = 100)
+        //   mmap[1005..1008] → word_bytes[105..108]  (offset = 105)
+        //
+        // The kernel sees offsets [100, 105] — batch-relative positions into
+        // the word_bytes buffer it receives.
+        let base_count = batch.candidate_count();
+        let mut wb_cursor = batch.word_bytes_len();
+        unsafe {
+            let wb_base = batch.word_bytes_ptr_mut();
+            let offsets_base = batch.word_offsets_ptr_mut().add(base_count);
+            let lengths_base = batch.word_lengths_ptr_mut().add(base_count);
+
+            for i in 0..count {
+                let abs_offset = offsets[i] as usize;
+                let len = lengths[i] as usize;
+
+                // Copy word bytes from mmap into batch buffer.
+                std::ptr::copy_nonoverlapping(
+                    mmap.as_ptr().add(abs_offset),
+                    wb_base.add(wb_cursor),
+                    len,
+                );
+
+                // Write batch-relative offset and length.
+                *offsets_base.add(i) = wb_cursor as u32;
+                *lengths_base.add(i) = lengths[i];
+
+                wb_cursor += len;
+            }
+        }
+        batch.set_staged_counts(count, wb_cursor, max_word_len);
     }
-    batch.set_staged_counts(count, word_bytes_len, max_word_len);
 }
 
 // ---------------------------------------------------------------------------
@@ -785,6 +906,8 @@ mod tests {
             test_device(),
             test_parser_config(2, 8),
             DEFAULT_PIPELINE_DEPTH,
+            #[cfg(target_os = "linux")]
+            false,
         );
 
         let (total, batch_count) = drain_all_batches(&mut producer);
@@ -801,7 +924,14 @@ mod tests {
     fn wordlist_producer_emits_batches_from_larger_wordlist() {
         let path = write_temp_wordlist(b"alpha\nbeta\ngamma\ndelta\n");
         let mut producer =
-            WordlistProducer::spawn(path.clone(), test_device(), test_parser_config(2, 8), 4);
+            WordlistProducer::spawn(
+                path.clone(),
+                test_device(),
+                test_parser_config(2, 8),
+                4,
+                #[cfg(target_os = "linux")]
+                false,
+            );
 
         let (total, batch_count) = drain_all_batches(&mut producer);
         assert_eq!(total, 4, "expected 4 total candidates");

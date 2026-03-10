@@ -393,12 +393,28 @@ fn compile_and_load_single(
 /// Owns the CUDA context, stream, compiled kernels, and pre-allocated
 /// device buffers.
 ///
-/// ## Zero-copy mmap dispatch
+/// ## Zero-copy vs per-batch dispatch
 ///
-/// The entire wordlist mmap is uploaded to GPU VRAM once at construction.
-/// Per-batch dispatch only copies the small metadata arrays (offsets and
-/// lengths) — the candidate bytes are already on-device. This eliminates
-/// the biggest CPU→GPU transfer bottleneck (~32MB word_bytes per batch).
+/// At construction time, we query available VRAM via `cuMemGetInfo` and
+/// decide which of two strategies to use:
+///
+/// 1. **Zero-copy** (wordlist fits in VRAM): the entire mmap is uploaded
+///    once to `d_mmap`. Per-batch dispatch only copies metadata (offsets
+///    and lengths — ~30 MiB). The kernel reads candidate bytes directly
+///    from VRAM using absolute mmap offsets. This is the fast path.
+///
+/// 2. **Per-batch copy** (wordlist exceeds VRAM): `d_mmap` is a small
+///    (~44 MiB) reusable buffer. Before each kernel launch, word bytes
+///    from the batch's pinned host buffer are copied to `d_mmap` via
+///    `memcpy_htod`. Offsets in this mode are batch-relative (starting
+///    from 0), not absolute mmap positions. This avoids OOM crashes at
+///    the cost of PCIe transfer overhead (~2 ms per 32 MiB batch on
+///    PCIe Gen4).
+///
+/// The `zero_copy` field records which path was chosen. The kernel source
+/// is identical for both modes — it simply reads `word_bytes[offsets[i]]`,
+/// and whether those offsets are absolute or batch-relative is determined
+/// by how the producer packed the batch.
 pub(crate) struct CudaBruteForcer {
     variant: HmacVariant,
     #[allow(dead_code)] // Kept alive to prevent CUDA context from being dropped
@@ -407,13 +423,26 @@ pub(crate) struct CudaBruteForcer {
     _module: Arc<cudarc::driver::CudaModule>,
     func_mixed: CudaFunction,
     func_short_keys: CudaFunction,
-    // Pre-allocated device buffers (UnsafeCell for interior mutability).
+    // --- Pre-allocated device buffers ---
+    //
+    // All device buffers are wrapped in `UnsafeCell` to allow interior
+    // mutability through `&self` (required by the `GpuBruteForcer` trait).
+    // See the module-level safety comment for why this is sound.
     d_params: UnsafeCell<CudaSlice<u8>>,
     d_message: CudaSlice<u8>,
-    /// Entire wordlist mmap uploaded to GPU VRAM once at startup.
-    /// Kernel reads candidate bytes directly from this buffer using
-    /// absolute mmap offsets stored in the per-batch offsets array.
-    d_mmap: CudaSlice<u8>,
+    /// Dual-purpose device buffer whose role depends on `zero_copy`:
+    ///
+    /// - **zero_copy = true**: holds the entire wordlist mmap in VRAM.
+    ///   Offsets from the batch are absolute mmap positions; the kernel
+    ///   reads `d_mmap[offset..offset+len]` to get each candidate.
+    ///
+    /// - **zero_copy = false**: a reusable ~44 MiB staging buffer. Before
+    ///   each kernel launch, `encode_and_commit_impl` copies the batch's
+    ///   word bytes here via `memcpy_htod`. Offsets are batch-relative.
+    ///
+    /// The `UnsafeCell` wrapper is needed because per-batch mode mutates
+    /// this buffer during `encode_and_commit` (which takes `&self`).
+    d_mmap: UnsafeCell<CudaSlice<u8>>,
     d_word_offsets: UnsafeCell<CudaSlice<u8>>,
     d_word_lengths: UnsafeCell<CudaSlice<u8>>,
     d_result: UnsafeCell<CudaSlice<u32>>,
@@ -422,6 +451,14 @@ pub(crate) struct CudaBruteForcer {
     device_name: String,
     max_threads_per_block: usize,
     device_handle: CudaDeviceHandle,
+    /// Runtime toggle: `true` = mmap in VRAM (fast), `false` = per-batch copy.
+    ///
+    /// Determined at construction by comparing the wordlist size against
+    /// available VRAM (with 10% headroom). Once set, this flag controls:
+    ///   - Whether `encode_and_commit_impl` copies word bytes per-batch
+    ///   - Whether the producer writes absolute or batch-relative offsets
+    ///   - Whether `handle_match` reads from the mmap or the batch buffer
+    zero_copy: bool,
 }
 
 impl CudaBruteForcer {
@@ -497,21 +534,63 @@ impl CudaBruteForcer {
                 .map_err(|e| anyhow!("failed to copy message to device: {e}"))?
         };
 
-        // Upload entire mmap to GPU VRAM once. The kernel reads candidate
-        // bytes directly from this buffer using absolute mmap offsets.
+        // ## VRAM capacity check — zero-copy vs per-batch fallback
+        //
+        // This is the key OOM-prevention logic. We query the GPU's free VRAM
+        // via `cuMemGetInfo` and compare it to the wordlist file size:
+        //
+        //   - If the file fits (with 10% headroom for other buffers), we
+        //     upload the entire mmap to VRAM once. This is the zero-copy
+        //     path: the kernel reads candidate bytes directly from VRAM.
+        //
+        //   - If it doesn't fit, we allocate a small reusable buffer
+        //     (~44 MiB = WORD_BYTES_ALLOC_SIZE) and copy word bytes from
+        //     pinned host memory before each kernel launch. This is the
+        //     per-batch copy path, identical to how macOS Metal works.
+        //
+        // The 10% headroom (`free_vram / 10`) reserves space for the
+        // metadata buffers (offsets, lengths, params, result) that are
+        // also allocated in VRAM. Without headroom, a file that barely
+        // fits would OOM when allocating those buffers.
         let mmap_len = mmap_bytes.len();
-        let d_mmap = if mmap_len > 0 {
-            eprintln!(
-                "CUDA: uploading {} byte mmap to GPU VRAM",
-                format_human_count(mmap_len as f64)
-            );
-            stream
-                .clone_htod(mmap_bytes)
-                .map_err(|e| anyhow!("failed to upload mmap to device ({mmap_len} bytes): {e}"))?
-        } else {
-            stream
+        let (d_mmap, zero_copy) = if mmap_len == 0 {
+            // Edge case: empty wordlist. Allocate 1-byte placeholder to
+            // satisfy the kernel argument contract (non-null device pointer).
+            let buf = stream
                 .alloc_zeros::<u8>(1)
-                .map_err(|e| anyhow!("failed to alloc placeholder mmap buffer: {e}"))?
+                .map_err(|e| anyhow!("failed to alloc placeholder mmap buffer: {e}"))?;
+            (buf, true) // Empty mmap is trivially "zero-copy".
+        } else {
+            let (free_vram, _total_vram) = cudarc::driver::result::mem_get_info()
+                .map_err(|e| anyhow!("failed to query VRAM: {e}"))?;
+            let headroom = free_vram / 10;
+            if mmap_len < free_vram.saturating_sub(headroom) {
+                // Fast path: upload entire mmap to VRAM.
+                // `clone_htod` performs a single contiguous DMA transfer.
+                eprintln!(
+                    "CUDA: uploading {} byte mmap to GPU VRAM ({} free)",
+                    format_human_count(mmap_len as f64),
+                    format_human_count(free_vram as f64),
+                );
+                let buf = stream
+                    .clone_htod(mmap_bytes)
+                    .map_err(|e| anyhow!("failed to upload mmap to device ({mmap_len} bytes): {e}"))?;
+                (buf, true)
+            } else {
+                // Fallback path: wordlist too large for VRAM.
+                // Allocate a per-batch staging buffer sized to the maximum
+                // word bytes payload. This buffer is reused across all batches
+                // — its contents are overwritten before each kernel launch.
+                eprintln!(
+                    "CUDA: mmap too large for VRAM ({} > {} free), using per-batch copy",
+                    format_human_count(mmap_len as f64),
+                    format_human_count(free_vram as f64),
+                );
+                let buf = stream
+                    .alloc_zeros::<u8>(crate::batch::WORD_BYTES_ALLOC_SIZE)
+                    .map_err(|e| anyhow!("failed to alloc word_bytes device buffer: {e}"))?;
+                (buf, false)
+            }
         };
         let d_word_offsets = stream
             .alloc_zeros::<u8>(MAX_CANDIDATES_PER_BATCH * 4)
@@ -538,7 +617,7 @@ impl CudaBruteForcer {
             func_short_keys,
             d_params: UnsafeCell::new(d_params),
             d_message,
-            d_mmap,
+            d_mmap: UnsafeCell::new(d_mmap),
             d_word_offsets: UnsafeCell::new(d_word_offsets),
             d_word_lengths: UnsafeCell::new(d_word_lengths),
             d_result: UnsafeCell::new(d_result),
@@ -547,6 +626,7 @@ impl CudaBruteForcer {
             device_name,
             max_threads_per_block,
             device_handle,
+            zero_copy,
         })
     }
 
@@ -621,9 +701,8 @@ impl CudaBruteForcer {
 
     /// Copy batch metadata to device, launch kernel, return command handle.
     ///
-    /// With zero-copy mmap dispatch, only the small metadata arrays (offsets
-    /// and lengths) are copied per batch. The candidate bytes are already in
-    /// GPU VRAM via `d_mmap`.
+    /// In zero-copy mode, only the small metadata arrays (offsets and lengths)
+    /// are copied per batch. In per-batch mode, word bytes are also copied.
     ///
     /// `candidate_count_override` allows autotuning to dispatch a
     /// smaller prefix of the batch without copying all metadata.
@@ -644,7 +723,6 @@ impl CudaBruteForcer {
         let view = batch.as_dispatch_view();
 
         // Phase 1: Host prep — write params and copy metadata to device.
-        // No word_bytes copy needed — mmap is already in VRAM.
         let prep_started = Instant::now();
         self.write_params(target_signature, candidate_count)?;
 
@@ -654,7 +732,7 @@ impl CudaBruteForcer {
             .memcpy_htod(&[RESULT_NOT_FOUND_SENTINEL], d_result)
             .map_err(|e| anyhow!("failed to reset result sentinel: {e}"))?;
 
-        // Copy only metadata (offsets + lengths) from host to device.
+        // Copy metadata (offsets + lengths) from host to device.
         let d_word_offsets = unsafe { &mut *self.d_word_offsets.get() };
         let d_word_lengths = unsafe { &mut *self.d_word_lengths.get() };
 
@@ -676,9 +754,44 @@ impl CudaBruteForcer {
                 )
                 .map_err(|e| anyhow!("failed to copy word_lengths to device: {e}"))?;
         }
+
+        // ## Per-batch word bytes copy (fallback mode)
+        //
+        // In zero-copy mode, `d_mmap` already holds the entire wordlist
+        // in VRAM, so we skip this step entirely — a major performance win.
+        //
+        // In per-batch mode, the producer packed word bytes into the batch's
+        // pinned host buffer with batch-relative offsets (starting at 0).
+        // We copy just the valid prefix (`word_bytes_len` bytes, typically
+        // ~32 MiB) to the reusable `d_mmap` device buffer. The kernel then
+        // reads `d_mmap[offset..offset+len]` using those batch-relative offsets.
+        //
+        // Cost: ~2 ms per 32 MiB on PCIe Gen4. This is the price we pay
+        // for supporting wordlists larger than GPU VRAM. For comparison,
+        // the GPU computation for a 6M-candidate HMAC-SHA256 batch takes
+        // ~3–5 ms, so the PCIe copy adds roughly 40–60% overhead.
+        if !self.zero_copy {
+            let d_mmap = unsafe { &mut *self.d_mmap.get() };
+            let word_bytes_len = view.word_bytes_len;
+            if word_bytes_len > 0 {
+                self.stream
+                    .memcpy_htod(
+                        &view.word_bytes_buf.as_slice()[..word_bytes_len],
+                        d_mmap,
+                    )
+                    .map_err(|e| anyhow!("failed to copy word_bytes to device: {e}"))?;
+            }
+        }
+
         let host_prep = prep_started.elapsed();
 
         // Phase 2: Kernel launch.
+        //
+        // The kernel function, grid dimensions, and argument layout are
+        // identical for both zero-copy and per-batch modes. The kernel
+        // doesn't know (or care) whether `d_mmap` holds the full wordlist
+        // or just one batch's worth of word bytes — it simply reads
+        // `word_bytes[offsets[tid]]` for `lengths[tid]` bytes.
         let encode_started = Instant::now();
         let func = self.active_func(view.max_word_len);
         let grid_dim = (candidate_count + threadgroup_width as u32 - 1) / threadgroup_width as u32;
@@ -690,8 +803,15 @@ impl CudaBruteForcer {
 
         // SAFETY: Kernel arguments match the CUDA kernel signature:
         //   params*, message*, word_bytes*, word_offsets*, word_lengths*, result*
-        // d_mmap replaces d_word_bytes — offsets are absolute mmap positions.
+        // The buffer contents are valid because:
+        //   - d_params was just written by write_params()
+        //   - d_message was written once in new()
+        //   - d_mmap holds either the full mmap (zero-copy) or this batch's
+        //     word bytes (per-batch), both valid for the current offsets
+        //   - d_word_offsets/d_word_lengths were just copied above
+        //   - d_result was reset to RESULT_NOT_FOUND_SENTINEL
         let d_params = unsafe { &*self.d_params.get() };
+        let d_mmap = unsafe { &*self.d_mmap.get() };
         let d_word_offsets = unsafe { &*self.d_word_offsets.get() };
         let d_word_lengths = unsafe { &*self.d_word_lengths.get() };
         let d_result = unsafe { &mut *self.d_result.get() };
@@ -701,7 +821,7 @@ impl CudaBruteForcer {
                 .launch_builder(func)
                 .arg(d_params)
                 .arg(&self.d_message)
-                .arg(&self.d_mmap)
+                .arg(d_mmap)
                 .arg(d_word_offsets)
                 .arg(d_word_lengths)
                 .arg(d_result)
@@ -772,6 +892,10 @@ impl GpuBruteForcer for CudaBruteForcer {
 
     fn device_name(&self) -> &str {
         &self.device_name
+    }
+
+    fn zero_copy(&self) -> bool {
+        self.zero_copy
     }
 
     fn thread_execution_width(&self) -> usize {
@@ -881,7 +1005,11 @@ impl GpuBruteForcer for CudaBruteForcer {
 ///
 /// The kernel source is compiled with `#define AES_KEY_BYTES N` to
 /// produce a fully specialised binary for each AES key size.
-/// Uses zero-copy mmap dispatch — the wordlist is in VRAM.
+///
+/// Supports both zero-copy mmap dispatch and per-batch fallback,
+/// using the same VRAM capacity check as `CudaBruteForcer`. See
+/// that struct's documentation for a detailed explanation of the
+/// two dispatch modes.
 pub(crate) struct CudaAesKwBruteForcer {
     #[allow(dead_code)]
     variant: AesKwVariant,
@@ -893,7 +1021,9 @@ pub(crate) struct CudaAesKwBruteForcer {
     func_short_keys: CudaFunction,
     d_params: UnsafeCell<CudaSlice<u8>>,
     d_encrypted_key: CudaSlice<u8>,
-    d_mmap: CudaSlice<u8>,
+    /// See `CudaBruteForcer::d_mmap` for documentation on the dual-purpose
+    /// nature of this buffer (whole mmap vs per-batch staging).
+    d_mmap: UnsafeCell<CudaSlice<u8>>,
     d_word_offsets: UnsafeCell<CudaSlice<u8>>,
     d_word_lengths: UnsafeCell<CudaSlice<u8>>,
     d_result: UnsafeCell<CudaSlice<u32>>,
@@ -903,6 +1033,8 @@ pub(crate) struct CudaAesKwBruteForcer {
     device_name: String,
     max_threads_per_block: usize,
     device_handle: CudaDeviceHandle,
+    /// Runtime toggle — see `CudaBruteForcer::zero_copy` for documentation.
+    zero_copy: bool,
 }
 
 impl CudaAesKwBruteForcer {
@@ -950,20 +1082,40 @@ impl CudaAesKwBruteForcer {
         let d_encrypted_key = stream
             .clone_htod(encrypted_key)
             .map_err(|e| anyhow!("failed to copy encrypted_key to device: {e}"))?;
-        // Upload entire mmap to GPU VRAM once.
+        // VRAM capacity check — same logic as CudaBruteForcer::new().
+        // See the HMAC backend above for a detailed explanation of the
+        // zero-copy vs per-batch copy decision and the 10% headroom rule.
         let mmap_len = mmap_bytes.len();
-        let d_mmap = if mmap_len > 0 {
-            eprintln!(
-                "CUDA: uploading {} byte mmap to GPU VRAM",
-                format_human_count(mmap_len as f64)
-            );
-            stream
-                .clone_htod(mmap_bytes)
-                .map_err(|e| anyhow!("failed to upload mmap to device ({mmap_len} bytes): {e}"))?
-        } else {
-            stream
+        let (d_mmap, zero_copy) = if mmap_len == 0 {
+            let buf = stream
                 .alloc_zeros::<u8>(1)
-                .map_err(|e| anyhow!("failed to alloc placeholder mmap buffer: {e}"))?
+                .map_err(|e| anyhow!("failed to alloc placeholder mmap buffer: {e}"))?;
+            (buf, true)
+        } else {
+            let (free_vram, _total_vram) = cudarc::driver::result::mem_get_info()
+                .map_err(|e| anyhow!("failed to query VRAM: {e}"))?;
+            let headroom = free_vram / 10;
+            if mmap_len < free_vram.saturating_sub(headroom) {
+                eprintln!(
+                    "CUDA: uploading {} byte mmap to GPU VRAM ({} free)",
+                    format_human_count(mmap_len as f64),
+                    format_human_count(free_vram as f64),
+                );
+                let buf = stream
+                    .clone_htod(mmap_bytes)
+                    .map_err(|e| anyhow!("failed to upload mmap to device ({mmap_len} bytes): {e}"))?;
+                (buf, true)
+            } else {
+                eprintln!(
+                    "CUDA: mmap too large for VRAM ({} > {} free), using per-batch copy",
+                    format_human_count(mmap_len as f64),
+                    format_human_count(free_vram as f64),
+                );
+                let buf = stream
+                    .alloc_zeros::<u8>(crate::batch::WORD_BYTES_ALLOC_SIZE)
+                    .map_err(|e| anyhow!("failed to alloc word_bytes device buffer: {e}"))?;
+                (buf, false)
+            }
         };
         let d_word_offsets = stream
             .alloc_zeros::<u8>(MAX_CANDIDATES_PER_BATCH * 4)
@@ -991,7 +1143,7 @@ impl CudaAesKwBruteForcer {
             func_short_keys,
             d_params: UnsafeCell::new(d_params),
             d_encrypted_key,
-            d_mmap,
+            d_mmap: UnsafeCell::new(d_mmap),
             d_word_offsets: UnsafeCell::new(d_word_offsets),
             d_word_lengths: UnsafeCell::new(d_word_lengths),
             d_result: UnsafeCell::new(d_result),
@@ -1001,6 +1153,7 @@ impl CudaAesKwBruteForcer {
             device_name,
             max_threads_per_block,
             device_handle,
+            zero_copy,
         })
     }
 
@@ -1050,7 +1203,7 @@ impl CudaAesKwBruteForcer {
             .memcpy_htod(&[RESULT_NOT_FOUND_SENTINEL], d_result)
             .map_err(|e| anyhow!("failed to reset result sentinel: {e}"))?;
 
-        // Copy only metadata (offsets + lengths) — mmap is already in VRAM.
+        // Copy metadata (offsets + lengths) from host to device.
         let d_word_offsets = unsafe { &mut *self.d_word_offsets.get() };
         let d_word_lengths = unsafe { &mut *self.d_word_lengths.get() };
 
@@ -1072,8 +1225,25 @@ impl CudaAesKwBruteForcer {
                 )
                 .map_err(|e| anyhow!("failed to copy word_lengths to device: {e}"))?;
         }
+
+        // Per-batch word bytes copy — see CudaBruteForcer::encode_and_commit_impl
+        // for a detailed explanation of the zero-copy vs per-batch copy decision.
+        if !self.zero_copy {
+            let d_mmap = unsafe { &mut *self.d_mmap.get() };
+            let word_bytes_len = view.word_bytes_len;
+            if word_bytes_len > 0 {
+                self.stream
+                    .memcpy_htod(
+                        &view.word_bytes_buf.as_slice()[..word_bytes_len],
+                        d_mmap,
+                    )
+                    .map_err(|e| anyhow!("failed to copy word_bytes to device: {e}"))?;
+            }
+        }
+
         let host_prep = prep_started.elapsed();
 
+        // Kernel launch — identical for both zero-copy and per-batch modes.
         let encode_started = Instant::now();
         let func = self.active_func(view.max_word_len);
         let grid_dim = (candidate_count + threadgroup_width as u32 - 1) / threadgroup_width as u32;
@@ -1084,6 +1254,7 @@ impl CudaAesKwBruteForcer {
         };
 
         let d_params = unsafe { &*self.d_params.get() };
+        let d_mmap = unsafe { &*self.d_mmap.get() };
         let d_word_offsets = unsafe { &*self.d_word_offsets.get() };
         let d_word_lengths = unsafe { &*self.d_word_lengths.get() };
         let d_result = unsafe { &mut *self.d_result.get() };
@@ -1093,7 +1264,7 @@ impl CudaAesKwBruteForcer {
                 .launch_builder(func)
                 .arg(d_params)
                 .arg(&self.d_encrypted_key)
-                .arg(&self.d_mmap)
+                .arg(d_mmap)
                 .arg(d_word_offsets)
                 .arg(d_word_lengths)
                 .arg(d_result)
@@ -1158,6 +1329,10 @@ impl CudaAesKwBruteForcer {
 impl GpuBruteForcer for CudaAesKwBruteForcer {
     fn device(&self) -> &super::GpuDevice {
         &self.device_handle
+    }
+
+    fn zero_copy(&self) -> bool {
+        self.zero_copy
     }
 
     fn device_name(&self) -> &str {
